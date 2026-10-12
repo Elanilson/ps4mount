@@ -21,7 +21,7 @@ The web panel, opened from the **Media** tab:
 
 ## Features
 
-- Detects PS4 fake PKGs (game and update) in the root of any connected USB drive.
+- Detects PS4 fake PKGs (game and update) at the drive root **and inside nested per-game folders** (up to eight levels deep).
 - Adds the games to the home screen with their icon, name and update version.
 - Applies updates: put the update `.pkg` next to the game and it is picked up automatically.
 - Games run from the drive; no internal storage is used for the packages.
@@ -47,8 +47,8 @@ The web panel, opened from the **Media** tab:
 Download `ps4mount.elf` from the [Releases](https://github.com/gasb07/ps4mount/releases) page
 (or [build it](#building)).
 
-1. Copy the PS4 game `.pkg` (and its update `.pkg`, if you have one) to the **root** of the USB drive.
-   The file names do not matter.
+1. **Custom folders (new):** keep the game PKG and its update PKG in the **same game folder** anywhere on the USB drive (up to eight subfolders deep). Other files and DLC subfolders are not touched. Or keep using the original **root-of-drive** installation workflow.
+   The file names do not matter initially.
 2. Plug the drive into the PS5.
 3. Send `ps4mount.elf` to the ELF loader (port 9021). Do this after every console boot, or add it to
    the payloads your jailbreak loads automatically.
@@ -59,14 +59,34 @@ Download `ps4mount.elf` from the [Releases](https://github.com/gasb07/ps4mount/r
    - `<game name> ready to play`
 5. Start the game from the home screen.
 
-On the first run PS4Mount moves every package it uses into a folder per game on the same drive:
+**Custom folders:** on the first scan, PS4Mount recognizes the package types and **renames only the game and update files in place**, to `app.pkg` and `patch.pkg` (as required by the PS5 mounting mechanism). It does not move the game directory or touch DLC files. It does create additional metadata files next to the game. Example:
 
+```text
+/Meus Jogos PS4/God of War III/app.pkg
+/Meus Jogos PS4/God of War III/patch.pkg
+/Meus Jogos PS4/God of War III/DLCs/dlc01.pkg   (untouched, NOT supported)
+/Meus Jogos PS4/Bloodborne/app.pkg
 ```
+
+**Classic root-of-drive workflow:** packages that are placed directly in the drive root are **still moved** into the conventional layout:
+
+```text
 /ps4/CUSAxxxxx/app.pkg      game
 /ps4/CUSAxxxxx/patch.pkg    update (optional)
 ```
 
-Keep this layout. To add more games later, copy their `.pkg` files to the root of the drive again.
+Keep this layout. The standard root workflow is unchanged.
+
+**Important limitations of nested folders:**
+- The game and update must be in the **same directory**. Updates placed in separate subfolders are not automatically applied.
+- Two different base games in the same directory cannot be disambiguated: use one folder per game.
+- If there are multiple competing updates, the existing `patch.pkg` takes precedence; otherwise updates are ignored until you remove the ambiguity.
+- DLC PKGs are **left alone** but are **not installed or executed** by PS4Mount.
+- Recursive discovery happens at first mount, when clicking **Scan for games**, and periodically every five minutes. Normal mounts remain monitored every ten seconds.
+- Up to 256 distinct titles are catalogued. Duplicated title IDs across folders/drives are skipped (the first found is used).
+- **Back up your data** before using this modified build on your full game drive. The PS5 firmware build has not been tested here. On some drives, game metadata will be written alongside your own files.
+- To disable automatic renaming of the nested game's two PKGs, set `AUTO_RENAME_NESTED_PKGS` to `0` in `src/main.c` before building, and name the packages `app.pkg` and `patch.pkg` yourself.
+
 
 ### Web panel
 
@@ -97,7 +117,7 @@ Deleting a game from the PS5 (Options > Delete), or using **Remove from library*
 removes the game from the library and leaves the `.pkg` on the drive. A removed game comes back
 when you reconnect the drive or click **Add to library**.
 
-To delete the game for good, delete its `/ps4/CUSAxxxxx` folder from the drive on a computer.
+To delete the game files, delete the source folder shown in the web panel (for a conventional install, `/ps4/CUSAxxxxx`; for a nested game, the custom folder you created). **Take care not to delete DLCs or other files unintentionally.**
 
 ## Good to know
 

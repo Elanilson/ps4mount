@@ -3,13 +3,13 @@
  * PS4Mount daemon: scans USB drives, registers PS4 fpkgs without installing them, follows klog and serves the web panel. */
 /* ps4mount: run PS4 fpkgs from external storage without installing them.
  *
- * Every scan:
- *   1. A PS4 app pkg found at the root of /mnt/usbN or /mnt/extN is moved to
- *      <root>/ps4/<TITLE_ID>/app.pkg (same disk, rename only).
- *   2. For each <root>/ps4/<TITLE_ID>/app.pkg the files a real install leaves
- *      behind are generated from the pkg, the folder is mounted over
- *      /user/app/<TITLE_ID> (nullfs) and the title is added to app.db/appinfo.db.
- *   3. Mounts whose storage disappeared are released.
+ * Library modes:
+ *   1. PKGs placed at a drive's root retain the original import behavior:
+ *      moved to <root>/ps4/<TITLE_ID>/{app,patch}.pkg.
+ *   2. Nested per-game folders are discovered recursively. Matching game and
+ *      patch PKGs are renamed IN PLACE to app.pkg and patch.pkg as required by
+ *      nullfs registration. Folder structure and DLCs are left untouched.
+ *   3. Stale mounts are released when their source disappears.
  * Titles installed the normal way are never touched. */
 #include <dirent.h>
 #include <errno.h>
@@ -37,11 +37,15 @@
 #include "web.h"
 #include "icon_data.h"
 
-#define VERSION "PS4Mount 0.3.1"
+#define VERSION "PS4Mount 0.3.1-folders"
 #define LOCK_PORT 9032
 #define SCAN_SECONDS 10
 #define STATE_DIR "/data/ps4mount"
 #define MAX_TITLES 256
+#define MAX_FOLDER_DEPTH 8
+#define NESTED_RESCAN_SECONDS 300
+/* Disable this to only index nested folders already containing app.pkg. */
+#define AUTO_RENAME_NESTED_PKGS 1
 
 typedef struct { char useless[45]; char message[3075]; } notify_request_t;
 int sceUserServiceInitialize(void *);
@@ -151,7 +155,7 @@ typedef struct {
     pkg_t app, patch;
     int has_patch;
     sfo_t app_sfo, patch_sfo;
-    char name[128], ver[8], marker[160];
+    char name[128], ver[8], marker[PATH_MAX + 128];
     char update_issue[256]; /* why patch.pkg was ignored, empty when used or absent */
 } title_src_t;
 
@@ -171,13 +175,15 @@ static void src_close(title_src_t *t) {
 
 static int first_time(const char *path);
 
-static int src_open(title_src_t *t, const char *root, const char *tid) {
+static int src_open(title_src_t *t, const char *dir, const char *tid) {
     memset(t, 0, sizeof(*t));
-    snprintf(t->dir, sizeof(t->dir), "%s/ps4/%s", root, tid);
+    snprintf(t->dir, sizeof(t->dir), "%s", dir);
     snprintf(t->app_path, sizeof(t->app_path), "%s/app.pkg", t->dir);
     snprintf(t->patch_path, sizeof(t->patch_path), "%s/patch.pkg", t->dir);
     if (pkg_open(&t->app, t->app_path) || read_sfo(&t->app, &t->app_sfo)) {
         printf("[scan] %s: unreadable app pkg\n", t->app_path);
+        if (t->app.fd >= 0)
+            pkg_close(&t->app);
         return -1;
     }
     if (exists(t->patch_path)) {
@@ -545,7 +551,7 @@ static int installed_internally(const char *tid) {
 }
 
 static int marker_matches(const char *tid, const char *expected) {
-    char path[64], buf[256] = {0};
+    char path[64], buf[PATH_MAX + 128] = {0};
     snprintf(path, sizeof(path), STATE_DIR "/%s.src", tid);
     int fd = open(path, O_RDONLY);
     if (fd < 0)
@@ -719,51 +725,263 @@ static int adopt_root_pkgs(const char *root) {
     return moved;
 }
 
+/* Indexed game directories. Canonical /ps4/CUSAxxxxx and nested custom folders
+ * are handled by the exact same registration/mounting pipeline. */
 typedef struct {
     char tid[10];
+    char root[32];
+    char dir[PATH_MAX];
     int state;
 } title_t;
 
-static void scan_root(const char *root, int fresh, int reconnected) {
+static title_t g_titles[MAX_TITLES];
+static int g_title_count;
+static time_t g_last_nested_scan[10];
+
+static title_t *catalog_find(const char *tid) {
+    for (int i = 0; i < g_title_count; i++)
+        if (!strcmp(g_titles[i].tid, tid))
+            return &g_titles[i];
+    return NULL;
+}
+
+static void catalog_add(const char *root, const char *dir, const char *tid) {
+    if (strlen(tid) != 9 || strncmp(tid, "CUSA", 4) || !exists(dir))
+        return;
+    title_t *prev = catalog_find(tid);
+    if (prev) {
+        if (strcmp(prev->dir, dir) && first_time(dir))
+            printf("[scan] duplicate %s: using %s, skipping %s\n", tid, prev->dir, dir);
+        return;
+    }
+    if (g_title_count >= MAX_TITLES) {
+        if (first_time(dir))
+            printf("[scan] library full, ignoring %s\n", dir);
+        return;
+    }
+    title_t *t = &g_titles[g_title_count++];
+    memset(t, 0, sizeof(*t));
+    snprintf(t->root, sizeof(t->root), "%s", root);
+    snprintf(t->dir, sizeof(t->dir), "%s", dir);
+    snprintf(t->tid, sizeof(t->tid), "%s", tid);
+}
+
+static void catalog_forget_root(const char *root) {
+    for (int i = 0; i < g_title_count;)
+        if (!strcmp(g_titles[i].root, root)) {
+            memmove(g_titles + i, g_titles + i + 1,
+                    (size_t)(g_title_count - i - 1) * sizeof(g_titles[0]));
+            g_title_count--;
+        } else {
+            i++;
+        }
+}
+
+/* Inspect a PKG without using its filename to decide game versus update.
+ * DLC (CATEGORY=ac) and retail/unknown packages are deliberately ignored. */
+static int describe_pkg(const char *path, char tid[10], int *category) {
+    pkg_t pkg;
+    if (pkg_open(&pkg, path))
+        return -1;
+    sfo_t sfo;
+    int ok = !read_sfo(&pkg, &sfo);
+    const sfo_item_t *c = ok ? sfo_get(&sfo, "CATEGORY") : NULL;
+    int kind = c && !c->is_int && !strcmp(c->sval, "gd") ? 1 :
+               c && !c->is_int && !strcmp(c->sval, "gp") ? 2 : 0;
+    ok = kind && !strncmp(pkg.title_id, "CUSA", 4) && pkg_fake_key(&pkg);
+    if (ok) {
+        snprintf(tid, 10, "%s", pkg.title_id);
+        *category = kind;
+    }
+    pkg_close(&pkg);
+    return ok ? 0 : -1;
+}
+
+/* Within ONE directory, locate exactly one base game (and at most one patch).
+ * No other PKGs are touched; in particular DLCs stay in their folders.
+ * The PS5 needs app.pkg/patch.pkg at the root of the mounted game directory,
+ * so a file rename is unavoidable with this nullfs-based approach on exFAT.
+ * Never replace an existing target, never rename if files are ambiguous. */
+static void inspect_game_folder(const char *root, const char *dir) {
+    DIR *d = opendir(dir);
+    if (!d)
+        return;
+    char game[PATH_MAX] = "", patch[PATH_MAX] = "", tid[10] = "", patch_tid[10] = "";
+    int games = 0, patches = 0;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        size_t n = strlen(e->d_name);
+        if (n < 5 || strcasecmp(e->d_name + n - 4, ".pkg"))
+            continue;
+        char path[PATH_MAX], id[10];
+        if (snprintf(path, sizeof(path), "%s/%s", dir, e->d_name) >= (int)sizeof(path))
+            continue;
+        struct stat st;
+        if (lstat(path, &st) || !S_ISREG(st.st_mode))
+            continue;
+        int kind;
+        if (describe_pkg(path, id, &kind))
+            continue;
+        if (kind == 1) {
+            ++games;
+            snprintf(game, sizeof(game), "%s", path);
+            snprintf(tid, sizeof(tid), "%s", id);
+        } else if (kind == 2) {
+            ++patches;
+            snprintf(patch, sizeof(patch), "%s", path);
+            snprintf(patch_tid, sizeof(patch_tid), "%s", id);
+        }
+    }
+    closedir(d);
+    char app_dst[PATH_MAX], patch_dst[PATH_MAX];
+    if (snprintf(app_dst, sizeof(app_dst), "%s/app.pkg", dir) >= (int)sizeof(app_dst) ||
+        snprintf(patch_dst, sizeof(patch_dst), "%s/patch.pkg", dir) >= (int)sizeof(patch_dst))
+        return;
+    if (games > 1 && exists(app_dst)) {
+        char normalized_tid[10];
+        int kind;
+        if (!describe_pkg(app_dst, normalized_tid, &kind) && kind == 1) {
+            snprintf(game, sizeof(game), "%s", app_dst);
+            snprintf(tid, sizeof(tid), "%s", normalized_tid);
+            games = 1; /* already prepared; leave additional base PKGs alone */
+        }
+    }
+    if (games != 1) {
+        if (games > 1 && first_time(dir))
+            printf("[scan] %s: multiple game PKGs; split into per-game folders\n", dir);
+        return;
+    }
+    if (installed_internally(tid))
+        return;
+    title_t *existing = catalog_find(tid);
+    if (existing && strcmp(existing->dir, dir)) {
+        if (first_time(dir))
+            printf("[scan] %s: %s already indexed in %s; leaving duplicate untouched\n", dir, tid, existing->dir);
+        return;
+    }
+    if (patches > 1 && exists(patch_dst)) {
+        char normalized_tid[10];
+        int kind;
+        if (!describe_pkg(patch_dst, normalized_tid, &kind) && kind == 2) {
+            snprintf(patch, sizeof(patch), "%s", patch_dst);
+            snprintf(patch_tid, sizeof(patch_tid), "%s", normalized_tid);
+            patches = 1; /* keep the installed patch; ignore other updates */
+        }
+    }
+    if (patches > 1 || (patches == 1 && strcmp(tid, patch_tid))) {
+        if (first_time(dir))
+            printf("[scan] %s: ambiguous/mismatched update PKGs, update ignored\n", dir);
+        patches = 0;
+    }
+#if AUTO_RENAME_NESTED_PKGS
+    /* Do not rename half of a pair if the other destination conflicts. */
+    if ((strcmp(game, app_dst) && exists(app_dst)) ||
+        (patches && strcmp(patch, patch_dst) && exists(patch_dst))) {
+        if (first_time(dir))
+            printf("[scan] %s: app.pkg/patch.pkg destination already exists\n", dir);
+        return;
+    }
+    if (strcmp(game, app_dst)) {
+        if (rename(game, app_dst)) {
+            printf("[scan] cannot rename %s: %s\n", game, strerror(errno));
+            return;
+        }
+        printf("[scan] renamed in place: %s -> %s\n", game, app_dst);
+    }
+    if (patches && strcmp(patch, patch_dst)) {
+        if (rename(patch, patch_dst)) {
+            printf("[scan] cannot rename %s: %s\n", patch, strerror(errno));
+            return;
+        }
+        printf("[scan] renamed in place: %s -> %s\n", patch, patch_dst);
+    }
+#else
+    if (strcmp(game, app_dst) || (patches && strcmp(patch, patch_dst))) {
+        printf("[scan] %s: rename game/update to app.pkg/patch.pkg first\n", dir);
+        return;
+    }
+#endif
+    catalog_add(root, dir, tid);
+}
+
+/* Depth is capped to avoid pathological trees; lstat prevents symlink loops.
+ * Also crawl /ps4: some users already keep custom game folders there. */
+static void scan_nested(const char *root, const char *dir, int depth) {
+    if (depth > MAX_FOLDER_DEPTH || g_title_count >= MAX_TITLES)
+        return;
+    inspect_game_folder(root, dir);
+    DIR *d = opendir(dir);
+    if (!d)
+        return;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..") ||
+            !strcmp(e->d_name, "System Volume Information") ||
+            !strcmp(e->d_name, "$RECYCLE.BIN") || e->d_name[0] == '.')
+            continue;
+        char child[PATH_MAX];
+        if (snprintf(child, sizeof(child), "%s/%s", dir, e->d_name) >= (int)sizeof(child))
+            continue;
+        struct stat st;
+        if (!lstat(child, &st) && S_ISDIR(st.st_mode))
+            scan_nested(root, child, depth + 1);
+    }
+    closedir(d);
+}
+
+static void catalog_canonical(const char *root) {
+    char lib[PATH_MAX];
+    snprintf(lib, sizeof(lib), "%s/ps4", root);
+    DIR *d = opendir(lib);
+    if (!d)
+        return;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (strlen(e->d_name) != 9 || strncmp(e->d_name, "CUSA", 4))
+            continue;
+        char dir[PATH_MAX], app[PATH_MAX];
+        snprintf(dir, sizeof(dir), "%s/%s", lib, e->d_name);
+        snprintf(app, sizeof(app), "%s/app.pkg", dir);
+        if (exists(app))
+            catalog_add(root, dir, e->d_name);
+    }
+    closedir(d);
+}
+
+static void scan_root(const char *root, int fresh, int reconnected, int index) {
     const char *label = root + 5; /* "usb0" / "ext0" */
     if (fresh)
         notify("Scanning %s for PS4 games...", label);
     int moved = adopt_root_pkgs(root);
     if (moved && !fresh)
         notify("%s: %d new package(s) found", label, moved);
-    char lib[PATH_MAX];
-    snprintf(lib, sizeof(lib), "%s/ps4", root);
-    DIR *d = opendir(lib);
-    if (!d) {
-        if (fresh)
-            notify("%s: no PS4 games found", label);
-        return;
+    if (moved)
+        index = 1;
+    if (index) {
+        catalog_forget_root(root);
+        catalog_canonical(root);
+        scan_nested(root, root, 0);
     }
-    static title_t titles[MAX_TITLES];
     int count = 0, pending = 0;
-    struct dirent *e;
-    while ((e = readdir(d)) && count < MAX_TITLES) {
-        if (strlen(e->d_name) != 9 || strncmp(e->d_name, "CUSA", 4))
+    for (int i = 0; i < g_title_count; i++) {
+        title_t *t = &g_titles[i];
+        if (strcmp(t->root, root))
             continue;
-        char pkg_path[PATH_MAX];
-        snprintf(pkg_path, sizeof(pkg_path), "%s/%s/app.pkg", lib, e->d_name);
-        if (!exists(pkg_path))
+        if (!exists(t->dir))
             continue;
         title_src_t src;
-        if (src_open(&src, root, e->d_name))
+        if (src_open(&src, t->dir, t->tid))
             continue;
         if (reconnected) {
             char rm[64];
-            snprintf(rm, sizeof(rm), STATE_DIR "/%s.removed", e->d_name);
-            unlink(rm); /* reconnecting the USB drive brings removed games back */
+            snprintf(rm, sizeof(rm), STATE_DIR "/%s.removed", t->tid);
+            unlink(rm);
         }
-        title_t *t = &titles[count++];
-        snprintf(t->tid, sizeof(t->tid), "%s", e->d_name);
         t->state = title_state(&src);
         pending += t->state == 1;
+        count++;
         src_close(&src);
     }
-    closedir(d);
     if (fresh && !count)
         notify("%s: no PS4 games found", label);
     else if (fresh)
@@ -771,12 +989,12 @@ static void scan_root(const char *root, int fresh, int reconnected) {
     else if (pending)
         notify("%s: %d new or updated PS4 game(s)", label, pending);
     int done = 0, ok = 0;
-    for (int i = 0; i < count; i++) {
-        title_t *t = &titles[i];
-        if (t->state < 0)
+    for (int i = 0; i < g_title_count; i++) {
+        title_t *t = &g_titles[i];
+        if (strcmp(t->root, root) || t->state < 0 || !exists(t->dir))
             continue;
         title_src_t src;
-        if (src_open(&src, root, t->tid))
+        if (src_open(&src, t->dir, t->tid))
             continue;
         if (t->state == 0) {
             enforce_patch_sfo(&src);
@@ -784,13 +1002,11 @@ static void scan_root(const char *root, int fresh, int reconnected) {
             managed_t *m = managed_by(t->tid, NULL);
             int running = title_running(t->tid);
             if (m && running && !m->running) {
-                /* open before this daemon started (restart or crash): keep it writable */
                 printf("[scan] %s is running, keeping it read-write\n", t->tid);
                 m->running = 1;
                 m->rw = 1;
                 m->rw_until = 0;
             } else if (m && !running && m->running && time(NULL) - m->running_since > 60) {
-                /* closed without a klog end event: back to read-only */
                 printf("[scan] %s is no longer running\n", t->tid);
                 m->running = 0;
                 m->rw = 0;
@@ -852,8 +1068,18 @@ static void scan_all(void) {
         else
             snprintf(root, sizeof(root), "/mnt/ext%d", i - 8);
         int present = is_mountpoint(root);
-        if (present)
-            scan_root(root, !seen[i] || g_manual_scan, !seen[i] && !first);
+        if (present) {
+            time_t now = time(NULL);
+            int deep = !seen[i] || g_manual_scan || !g_last_nested_scan[i] ||
+                       now - g_last_nested_scan[i] >= NESTED_RESCAN_SECONDS;
+            /* Canonical imports can change each scan. */
+            scan_root(root, !seen[i] || g_manual_scan, !seen[i] && !first, deep);
+            if (deep)
+                g_last_nested_scan[i] = now;
+        } else if (seen[i]) {
+            catalog_forget_root(root);
+            g_last_nested_scan[i] = 0;
+        }
         seen[i] = present;
     }
     first = 0;
@@ -999,21 +1225,13 @@ static void json_str(buf_t *b, const char *s) {
     buf_put(b, "\"", 1);
 }
 
-/* Finds the library folder of tid on any connected storage. */
-static int find_root(const char *tid, char *root, size_t n) {
-    for (int i = 0; i < 10; i++) {
-        char r[32], p[PATH_MAX];
-        if (i < 8)
-            snprintf(r, sizeof(r), "/mnt/usb%d", i);
-        else
-            snprintf(r, sizeof(r), "/mnt/ext%d", i - 8);
-        snprintf(p, sizeof(p), "%s/ps4/%s/app.pkg", r, tid);
-        if (is_mountpoint(r) && exists(p)) {
-            snprintf(root, n, "%s", r);
-            return 0;
-        }
-    }
-    return -1;
+/* Looks up the actual source directory, regardless of folder naming. */
+static int find_title_dir(const char *tid, char *dir, size_t cap) {
+    title_t *t = catalog_find(tid);
+    if (!t || !exists(t->dir))
+        return -1;
+    snprintf(dir, cap, "%s", t->dir);
+    return 0;
 }
 
 void app_games_json(buf_t *out) {
@@ -1021,68 +1239,50 @@ void app_games_json(buf_t *out) {
     json_str(out, VERSION);
     buf_printf(out, ",\"games\":[");
     int first = 1;
-    for (int i = 0; i < 10; i++) {
-        char root[32], lib[PATH_MAX];
-        if (i < 8)
-            snprintf(root, sizeof(root), "/mnt/usb%d", i);
-        else
-            snprintf(root, sizeof(root), "/mnt/ext%d", i - 8);
-        if (!is_mountpoint(root))
+    for (int i = 0; i < g_title_count; i++) {
+        title_t *entry = &g_titles[i];
+        title_src_t t;
+        if (src_open(&t, entry->dir, entry->tid))
             continue;
-        snprintf(lib, sizeof(lib), "%s/ps4", root);
-        DIR *d = opendir(lib);
-        if (!d)
-            continue;
-        struct dirent *e;
-        while ((e = readdir(d))) {
-            if (strlen(e->d_name) != 9 || strncmp(e->d_name, "CUSA", 4))
-                continue;
-            title_src_t t;
-            char pkg_path[PATH_MAX];
-            snprintf(pkg_path, sizeof(pkg_path), "%s/%s/app.pkg", lib, e->d_name);
-            if (!exists(pkg_path) || src_open(&t, root, e->d_name))
-                continue;
-            const char *tid = e->d_name, *state, *mount = "";
-            char target[64], from[PATH_MAX];
-            snprintf(target, sizeof(target), "/user/app/%s", tid);
-            int mounted = mounted_from(target, from, sizeof(from));
-            if (mounted) {
-                struct statfs sf;
-                statfs(target, &sf);
+        const char *tid = entry->tid, *state, *mount = "";
+        char target[64], from[PATH_MAX];
+        snprintf(target, sizeof(target), "/user/app/%s", tid);
+        int mounted = mounted_from(target, from, sizeof(from));
+        if (mounted) {
+            struct statfs sf = {0};
+            if (!statfs(target, &sf))
                 mount = sf.f_flags & MNT_RDONLY ? "ro" : "rw";
-            }
-            managed_t *m = managed_by(tid, NULL);
-            if (installed_internally(tid))
-                state = "internal";
-            else if (removed(tid))
-                state = "removed";
-            else if (m && m->running)
-                state = "running";
-            else if (mounted && db_is_registered(tid))
-                state = "ready";
-            else
-                state = "pending";
-            buf_printf(out, "%s{\"title_id\":\"%s\",\"name\":", first ? "" : ",", tid);
-            json_str(out, t.name);
-            buf_printf(out, ",\"version\":");
-            json_str(out, t.ver);
-            buf_printf(out, ",\"has_patch\":%s,\"size\":%llu,\"state\":\"%s\",\"mount\":\"%s\",\"source\":",
-                       t.has_patch ? "true" : "false",
-                       (unsigned long long)(t.app.pkg_size + (t.has_patch ? t.patch.pkg_size : 0)), state, mount);
-            json_str(out, t.dir);
-            buf_printf(out, ",\"update_issue\":");
-            json_str(out, t.update_issue);
-            buf_printf(out, "}");
-            first = 0;
-            src_close(&t);
         }
-        closedir(d);
+        managed_t *m = managed_by(tid, NULL);
+        if (installed_internally(tid))
+            state = "internal";
+        else if (removed(tid))
+            state = "removed";
+        else if (m && m->running)
+            state = "running";
+        else if (mounted && db_is_registered(tid))
+            state = "ready";
+        else
+            state = "pending";
+        buf_printf(out, "%s{\"title_id\":\"%s\",\"name\":", first ? "" : ",", tid);
+        json_str(out, t.name);
+        buf_printf(out, ",\"version\":");
+        json_str(out, t.ver);
+        buf_printf(out, ",\"has_patch\":%s,\"size\":%llu,\"state\":\"%s\",\"mount\":\"%s\",\"source\":",
+                   t.has_patch ? "true" : "false",
+                   (unsigned long long)(t.app.pkg_size + (t.has_patch ? t.patch.pkg_size : 0)), state, mount);
+        json_str(out, t.dir);
+        buf_printf(out, ",\"update_issue\":");
+        json_str(out, t.update_issue);
+        buf_printf(out, "}");
+        first = 0;
+        src_close(&t);
     }
     buf_printf(out, "]}");
 }
 
 int app_icon(const char *tid, buf_t *out) {
-    char p[PATH_MAX], root[32];
+    char p[PATH_MAX], dir[PATH_MAX];
     snprintf(p, sizeof(p), "/user/appmeta/%s/icon0.png", tid);
     int fd = open(p, O_RDONLY);
     if (fd >= 0) {
@@ -1093,9 +1293,9 @@ int app_icon(const char *tid, buf_t *out) {
         close(fd);
         return out->len ? 0 : -1;
     }
-    if (find_root(tid, root, sizeof(root)))
+    if (find_title_dir(tid, dir, sizeof(dir)))
         return -1;
-    snprintf(p, sizeof(p), "%s/ps4/%s/app.pkg", root, tid);
+    snprintf(p, sizeof(p), "%s/app.pkg", dir);
     pkg_t pkg;
     if (pkg_open(&pkg, p))
         return -1;
@@ -1110,8 +1310,8 @@ int app_icon(const char *tid, buf_t *out) {
 }
 
 int app_add(const char *tid, char *msg, size_t cap) {
-    char rm[64], root[32];
-    if (find_root(tid, root, sizeof(root))) {
+    char rm[64], dir[PATH_MAX];
+    if (find_title_dir(tid, dir, sizeof(dir))) {
         snprintf(msg, cap, "%s is not on any connected USB drive", tid);
         return -1;
     }
