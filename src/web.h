@@ -14,6 +14,8 @@ int app_launch_check_json(const char *tid, buf_t *out);
 int app_probe_preview_json(const char *tid, buf_t *out);
 int app_probe_mount(const char *tid, const char *nonce, char *msg, size_t cap);
 int app_probe_release(const char *tid, const char *nonce, char *msg, size_t cap);
+int app_register_preview_json(const char *tid, buf_t *out);
+int app_register_one(const char *tid, const char *nonce, char *msg, size_t cap);
 int app_organize(const char *tid, const char *nonce, char *msg, size_t cap);
 int app_recovery_json(int usb, buf_t *out);
 int app_rollback(int usb, const char *nonce, char *msg, size_t cap);

@@ -62,10 +62,18 @@ pre{white-space:pre-wrap;font-size:12px;max-height:60vh;overflow:auto;background
 </main>
 <dialog id="logdlg"><h3>Log</h3><pre id="log"></pre><form method="dialog"><button>Close</button></form></dialog>
 <dialog id="launchdlg"><h3>Fase 4A — verificação de montagem e registro (somente leitura)</h3><pre id="launchinfo"></pre><p class="warn">Este teste NÃO monta, registra ou executa jogos. Resultado positivo valida somente os requisitos locais verificados; a integração com o sistema ainda precisa de auditoria.</p><form method="dialog"><button>Close</button></form></dialog>
-<dialog id="probedlg"><h3>Fase 4B — montagem experimental SOMENTE LEITURA</h3>
+<dialog id="probedlg"><h3>Teste de montagem real — SOMENTE LEITURA</h3>
   <pre id="probeinfo"></pre>
   <p class="warn">Risco experimental: altera TEMPORARIAMENTE os pontos de montagem /user/app e /user/patch para UM jogo. Nunca registra, instala ou inicia jogos. Faça backup dos dados importantes. Remova a montagem pelo painel ANTES de parar o PS4Mount.</p>
-  <div class="bar"><button id="probeaction" class="danger">Confirm</button><form method="dialog"><button>Close (does NOT release mount)</button></form></div>
+  <pre id="probestatus"></pre>
+  <div class="bar"><button id="probeaction" class="danger">Executar montagem</button><form method="dialog"><button>Close (does NOT release mount)</button></form></div>
+</dialog>
+<dialog id="registerdlg"><h3>Tentar registro individual (EXPERIMENTAL)</h3>
+  <pre id="registerinfo"></pre>
+  <p class="warn">Esta operacao ESCREVE metadados e licencas no armazenamento interno do PS5 e no USB. Exige backup do PS5 e dos PKGs. NUNCA usa AppInstallAll. Se a API individual estiver indisponivel no firmware, a operacao sera BLOQUEADA antes das escritas. Depois de registrado, tente iniciar o jogo pela tela inicial.</p>
+  <label><input id="registerbackup" type="checkbox"> Tenho backup e aceito o risco para somente este CUSA</label>
+  <pre id="registerstatus"></pre>
+  <div class="bar"><button id="registeraction" class="danger">Registrar APENAS este jogo</button><form method="dialog"><button>Fechar</button></form></div>
 </dialog>
 <dialog id="autodlg"><h3>Preparação automática — um jogo</h3>
   <pre id="autostatus" role="status" aria-live="polite"></pre>
@@ -90,7 +98,7 @@ pre{white-space:pre-wrap;font-size:12px;max-height:60vh;overflow:auto;background
 </dialog>
 <div id="toast"></div>
 <script>
-var games = [], busy = {}, currentPlan = null, currentProbe = null, organizing = false;
+var games = [], busy = {}, currentPlan = null, currentProbe = null, currentRegister = null, organizing = false;
 var autoBusy = false;
 var labels = {ready: 'Ready', running: 'Running', internal: 'Installed on console', discovered: 'Discovered', queued: 'Queued', conflict: 'Conflict'};
 var registrationEnabled = false; // safety-preview build: must remain false
@@ -115,7 +123,7 @@ function render() {
     if (q && (g.name + ' ' + g.title_id).toLowerCase().indexOf(q) < 0) return;
     shown++;
     var act = '';
-    if (g.state === 'discovered') act = '<button disabled title="Safety-preview: registration not enabled">Registration locked (preview)</button>';
+    if (g.state === 'discovered') act = '';
     else if (g.state === 'ready') act = '<button disabled>Registered</button>';
     else if (g.state === 'conflict') act = '<button disabled>Manual review required</button>';
     else if (g.state === 'queued') act = '<button disabled>Queued</button>';
@@ -125,6 +133,8 @@ function render() {
       act = '<button data-a="plan" data-t="' + g.title_id + '">Preview folder plan</button>' + act;
     if (g.state !== 'conflict' && g.state !== 'internal' && g.state !== 'queued')
       act = '<button data-a="probe" data-t="' + g.title_id + '">Temporary read-only mount (Phase 4B)</button>' + act;
+    if (g.state !== 'conflict' && g.state !== 'internal' && g.state !== 'queued' && g.state !== 'ready')
+      act = '<button data-a="register" data-t="' + g.title_id + '">Tentar registro individual (apos montagem)</button>' + act;
     if (g.state !== 'conflict' && g.state !== 'internal' && g.state !== 'queued')
       act = '<button data-a="launch-check" data-t="' + g.title_id + '">Check launch prerequisites (READ-ONLY)</button>' + act;
     if (busy[g.title_id]) act = '<button disabled>Please wait…</button>';
@@ -144,7 +154,7 @@ function render() {
   });
   $('grid').innerHTML = html;
   $('empty').hidden = games.length > 0;
-  var s = '<span>PHASE 4B · ONE-title temporary read-only nullfs probe · registration locked</span><span>' + games.length + ' game(s)</span>';
+  var s = '<span>PHASE 4F · ONE title at a time · no bulk registration</span><span>' + games.length + ' game(s)</span>';
   for (var k in counts) s += '<span>' + esc(labels[k] || k) + ': ' + counts[k] + '</span>';
   $('summary').innerHTML = s;
 }
@@ -164,6 +174,7 @@ $('grid').addEventListener('click', function (e) {
     busy[tid] = 1; render();
     api('/api/probe-preview?title_id=' + tid).then(function (p) {
       currentProbe = p;
+      $('probestatus').textContent = '';
       var action = p.can_release ? 'release' : p.can_mount ? 'mount' : null;
       $('probeinfo').textContent = [
         'CUSA: ' + p.title_id,
@@ -174,9 +185,23 @@ $('grid').addEventListener('click', function (e) {
         'NO registration, NO AppInstallAll, NO DB modification, NO launch.'
       ].join('\n');
       $('probeaction').disabled = !action || !p.confirm_token;
-      $('probeaction').textContent = p.can_release ? 'Release this read-only mount' : 'MOUNT THIS ONE GAME (READ-ONLY)';
+      $('probeaction').textContent = p.can_release ? 'Liberar montagem deste jogo' : 'Montar SOMENTE este jogo (RO)';
       $('probedlg').showModal();
     }).catch(function (err) { toast('Mount preview failed: ' + err.message); })
+      .then(function () { delete busy[tid]; render(); });
+    return;
+  }
+  if (a === 'register') {
+    busy[tid] = 1; render();
+    api('/api/register-preview?title_id=' + tid).then(function (p) {
+      currentRegister = p;
+      $('registerinfo').textContent = 'CUSA: ' + p.title_id + '\nMount verified and released: ' + p.verified_mount +
+        '\nIndividual API available: ' + p.single_api_available + '\nStatus: ' + p.message;
+      $('registerbackup').checked = false;
+      $('registerstatus').textContent = '';
+      $('registeraction').disabled = !p.can_register || !p.confirm_token;
+      $('registerdlg').showModal();
+    }).catch(function (e) { toast('Targeted register preview failed: ' + e.message); })
       .then(function () { delete busy[tid]; render(); });
     return;
   }
@@ -304,21 +329,39 @@ function autoPrepareOne(tid) {
 }
 $('autodlg').addEventListener('cancel', function (event) { if (autoBusy) event.preventDefault(); });
 $('probeaction').onclick = function () {
-  if (!currentProbe || !currentProbe.confirm_token) return toast('Preview again');
+  if (!currentProbe || !currentProbe.confirm_token) return;
   var p = currentProbe, tid = p.title_id;
   var action = p.can_release ? 'release' : p.can_mount ? 'mount' : null;
   if (!action) return;
-  var text = (action === 'mount' ? 'MOUNT ' : 'RELEASE ') + tid;
-  var typed = prompt('EXPERIMENTAL TEMPORARY READ-ONLY MOUNT. Type ' + text + ' to continue:');
-  if (typed !== text) return toast('Cancelled: confirmation did not match');
-  if (!confirm((action === 'mount' ? 'Mount ' : 'Release mount for ') + tid + '? No game will be registered.')) return;
-  currentProbe = null;
-  $('probedlg').close();
-  busy[tid] = 1; render();
+  currentProbe = null; // single POST; NEVER auto retry on a lost response
+  $('probeaction').disabled = true;
+  $('probestatus').textContent = action === 'mount' ? 'Tentando montar CUSA ' + tid + '... aguarde' : 'Liberando montagem...';
   api('/api/probe-' + action + '?title_id=' + tid, 'POST', p.confirm_token).then(function (j) {
-    alert(j.message + (action === 'mount' ? '\n\nNow reopen the probe panel and RELEASE the mount.' : ''));
-  }).catch(function (e) { alert('Probe action failed: ' + e.message + '\nInspect the log before retrying.'); })
-    .then(function () { delete busy[tid]; load(); });
+    $('probestatus').textContent = 'SUCESSO: ' + j.message +
+      (action === 'mount' ? '\n\nAgora feche e abra esta janela novamente para LIBERAR a montagem antes de registrar.' :
+         '\n\nMontagem liberada. Agora use "Tentar registro individual" neste CUSA.');
+  }).catch(function (e) {
+    $('probestatus').textContent = 'FALHA/ESTADO DESCONHECIDO: ' + e.message +
+      '\n\nNAO repita cegamente. Confira o log e as montagens.';
+  }).then(function () { load(); });
+};
+$('registeraction').onclick = function () {
+  var p = currentRegister;
+  if (!p || !p.can_register || !p.confirm_token || !$('registerbackup').checked) {
+    $('registerstatus').textContent = 'Confirme backup e abra uma previa valida antes de continuar.';
+    return;
+  }
+  currentRegister = null; // one authorization, no retries
+  $('registeraction').disabled = true;
+  $('registerstatus').textContent = 'Registrando SOMENTE ' + p.title_id +
+    '... Nao desligue console nem USB. Aguarde a resposta.';
+  api('/api/register-one?title_id=' + p.title_id, 'POST', p.confirm_token).then(function (j) {
+    $('registerstatus').textContent = 'RESULTADO: ' + j.message +
+      '\nSe registrado, tente o jogo na tela inicial do PS5.';
+  }).catch(function (e) {
+    $('registerstatus').textContent = 'FALHA/ESTADO DESCONHECIDO: ' + e.message +
+      '\nNAO repita nem limpe manualmente os arquivos. Verifique o log.';
+  }).then(function () { load(); });
 };
 /* Native browser prompt()/confirm() may be suppressed while an HTML <dialog>
  * is open (especially on TV/mobile clients). Use an in-dialog, two-stage

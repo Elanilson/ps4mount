@@ -193,6 +193,22 @@ void web_serve(int listen_fd) {
             reply(fd, "200 OK", "application/json; charset=utf-8", b.data, b.len);
             buf_free(&b);
         }
+    } else if (!post && !strncmp(path, "/api/register-preview?", 22)) {
+        if (title_param(path, tid)) json_msg(fd, 0, "invalid title_id");
+        else {
+            buf_t b = {0};
+            app_register_preview_json(tid, &b);
+            reply(fd, "200 OK", "application/json; charset=utf-8", b.data, b.len);
+            buf_free(&b);
+        }
+    } else if (post && !strncmp(path, "/api/register-one?", 18)) {
+        char token[33];
+        if (title_param(path, tid) || confirmation_header(req, token))
+            json_msg(fd, 0, "Missing/invalid single-title confirmation");
+        else {
+            int rc = app_register_one(tid, token, msg, sizeof(msg));
+            json_msg(fd, !rc, msg);
+        }
     } else if (post && (!strncmp(path, "/api/probe-mount?", 17) ||
                         !strncmp(path, "/api/probe-release?", 19))) {
         char token[33];

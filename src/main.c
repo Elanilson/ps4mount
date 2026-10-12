@@ -39,7 +39,7 @@
 #include "organize.h"
 #include "icon_data.h"
 
-#define VERSION "PS4Mount 0.5.6-phase4e-usb-path-case"
+#define VERSION "PS4Mount 0.5.7-phase4f-single-register"
 #define LOCK_PORT 9032
 #define SCAN_SECONDS 10
 #define STATE_DIR "/data/ps4mount"
@@ -60,9 +60,22 @@
 typedef struct { char useless[45]; char message[3075]; } notify_request_t;
 int sceUserServiceInitialize(void *);
 int sceAppInstUtilInitialize(void);
-int sceAppInstUtilAppInstallAll(void *);
+/* No AppInstallAll declaration: global installer is intentionally unavailable. */
 int sceAppInstUtilAppUnInstall(const char *);
 int sceKernelSendNotificationRequest(int, notify_request_t *, size_t, int);
+
+/* PS5 targeted registration: unlike AppInstallAll this addresses one CUSA.
+ * No fallback whatsoever: some firmwares expose no usable single-title API.
+ * NID Wudg3Xe3heE is used by ps5-payload-dev/ftpsrv, itsPLK and
+ * ShadowMountPlus.  No system database calls are made if resolution fails. */
+typedef int (*app_install_title_dir_fn)(const char *, const char *, void *);
+static app_install_title_dir_fn one_title_install_api(void) {
+    uint32_t handle = 0;
+    if (kernel_dynlib_handle(-1, "libSceAppInstUtil.sprx", &handle))
+        return NULL;
+    return (app_install_title_dir_fn)kernel_dynlib_resolve(-1, handle, "Wudg3Xe3heE");
+}
+
 
 static void notify(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 static void notify(const char *fmt, ...) {
@@ -659,8 +672,8 @@ static int register_title(title_src_t *t) {
     }
     manage(t);
     if (!was_registered) {
-        int rc = sceAppInstUtilAppInstallAll(NULL);
-        printf("[safe][reg] %s AppInstallAll=0x%08x\n", tid, rc);
+        int rc = -1; /* Global registration permanently disabled. */
+        printf("[safe][reg] %s legacy/global registration blocked\n", tid);
         if (rc) goto done;
         /* Wait for confirmation; do NOT write directly into SQLite on timeout. */
         int status = 0;
@@ -1587,6 +1600,9 @@ static struct {
     struct stat app_stat, patch_stat;
     time_t issued;
 } g_probe_auth;
+/* Registration may follow ONLY a verified RO mount AND safe release. */
+static char g_verified_ro_tid[10];
+
 
 static void probe_auth_clear(void) { memset(&g_probe_auth, 0, sizeof(g_probe_auth)); }
 static int probe_auth_generate(const char *tid, const char *mode, const title_t *t) {
@@ -1606,7 +1622,7 @@ static int probe_auth_generate(const char *tid, const char *mode, const title_t 
         snprintf(g_probe_auth.token + i * 2, 3, "%02x", raw[i]);
     snprintf(g_probe_auth.tid, sizeof(g_probe_auth.tid), "%s", tid);
     snprintf(g_probe_auth.mode, sizeof(g_probe_auth.mode), "%s", mode);
-    if (t && !strcmp(mode, "mount")) {
+    if (t && (!strcmp(mode, "mount") || !strcmp(mode, "register"))) {
         snprintf(g_probe_auth.app_path, sizeof(g_probe_auth.app_path), "%s", t->app_path);
         snprintf(g_probe_auth.patch_path, sizeof(g_probe_auth.patch_path), "%s", t->patch_path);
         if (lstat(t->app_path, &g_probe_auth.app_stat) ||
@@ -1820,6 +1836,7 @@ int app_probe_mount(const char *tid, const char *token, char *msg, size_t cap) {
         }
         return plan_error(msg, cap, "Read-only nullfs mount refused/failed; cleanup attempted. See log");
     }
+    snprintf(g_verified_ro_tid, sizeof(g_verified_ro_tid), "%s", tid);
     printf("[safe][mount-probe] %s MOUNTED READ-ONLY: %s (no registration, no game launch)\n", tid, t->dir);
     snprintf(msg, cap, "Temporary READ-ONLY probe mounted for %s. Now RELEASE it in panel; game NOT registered", tid);
     return 0;
@@ -1879,6 +1896,155 @@ int app_launch_check_json(const char *tid, buf_t *out) {
     printf("[safe][launch-check] %s %s: %s (NO mount, NO registration, NO game launch)\n",
            tid, ready ? "PREFLIGHT-PASS" : "BLOCKED", message);
     return 0;
+}
+
+/* Phase 4F: targeted SINGLE-CUSA registration, never AppInstallAll.
+ * Must be invoked after a real read-only mount succeeded AND was released.
+ * We deliberately do not attempt to launch from this daemon: on many firmwares
+ * sceLncUtilLaunchApp must run inside SceShellUI; use the home-screen tile.
+ * Metadata preparation WRITES USB and title-scoped internal files; do this
+ * only on a sacrificial/fully backed-up console. No unsafe automatic retry. */
+int app_register_preview_json(const char *tid, buf_t *out) {
+    title_t *t = catalog_find(tid);
+    title_plan_t plan = {0};
+    char detail[256] = "";
+    int db_status = -2;
+    unsigned int checks = (unsigned int)phase4_compute(t, &plan, detail, sizeof(detail), &db_status);
+    int verified = tid && !strcmp(g_verified_ro_tid, tid) && g_probe.attempted && !g_probe.active;
+    app_install_title_dir_fn single = one_title_install_api();
+    int supported = single != NULL;
+    int ready = verified && supported && !g_registration_busy && !g_registration_fault &&
+                phase4_ready(checks);
+    /* A blocked registration preview must NOT invalidate an active release token. */
+    if (ready && probe_auth_generate(tid, "register", t)) ready = 0;
+    const char *message = g_probe.active ? "Release the read-only mount before registration" :
+        !verified ? "Complete an ACTUAL read-only mount and release it in this PS4Mount session first" :
+        !supported ? "Single-title AppInstallTitleDir unavailable on this firmware. NO AppInstallAll fallback" :
+        g_registration_fault ? "Prior registration attempt failed; stop and inspect internal metadata" :
+        !phase4_ready(checks) ? phase4_first_blocker(checks) :
+        ready ? "Targeted registration is available; writes metadata for ONE CUSA, then verifies app.db" :
+        "Cannot authorize targeted registration";
+    buf_printf(out, "{\"ok\":true,\"title_id\":"); json_str(out, tid);
+    buf_printf(out, ",\"can_register\":%s,\"single_api_available\":%s,\"verified_mount\":%s,\"message\":",
+               ready ? "true" : "false", supported ? "true" : "false", verified ? "true" : "false");
+    json_str(out, message);
+    buf_printf(out, ",\"confirm_token\":"); json_str(out, ready ? g_probe_auth.token : "");
+    buf_printf(out, "}");
+    printf("[safe][register-preview] %s %s: %s (NO changes yet)\n", tid,
+           ready ? "READY" : "BLOCKED", message);
+    return 0;
+}
+
+int app_register_one(const char *tid, const char *token, char *msg, size_t cap) {
+    struct stat a, p;
+    char app_path[PATH_MAX], patch_path[PATH_MAX];
+    if (!probe_auth_consume(tid, "register", token, &a, &p, app_path, patch_path))
+        return plan_error(msg, cap, "Invalid or expired ONE-title registration nonce");
+    if (g_probe.active || !g_probe.attempted || strcmp(g_verified_ro_tid, tid) ||
+        g_registration_busy || g_registration_fault)
+        return plan_error(msg, cap, "RO mount not verified/released or registration already attempted");
+    title_t *t = catalog_find(tid);
+    title_plan_t plan = {0};
+    char detail[256] = "";
+    int db_status = -2;
+    if (!t || !phase4_ready((unsigned int)phase4_compute(t, &plan, detail, sizeof(detail), &db_status)) ||
+        strcmp(app_path, t->app_path) || strcmp(patch_path, t->patch_path) ||
+        !same_stat(app_path, &a) || (t->patch_path[0] && !same_stat(patch_path, &p)))
+        return plan_error(msg, cap, "CUSA/PKG changed or preflight failed; no system writes");
+
+    /* Critical safety boundary: NO fallback to AppInstallAll. Must resolve
+     * BEFORE any system metadata/file write, including sceAppInstUtil init. */
+    app_install_title_dir_fn single = one_title_install_api();
+    if (!single)
+        return plan_error(msg, cap, "AppInstallTitleDir unavailable: registration NOT attempted");
+    char app_target[64], patch_target[64];
+    int create_app = 0, create_patch = 0;
+    snprintf(app_target, sizeof(app_target), "/user/app/%.9s", tid);
+    snprintf(patch_target, sizeof(patch_target), "/user/patch/%.9s", tid);
+    if (probe_safe_target(app_target, "/user/app", t->dir, &create_app) ||
+        probe_safe_target(patch_target, "/user/patch", t->dir, &create_patch))
+        return plan_error(msg, cap, "A target mount path is occupied: nothing registered");
+    g_registration_busy = 1;
+    g_registration_fault = 1; /* no retries after ANY mutation or unknown result */
+    g_verified_ro_tid[0] = 0; /* verified probe can be consumed only once */
+    printf("[safe][register-one] %s BEGIN single-title registration (NO AppInstallAll)\n", tid);
+    int init_rc = sceAppInstUtilInitialize();
+    if (init_rc) {
+        printf("[safe][register-one] init failed: 0x%08x; NO metadata staged\n", init_rc);
+        snprintf(msg, cap, "AppInstUtil initialization failed: 0x%08x (no metadata written)", init_rc);
+        g_registration_busy = 0;
+        return -1;
+    }
+    title_src_t src;
+    if (src_open(&src, t->dir, tid)) {
+        snprintf(msg, cap, "Source PKGs cannot be opened; no metadata staged");
+        g_registration_busy = 0;
+        return -1;
+    }
+    int rc = -1;
+    if (strcmp(src.app.title_id, tid) || strcmp(src.app.content_id, t->content_id) ||
+        (t->patch_path[0] && !src.has_patch)) {
+        snprintf(msg, cap, "Source CUSA or update mismatch. No files staged");
+        goto reg_done;
+    }
+    if (place_files(&src)) {
+        snprintf(msg, cap, "Title metadata staging FAILED. Partial files may exist; do not retry");
+        goto reg_done;
+    }
+    if (mount_title(&src, 1)) {
+        snprintf(msg, cap, "Writable registration mount FAILED; do not retry until paths inspected");
+        goto reg_done;
+    }
+    manage(&src);
+    /* pass the /user/app/ PARENT, not a global install function */
+    rc = single(tid, "/user/app/", NULL);
+    printf("[safe][register-one] %s AppInstallTitleDir rc=0x%08x\n", tid, rc);
+    if (rc && (uint32_t)rc != 0x80990002u) {
+        snprintf(msg, cap, "Targeted registration returned 0x%08x; inspect PS5 before retry", rc);
+        goto reg_done;
+    }
+    int status = -1;
+    for (int i = 0; i < 12; ++i) {
+        status = db_registered_status(tid);
+        if (status != 0) break;
+        usleep(400000);
+    }
+    if (status != 1) {
+        snprintf(msg, cap, "Single-title API returned success but app.db verification=%d. NO auto retry", status);
+        goto reg_done;
+    }
+    enforce_patch_sfo(&src);
+    char marker[64];
+    snprintf(marker, sizeof(marker), STATE_DIR "/%s.src", tid);
+    if (write_file(marker, src.marker, strlen(src.marker), 0666)) {
+        snprintf(msg, cap, "Registered, but tracking marker write failed; do not retry");
+        goto reg_done;
+    }
+    /* Original PS4Mount leaves the USB readonly except while the game is
+     * selected/running. Do not report success unless the layers go back RO. */
+    if (mount_title(&src, 0)) {
+        snprintf(msg, cap, "Registered, but reverting mounts to read-only failed; inspect log");
+        goto reg_done;
+    }
+    if (top_layer(app_target, src.dir) != 1 ||
+        (src.has_patch && top_layer(patch_target, src.dir) != 1)) {
+        snprintf(msg, cap, "Registered, but read-only mount verification failed; inspect log");
+        goto reg_done;
+    }
+    managed_t *m = managed_by(tid, NULL);
+    if (m) m->rw = 0;
+    /* Keep the individual game's nullfs layers managed. The game's tile is
+     * launched manually from SceShellUI, never from this daemon. */
+    printf("[safe][register-one] %s REGISTERED INDIVIDUALLY; launch via PS5 home screen\n", tid);
+    snprintf(msg, cap, "%s registered! Try launching its tile in PS5 home; leave USB and daemon active", tid);
+    g_registration_fault = 0;
+    rc = 0;
+reg_done:
+    src_close(&src);
+    if (g_registration_fault)
+        printf("[safe][register-one] %s FAILED/UNKNOWN: locked further registration, no rollback or bulk operation\n", tid);
+    g_registration_busy = 0;
+    return g_registration_fault ? -1 : 0;
 }
 
 /* Web endpoint returns paths for review but NEVER mutates the drive. */
@@ -2125,8 +2291,8 @@ static void install_panel_shortcut(void) {
         printf("[panel] shortcut files: %s\n", strerror(errno));
         return;
     }
-    rc = sceAppInstUtilAppInstallAll(NULL);
-    printf("[panel] shortcut install rc=0x%08x\n", rc);
+    rc = -1; /* Do not invoke bulk installer for a panel shortcut either. */
+    printf("[panel] shortcut automatic registration disabled\n");
     if (!rc)
         notify("PS4Mount added to the Media tab");
 }
@@ -2231,9 +2397,9 @@ int main(void) {
     /* SAFE PREVIEW: shortcut installation invokes AppInstallAll and writes
      * to PS5 DB even during discovery; never install it automatically. */
     printf("\n======= " VERSION " session start =======\n");
-    printf("[safe] shortcut install DISABLED; registration DISABLED; open http://<PS5 IP>:8770\n");
+    printf("[safe] shortcut install DISABLED; bulk registration DISABLED; targeted one-title test opt-in; open http://<PS5 IP>:8770\n");
     g_web = web_listen();
-    notify(g_web >= 0 ? VERSION " running. ONE-title RO mount probe; registration LOCKED; panel :8770" : VERSION " panel unavailable");
+    notify(g_web >= 0 ? VERSION " running. ONE-title mount + optional targeted registration; NO bulk fallback; panel :8770" : VERSION " panel unavailable");
     unlink(STATE_DIR "/stop");
     for (;;) {
         if (g_stop || exists(STATE_DIR "/stop")) {

@@ -1,3 +1,15 @@
+# PS4Mount 0.5.7 — Registro individual experimental (Fase 4F)
+
+**Limites:** esta compilacao NAO garante execucao do jogo. O log 0.5.6 nao mostrou montagem efetiva, somente PREVIEW. A nova versao corrige os `prompt()/confirm()` escondidos pelo `<dialog>`, para que o botao realmente envie a tentativa de montagem. Adiciona suporte *condicional* a `sceAppInstUtilAppInstallTitleDir` (NID `Wudg3Xe3heE`), SEM fallback para `sceAppInstUtilAppInstallAll(NULL)`. Firmwares 12.00+ podem nao oferecer essa API: neste caso, o painel bloqueia registro ANTES de escrever metadados.
+
+**Procedimento:** Backup dos PKGs e dados internos. Selecione CUSA03323 > `Temporary read-only mount` > `Montar SOMENTE este jogo (RO)`; espere resposta. Reabra a janela e clique `Liberar montagem deste jogo`; espere sucesso. So se ambas ocorrerem, clique `Tentar registro individual (apos montagem)`, confira se `Individual API available: true` e siga a confirmacao de backup. O app vai tentar escrever os metadados do titulo e registrar so esse CUSA, verificando `app.db` somente por leitura. Se confirmado, abra pelo home screen do PS5; nenhum injetor ShellUI foi incluido. Caso ocorram falhas, nao repita, pois pode existir estado parcial interno. Nao desligue nem desconecte USB durante as operacoes.
+
+**Risco serio:** o registro grava metadados internos e pode travar o console. Nao ha rollback transacional da preparacao interna nem mecanismo de desinstalacao nesta versao. Nenhuma chamada em lote nem escrita SQL direta foi adicionada. Use somente em console que possa ser restaurado a partir de backup e nunca em console de producao.
+
+Build ELF somente via GitHub Actions/PS5 SDK. `bash tests/run_host_tests.sh` testa as partes portaveis, nao as APIs/montagens do PS5. **Este ZIP e codigo-fonte, nao ELF.**
+
+---
+
 # PS4Mount 0.5.6 — Corrige prévia após organizar no USB (Fase 4E)
 
 **Confirmado no log real da 0.5.4:** `CUSA03323 DONE`, e no rescan os dois PKGs aparecem em
