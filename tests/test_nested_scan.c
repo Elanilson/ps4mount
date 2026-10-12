@@ -5,6 +5,9 @@
 #undef main
 #include <assert.h>
 
+/* The isolated scanner host fixture has no PS5 app.db. */
+int db_registered_status(const char *tid) { (void)tid; return 0; }
+
 /* Minimal host buffer helpers needed to exercise the authenticated preview. */
 void buf_put(buf_t *b, const void *data, size_t len) {
     if (b->len + len + 1 > b->cap) {
@@ -139,6 +142,23 @@ int main(void) {
     snprintf(p, sizeof(p), "%s/Update Version.pkg", updates); assert(exists(p));
     snprintf(p, sizeof(p), "%s/DLC.pkg", dlcs); assert(exists(p));
     printf("PASS: recursive scanning is read-only and joins update by CUSA across folders\n");
+
+    /* Phase 4A: read-only preflight gating is fail-closed for every bit. */
+    assert(phase4_ready(PH4_REQUIRED));
+    for (unsigned int bit = 1; bit <= PH4_DB_ABSENT; bit <<= 1) {
+        assert(!phase4_ready(PH4_REQUIRED & ~bit));
+        assert(strcmp(phase4_first_blocker(PH4_REQUIRED & ~bit),
+                      phase4_first_blocker(PH4_REQUIRED)) != 0);
+    }
+    assert(!phase4_ready(PH4_CATALOG | PH4_CONFLICT_FREE));
+    assert(strstr(phase4_first_blocker(PH4_REQUIRED & ~PH4_ORGANIZED), "not yet"));
+    buf_t launch_json = {0};
+    assert(app_launch_check_json("CUSA99999", &launch_json) == 0);
+    assert(strstr((char *)launch_json.data, "\"preflight_passed\":false"));
+    assert(strstr((char *)launch_json.data, "\"launchable\":false"));
+    assert(strstr((char *)launch_json.data, "\"registration_enabled\":false"));
+    buf_free(&launch_json);
+    printf("PASS: phase 4A read-only single-title preflight requires EVERY check; missing title blocked\n");
 
     /* Test registration is hard-disabled without touching the file tree. */
     char msg[256];

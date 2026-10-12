@@ -177,6 +177,14 @@ void web_serve(int listen_fd) {
             reply(fd, rc ? "400 Bad Request" : "200 OK", "application/json; charset=utf-8", b.data, b.len);
             buf_free(&b);
         }
+    } else if (!post && !strncmp(path, "/api/launch-check?", 18)) {
+        if (title_param(path, tid)) json_msg(fd, 0, "invalid title_id");
+        else {
+            buf_t b = {0};
+            app_launch_check_json(tid, &b);
+            reply(fd, "200 OK", "application/json; charset=utf-8", b.data, b.len);
+            buf_free(&b);
+        }
     } else if (post && !strncmp(path, "/api/organize?", 14)) {
         char token[33];
         if (title_param(path, tid) || confirmation_header(req, token))

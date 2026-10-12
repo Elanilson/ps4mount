@@ -39,7 +39,7 @@
 #include "organize.h"
 #include "icon_data.h"
 
-#define VERSION "PS4Mount 0.5.1-phase3b-single"
+#define VERSION "PS4Mount 0.5.2-phase4a-preflight"
 #define LOCK_PORT 9032
 #define SCAN_SECONDS 10
 #define STATE_DIR "/data/ps4mount"
@@ -1514,6 +1514,110 @@ static int pkg_matches_catalog(const title_t *t, char *why, size_t cap) {
 static int supported_usb(const title_t *t) {
     return t && !strncmp(t->root, "/mnt/usb", 8) &&
            t->root[8] >= '0' && t->root[8] <= '7' && !t->root[9] && is_mountpoint(t->root);
+}
+
+/* Phase 4A: per-CUSA READ-ONLY mount/registration prerequisites.  Never
+ * call the legacy register_title(), mount_title(), place_files() or any
+ * system-writing function from this endpoint. Passing this check does NOT
+ * mean the title is runnable: system integration remains unimplemented. */
+enum {
+    PH4_CATALOG       = 1u << 0,
+    PH4_CONFLICT_FREE = 1u << 1,
+    PH4_USB_MOUNTED   = 1u << 2,
+    PH4_JOURNAL_CLEAR = 1u << 3,
+    PH4_NOT_INTERNAL  = 1u << 4,
+    PH4_SAFE_PATHS    = 1u << 5,
+    PH4_ORGANIZED     = 1u << 6,
+    PH4_METADATA_OK   = 1u << 7,
+    PH4_DB_READABLE   = 1u << 8,
+    PH4_DB_ABSENT     = 1u << 9,
+};
+#define PH4_REQUIRED ((1u << 10) - 1u)
+
+static const char *phase4_first_blocker(unsigned int checks) {
+    if (!(checks & PH4_CATALOG)) return "Game not found: scan USB and retry";
+    if (!(checks & PH4_CONFLICT_FREE)) return "Game/update conflict: review candidates first";
+    if (!(checks & PH4_USB_MOUNTED)) return "USB is not a supported mounted drive";
+    if (!(checks & PH4_JOURNAL_CLEAR)) return "USB has an unfinished/unreadable organization journal; inspect USB recovery";
+    if (!(checks & PH4_NOT_INTERNAL)) return "Game appears installed internally: refusing conflicting registration";
+    if (!(checks & PH4_SAFE_PATHS)) return "Cannot verify PKG paths or target directory; check Phase 3B preview";
+    if (!(checks & PH4_ORGANIZED)) return "PKGs are not yet at their Phase 3B destination; organize ONE title first";
+    if (!(checks & PH4_METADATA_OK)) return "PKG metadata changed or cannot be verified; rescan and inspect";
+    if (!(checks & PH4_DB_READABLE)) return "Cannot read PS5 application database safely";
+    if (!(checks & PH4_DB_ABSENT)) return "CUSA is already registered; do not overwrite or re-register";
+    return "USB/metadata preflight passed. Launch/registration is NOT enabled.";
+}
+static int phase4_ready(unsigned int checks) {
+    return (checks & PH4_REQUIRED) == PH4_REQUIRED;
+}
+static void phase4_check_bool(buf_t *out, const char *key, unsigned int flags, unsigned int bit, int comma) {
+    buf_printf(out, "%s\"%s\":%s", comma ? "," : "", key, (flags & bit) ? "true" : "false");
+}
+
+/* An informational GET only: lstat, PKG header reads and SELECT from a
+ * read-only SQLite handle. No mkdir, rename, mount, system write or install. */
+int app_launch_check_json(const char *tid, buf_t *out) {
+    title_t *t = catalog_find(tid);
+    unsigned int checks = 0;
+    title_plan_t plan = {0};
+    char detail[256] = "";
+    int db_status = -2; /* -2 = not checked, -1 = read error */
+    if (t && t->app_path[0]) checks |= PH4_CATALOG;
+    if ((checks & PH4_CATALOG) && !t->conflict && !t->patch_conflict &&
+        !(t->update_count && !t->patch_path[0])) checks |= PH4_CONFLICT_FREE;
+    if ((checks & PH4_CONFLICT_FREE) && supported_usb(t)) checks |= PH4_USB_MOUNTED;
+    if ((checks & PH4_USB_MOUNTED) && org_pending(t->root) == 0) checks |= PH4_JOURNAL_CLEAR;
+    if ((checks & PH4_JOURNAL_CLEAR) && !installed_internally(tid)) checks |= PH4_NOT_INTERNAL;
+    if ((checks & PH4_NOT_INTERNAL) && !plan_title(t, &plan, detail, sizeof(detail))) {
+        checks |= PH4_SAFE_PATHS;
+        if (!plan.app_move && !plan.patch_move && !plan.create_library && !plan.create_folder)
+            checks |= PH4_ORGANIZED;
+    }
+    if ((checks & PH4_ORGANIZED) && !pkg_matches_catalog(t, detail, sizeof(detail)))
+        checks |= PH4_METADATA_OK;
+    if ((checks & PH4_METADATA_OK) && (db_status = db_registered_status(tid)) >= 0) {
+        checks |= PH4_DB_READABLE;
+        if (db_status == 0) checks |= PH4_DB_ABSENT;
+    }
+    int ready = phase4_ready(checks);
+    const char *message = phase4_first_blocker(checks);
+    buf_printf(out, "{\"ok\":true,\"title_id\":"); json_str(out, tid);
+    buf_printf(out, ",\"preflight_passed\":%s,\"read_only\":true,"
+                    "\"launchable\":false,\"registration_enabled\":false,"
+                    "\"message\":", ready ? "true" : "false");
+    json_str(out, message);
+    buf_printf(out, ",\"detail\":"); json_str(out, detail);
+    buf_printf(out, ",\"database_status\":");
+    json_str(out, db_status == 0 ? "not_registered" : db_status == 1 ? "already_registered" :
+                  db_status == -1 ? "unavailable" : "not_checked");
+    buf_printf(out, ",\"app_path\":"); json_str(out, t ? t->app_path : "");
+    buf_printf(out, ",\"update_path\":"); json_str(out, t ? t->patch_path : "");
+    buf_printf(out, ",\"expected_app_path\":"); json_str(out, plan.app_destination);
+    buf_printf(out, ",\"expected_update_path\":");
+    json_str(out, t && t->patch_path[0] ? plan.patch_destination : "");
+    buf_printf(out, ",\"proposed_app_mount\":");
+    char target[64];
+    snprintf(target, sizeof(target), "/user/app/%.9s", tid);
+    json_str(out, target);
+    buf_printf(out, ",\"proposed_patch_mount\":");
+    if (t && t->patch_path[0]) snprintf(target, sizeof(target), "/user/patch/%.9s", tid);
+    else target[0] = '\0';
+    json_str(out, target);
+    buf_printf(out, ",\"checks\":{");
+    phase4_check_bool(out, "catalog", checks, PH4_CATALOG, 0);
+    phase4_check_bool(out, "no_conflicts", checks, PH4_CONFLICT_FREE, 1);
+    phase4_check_bool(out, "usb_mounted", checks, PH4_USB_MOUNTED, 1);
+    phase4_check_bool(out, "journal_clear", checks, PH4_JOURNAL_CLEAR, 1);
+    phase4_check_bool(out, "not_installed_internally", checks, PH4_NOT_INTERNAL, 1);
+    phase4_check_bool(out, "paths_safe", checks, PH4_SAFE_PATHS, 1);
+    phase4_check_bool(out, "organized", checks, PH4_ORGANIZED, 1);
+    phase4_check_bool(out, "metadata_matches", checks, PH4_METADATA_OK, 1);
+    phase4_check_bool(out, "database_readable", checks, PH4_DB_READABLE, 1);
+    phase4_check_bool(out, "not_registered", checks, PH4_DB_ABSENT, 1);
+    buf_printf(out, "}}");
+    printf("[safe][launch-check] %s %s: %s (NO mount, NO registration, NO game launch)\n",
+           tid, ready ? "PREFLIGHT-PASS" : "BLOCKED", message);
+    return 0;
 }
 
 /* Web endpoint returns paths for review but NEVER mutates the drive. */

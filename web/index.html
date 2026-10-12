@@ -55,6 +55,7 @@ pre{white-space:pre-wrap;font-size:12px;max-height:60vh;overflow:auto;background
   <div class="empty" id="empty" hidden>No games found. PKGs may be in any subfolder; rescan to refresh.</div>
 </main>
 <dialog id="logdlg"><h3>Log</h3><pre id="log"></pre><form method="dialog"><button>Close</button></form></dialog>
+<dialog id="launchdlg"><h3>Fase 4A — verificação de montagem e registro (somente leitura)</h3><pre id="launchinfo"></pre><p class="warn">Este teste NÃO monta, registra ou executa jogos. Resultado positivo valida somente os requisitos locais verificados; a integração com o sistema ainda precisa de auditoria.</p><form method="dialog"><button>Close</button></form></dialog>
 <dialog id="plandlg"><h3>Organization preview — review before writing</h3><pre id="planinfo"></pre><p class="warn">USB FILES MAY BE MOVED by the explicit action below. A BACKUP is strongly recommended. Never unplug during an operation. NO games will be registered or launched.</p><div class="bar"><button id="organizebtn" class="danger">Organize THIS title on USB</button><form method="dialog"><button>Cancel</button></form></div></dialog>
 <div id="toast"></div>
 <script>
@@ -88,6 +89,8 @@ function render() {
     else if (g.state === 'queued') act = '<button disabled>Queued</button>';
     if (g.state !== 'conflict' && g.state !== 'internal' && g.state !== 'queued')
       act = '<button data-a="plan" data-t="' + g.title_id + '">Preview folder plan</button>' + act;
+    if (g.state !== 'conflict' && g.state !== 'internal' && g.state !== 'queued')
+      act = '<button data-a="launch-check" data-t="' + g.title_id + '">Check launch prerequisites (READ-ONLY)</button>' + act;
     if (busy[g.title_id]) act = '<button disabled>Please wait…</button>';
     html += '<div class="card"><div class="art" style="background-image:url(/icon/' + g.title_id + ')">' +
       '<span class="badge b-' + g.state + '">' + esc(labels[g.state] || g.state) + '</span></div>' +
@@ -105,7 +108,7 @@ function render() {
   });
   $('grid').innerHTML = html;
   $('empty').hidden = games.length > 0;
-  var s = '<span>PHASE 3B · ONE title per explicit confirmation · registration locked</span><span>' + games.length + ' game(s)</span>';
+  var s = '<span>PHASE 4A · READ-ONLY launch preflight · registration locked</span><span>' + games.length + ' game(s)</span>';
   for (var k in counts) s += '<span>' + esc(labels[k] || k) + ': ' + counts[k] + '</span>';
   $('summary').innerHTML = s;
 }
@@ -119,6 +122,33 @@ $('grid').addEventListener('click', function (e) {
   var b = e.target.closest('button[data-a]');
   if (!b) return;
   var tid = b.getAttribute('data-t'), a = b.getAttribute('data-a');
+  if (a === 'launch-check') {
+    busy[tid] = 1; render();
+    api('/api/launch-check?title_id=' + tid).then(function (p) {
+      var lines = [
+        'Game: ' + p.title_id,
+        'Preflight: ' + (p.preflight_passed ? 'PASSED (local checks only)' : 'BLOCKED'),
+        'Reason: ' + p.message,
+        'Filesystem detail: ' + (p.detail || '(none)'),
+        'PS5 app database: ' + p.database_status,
+        '', 'Source PKG: ' + p.app_path,
+        'Update PKG: ' + (p.update_path || '(none)'),
+        'Expected app: ' + (p.expected_app_path || '(not known yet)'),
+        'Expected update: ' + (p.expected_update_path || '(none)'),
+        'PROPOSED app mount: ' + p.proposed_app_mount,
+        'PROPOSED patch mount: ' + (p.proposed_patch_mount || '(none)'),
+        '', 'Read-only checks:'
+      ];
+      Object.keys(p.checks).forEach(function (key) {
+        lines.push('  ' + (p.checks[key] ? '[OK] ' : '[BLOCKED/NOT CHECKED] ') + key);
+      });
+      lines.push('', 'NO GAME WAS MOUNTED, REGISTERED, OR LAUNCHED.');
+      $('launchinfo').textContent = lines.join('\n');
+      $('launchdlg').showModal();
+    }).catch(function (err) { toast('Launch preflight failed: ' + err.message); })
+      .then(function () { delete busy[tid]; render(); });
+    return;
+  }
   if (a === 'plan') {
     busy[tid] = 1; render();
     api('/api/plan?title_id=' + tid).then(function (p) {

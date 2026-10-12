@@ -10,6 +10,7 @@
 /* Implemented by main.c for the web panel. */
 void app_games_json(buf_t *out);
 int app_plan_json(const char *tid, buf_t *out);
+int app_launch_check_json(const char *tid, buf_t *out);
 int app_organize(const char *tid, const char *nonce, char *msg, size_t cap);
 int app_recovery_json(int usb, buf_t *out);
 int app_rollback(int usb, const char *nonce, char *msg, size_t cap);
