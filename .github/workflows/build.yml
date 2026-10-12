@@ -23,7 +23,7 @@ jobs:
       - name: Install host tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang-18 lld-18 xxd unzip
+          sudo apt-get install -y clang-18 lld-18 xxd unzip libsqlite3-dev
 
       - name: Cache PS5 Payload SDK
         id: sdk-cache
@@ -46,6 +46,11 @@ jobs:
             echo "::error::Tag ${GITHUB_REF_NAME} does not match VERSION \"${version}\" in src/main.c"
             exit 1
           fi
+
+      - name: Safety-preview guard and host tests
+        run: |
+          grep -q '^#define ENABLE_EXPERIMENTAL_REGISTRATION 0$' src/main.c
+          bash tests/run_host_tests.sh
 
       - name: Build
         run: PS5_PAYLOAD_SDK="$HOME/ps5-payload-sdk" bash build.sh

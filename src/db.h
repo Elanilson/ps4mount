@@ -16,6 +16,8 @@ typedef struct {
     uint64_t install_version;
 } db_title_t;
 
+/* 1 registered, 0 not registered, -1 DB read/lock/schema error. */
+int db_registered_status(const char *title_id);
 int db_is_registered(const char *title_id);
 /* Inserts rows into app.db and appinfo.db. Returns 0 on success. */
 int db_register(const db_title_t *t);

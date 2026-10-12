@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PS4Mount</title>
+<title>PS4Mount Safety Preview</title>
 <style>
 :root{--bg:#0e1116;--panel:#171b22;--line:#262c36;--fg:#e8eaed;--muted:#97a0ab;--accent:#3d7bfd;--ok:#2f9e57;--warn:#c98b1f;--bad:#c2453b}
 *{box-sizing:border-box}
@@ -51,13 +51,14 @@ pre{white-space:pre-wrap;font-size:12px;max-height:60vh;overflow:auto;background
 <main>
   <div class="summary" id="summary"></div>
   <div class="grid" id="grid"></div>
-  <div class="empty" id="empty" hidden>No PS4 games found. Put the .pkg files (game and update) in the root of a USB drive.</div>
+  <div class="empty" id="empty" hidden>No games found. PKGs may be in any subfolder; rescan to refresh.</div>
 </main>
 <dialog id="logdlg"><h3>Log</h3><pre id="log"></pre><form method="dialog"><button>Close</button></form></dialog>
 <div id="toast"></div>
 <script>
 var games = [], busy = {};
-var labels = {ready: 'Ready', running: 'Running', removed: 'Not in library', internal: 'Installed on console', pending: 'Adding'};
+var labels = {ready: 'Ready', running: 'Running', internal: 'Installed on console', discovered: 'Discovered', queued: 'Queued', conflict: 'Conflict'};
+var registrationEnabled = false; // safety-preview build: must remain false
 
 function $(id) { return document.getElementById(id); }
 function esc(s) { return String(s).replace(/[&<>"']/g, function (c) { return '&#' + c.charCodeAt(0) + ';'; }); }
@@ -77,9 +78,10 @@ function render() {
     if (q && (g.name + ' ' + g.title_id).toLowerCase().indexOf(q) < 0) return;
     shown++;
     var act = '';
-    if (g.state === 'removed') act = '<button class="primary" data-a="mount" data-t="' + g.title_id + '">Add to library</button>';
-    else if (g.state === 'ready') act = '<button class="danger" data-a="unmount" data-t="' + g.title_id + '">Remove from library</button>';
-    else if (g.state === 'running') act = '<button disabled>Close the game to remove it</button>';
+    if (g.state === 'discovered') act = '<button disabled title="Safety-preview: registration not enabled">Registration locked (preview)</button>';
+    else if (g.state === 'ready') act = '<button disabled>Registered</button>';
+    else if (g.state === 'conflict') act = '<button disabled>Resolve duplicate PKGs</button>';
+    else if (g.state === 'queued') act = '<button disabled>Queued</button>';
     if (busy[g.title_id]) act = '<button disabled>Please wait…</button>';
     html += '<div class="card"><div class="art" style="background-image:url(/icon/' + g.title_id + ')">' +
       '<span class="badge b-' + g.state + '">' + esc(labels[g.state] || g.state) + '</span></div>' +
@@ -91,13 +93,13 @@ function render() {
   });
   $('grid').innerHTML = html;
   $('empty').hidden = games.length > 0;
-  var s = '<span>' + games.length + ' game(s)</span>';
+  var s = '<span>SAFE PREVIEW · read-only discovery · game registration disabled</span><span>' + games.length + ' game(s)</span>';
   for (var k in counts) s += '<span>' + esc(labels[k] || k) + ': ' + counts[k] + '</span>';
   $('summary').innerHTML = s;
 }
 
 function load() {
-  api('/api/games').then(function (j) { games = j.games; $('ver').textContent = j.version; render(); })
+  api('/api/games').then(function (j) { games = j.games; $('ver').textContent = j.version; render(); if (j.fault) toast('Registration blocked after error; see log'); })
     .catch(function (e) { toast('Could not read the list: ' + e.message); });
 }
 
