@@ -39,7 +39,7 @@
 #include "organize.h"
 #include "icon_data.h"
 
-#define VERSION "PS4Mount 0.5.2-phase4a-preflight"
+#define VERSION "PS4Mount 0.5.3-phase4b-mount-probe"
 #define LOCK_PORT 9032
 #define SCAN_SECONDS 10
 #define STATE_DIR "/data/ps4mount"
@@ -1547,6 +1547,258 @@ static const char *phase4_first_blocker(unsigned int checks) {
     if (!(checks & PH4_DB_ABSENT)) return "CUSA is already registered; do not overwrite or re-register";
     return "USB/metadata preflight passed. Launch/registration is NOT enabled.";
 }
+/* Phase 4B: ONE-TITLE, OPT-IN, READ-ONLY nullfs mount experiment.
+ * It does not call sceAppInstUtilAppInstallAll, register_title, place_files,
+ * write metadata, or modify SQLite. It is NOT a launch operation.
+ * Real console verification is required before enabling registration. */
+static int phase4_ready(unsigned int checks);
+static struct {
+    int active, attempted, made_app_dir, made_patch_dir;
+    char tid[10], dir[PATH_MAX];
+} g_probe;
+static struct {
+    char token[33], tid[10], mode[12], app_path[PATH_MAX], patch_path[PATH_MAX];
+    struct stat app_stat, patch_stat;
+    time_t issued;
+} g_probe_auth;
+
+static void probe_auth_clear(void) { memset(&g_probe_auth, 0, sizeof(g_probe_auth)); }
+static int probe_auth_generate(const char *tid, const char *mode, const title_t *t) {
+    unsigned char raw[16];
+    int fd = open("/dev/urandom", O_RDONLY);
+    if (fd < 0) return -1;
+    size_t got = 0;
+    while (got < sizeof(raw)) {
+        ssize_t n = read(fd, raw + got, sizeof(raw) - got);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) { close(fd); return -1; }
+        got += (size_t)n;
+    }
+    close(fd);
+    probe_auth_clear();
+    for (int i = 0; i < 16; ++i)
+        snprintf(g_probe_auth.token + i * 2, 3, "%02x", raw[i]);
+    snprintf(g_probe_auth.tid, sizeof(g_probe_auth.tid), "%s", tid);
+    snprintf(g_probe_auth.mode, sizeof(g_probe_auth.mode), "%s", mode);
+    if (t && !strcmp(mode, "mount")) {
+        snprintf(g_probe_auth.app_path, sizeof(g_probe_auth.app_path), "%s", t->app_path);
+        snprintf(g_probe_auth.patch_path, sizeof(g_probe_auth.patch_path), "%s", t->patch_path);
+        if (lstat(t->app_path, &g_probe_auth.app_stat) ||
+            (t->patch_path[0] && lstat(t->patch_path, &g_probe_auth.patch_stat))) {
+            probe_auth_clear(); return -1;
+        }
+    }
+    g_probe_auth.issued = time(NULL);
+    return 0;
+}
+static int probe_auth_consume(const char *tid, const char *mode, const char *token,
+                              struct stat *app, struct stat *patch,
+                              char *app_path, char *patch_path) {
+    int ok = token && strlen(token) == 32 && g_probe_auth.token[0] &&
+             !strcmp(tid, g_probe_auth.tid) && !strcmp(mode, g_probe_auth.mode) &&
+             time(NULL) >= g_probe_auth.issued && time(NULL) - g_probe_auth.issued <= 120;
+    unsigned char diff = 0;
+    if (ok) for (int i = 0; i < 32; ++i)
+        diff |= (unsigned char)(token[i] ^ g_probe_auth.token[i]);
+    ok = ok && diff == 0;
+    if (ok && app) {
+        *app = g_probe_auth.app_stat;
+        *patch = g_probe_auth.patch_stat;
+        snprintf(app_path, PATH_MAX, "%s", g_probe_auth.app_path);
+        snprintf(patch_path, PATH_MAX, "%s", g_probe_auth.patch_path);
+    }
+    probe_auth_clear(); /* ONE USE, even on a mismatch. */
+    return ok;
+}
+
+/* Only create a nullfs mount over an absent or EMPTY real directory. Never
+ * obscure existing files, a symlink, or someone else's mount. */
+static int probe_empty_dir(const char *path) {
+    DIR *d = opendir(path);
+    if (!d) return -1;
+    struct dirent *e;
+    int empty = 1;
+    while ((e = readdir(d))) {
+        if (strcmp(e->d_name, ".") && strcmp(e->d_name, "..")) { empty = 0; break; }
+    }
+    int rc = closedir(d);
+    return rc ? -1 : empty;
+}
+static int probe_safe_target(const char *path, const char *parent, const char *source, int *create) {
+    struct stat st;
+    if (lstat("/user", &st) || !S_ISDIR(st.st_mode) ||
+        lstat(parent, &st) || !S_ISDIR(st.st_mode)) return -1;
+    if (lstat(path, &st)) {
+        if (errno != ENOENT) return -1;
+        *create = 1;
+        return 0;
+    }
+    if (!S_ISDIR(st.st_mode) || top_layer(path, source) != 0 || probe_empty_dir(path) != 1)
+        return -1;
+    *create = 0;
+    return 0;
+}
+static int phase4_compute(title_t *t, title_plan_t *plan, char *detail, size_t cap,
+                          int *db_status) {
+    unsigned int checks = 0;
+    *db_status = -2;
+    if (t && t->app_path[0]) checks |= PH4_CATALOG;
+    if ((checks & PH4_CATALOG) && !t->conflict && !t->patch_conflict &&
+        !(t->update_count && !t->patch_path[0])) checks |= PH4_CONFLICT_FREE;
+    if ((checks & PH4_CONFLICT_FREE) && supported_usb(t)) checks |= PH4_USB_MOUNTED;
+    if ((checks & PH4_USB_MOUNTED) && org_pending(t->root) == 0) checks |= PH4_JOURNAL_CLEAR;
+    if ((checks & PH4_JOURNAL_CLEAR) && !installed_internally(t->tid)) checks |= PH4_NOT_INTERNAL;
+    if ((checks & PH4_NOT_INTERNAL) && !plan_title(t, plan, detail, cap)) {
+        checks |= PH4_SAFE_PATHS;
+        if (!plan->app_move && !plan->patch_move && !plan->create_library && !plan->create_folder)
+            checks |= PH4_ORGANIZED;
+    }
+    if ((checks & PH4_ORGANIZED) && !pkg_matches_catalog(t, detail, cap))
+        checks |= PH4_METADATA_OK;
+    if ((checks & PH4_METADATA_OK) && (*db_status = db_registered_status(t->tid)) >= 0) {
+        checks |= PH4_DB_READABLE;
+        if (*db_status == 0) checks |= PH4_DB_ABSENT;
+    }
+    return (int)checks;
+}
+
+/* Called by an explicit UI preview. Never mounts in this handler. */
+int app_probe_preview_json(const char *tid, buf_t *out) {
+    title_t *t = catalog_find(tid);
+    title_plan_t plan = {0};
+    char detail[256] = "";
+    int db_status = -2;
+    unsigned int checks = 0;
+    int can_mount = 0, can_release = 0;
+    probe_auth_clear();
+    if (g_probe.active) {
+        can_release = !strcmp(g_probe.tid, tid);
+    } else if (!g_probe.attempted) {
+        checks = (unsigned int)phase4_compute(t, &plan, detail, sizeof(detail), &db_status);
+        if (phase4_ready(checks)) {
+            int make_app = 0, make_patch = 0;
+            char app[64], patch[64];
+            snprintf(app, sizeof(app), "/user/app/%.9s", tid);
+            snprintf(patch, sizeof(patch), "/user/patch/%.9s", tid);
+            can_mount = !probe_safe_target(app, "/user/app", t->dir, &make_app) &&
+                        !probe_safe_target(patch, "/user/patch", t->dir, &make_patch);
+        }
+    }
+    const char *mode = can_release ? "release" : can_mount ? "mount" : "";
+    if (mode[0] && probe_auth_generate(tid, mode, t)) { can_mount = can_release = 0; mode = ""; }
+    buf_printf(out, "{\"ok\":true,\"title_id\":"); json_str(out, tid);
+    buf_printf(out, ",\"can_mount\":%s,\"can_release\":%s,\"attempted\":%s,\"read_only\":true,\"registration_enabled\":false,\"launchable\":false,\"message\":",
+               can_mount ? "true" : "false", can_release ? "true" : "false", g_probe.attempted ? "true" : "false");
+    const char *message = g_probe.active && !can_release ? "Another title has the active probe; release it first" :
+        can_release ? "Read-only mount active. Release to restore unmounted paths" :
+        g_probe.attempted ? "One mount attempt per daemon session. Restart before another attempt" :
+        !phase4_ready(checks) ? phase4_first_blocker(checks) :
+        "Target mountpoint is occupied, nonempty, a symlink, or cannot be inspected";
+    if (can_mount) message = "Ready for a SINGLE temporary read-only nullfs mount. NOT launchable.";
+    json_str(out, message);
+    buf_printf(out, ",\"confirm_token\":"); json_str(out, mode[0] ? g_probe_auth.token : "");
+    buf_printf(out, "}");
+    printf("[safe][mount-probe] %s PREVIEW %s: %s (NO DB write, NO registration)\n",
+           tid, mode[0] ? mode : "blocked", message);
+    return 0;
+}
+
+/* A probe can be released only when top mount is exactly our source folder. */
+static int probe_layer(const char *target, const char *source) {
+    struct stat st;
+    if (lstat(target, &st)) return errno == ENOENT ? 0 : -1;
+    if (!S_ISDIR(st.st_mode)) return -1;
+    return top_layer(target, source);
+}
+static int probe_release_internal(char *msg, size_t cap) {
+    if (!g_probe.active) return plan_error(msg, cap, "No active mount probe");
+    int failed = 0;
+    char app[64], patch[64];
+    snprintf(app, sizeof(app), "/user/app/%.9s", g_probe.tid);
+    snprintf(patch, sizeof(patch), "/user/patch/%.9s", g_probe.tid);
+    int pa = probe_layer(app, g_probe.dir), pp = probe_layer(patch, g_probe.dir);
+    if (pa < 0 || pp < 0) {
+        snprintf(msg, cap, "Unknown or foreign mount detected; no mount touched. Inspect before retry");
+        return -1;
+    }
+    if (pp > 0 && unmount_owned_layer(patch, g_probe.dir)) failed = 1;
+    if (pa > 0 && unmount_owned_layer(app, g_probe.dir)) failed = 1;
+    if (failed) {
+        snprintf(msg, cap, "At least one read-only probe mount could not be released; do NOT retry");
+        return -1;
+    }
+    if (g_probe.made_patch_dir) (void)rmdir(patch); /* only succeeds when empty */
+    if (g_probe.made_app_dir) (void)rmdir(app);
+    printf("[safe][mount-probe] %s RELEASED read-only layer(s); NO registration\n", g_probe.tid);
+    memset(&g_probe, 0, sizeof(g_probe));
+    g_probe.attempted = 1;
+    snprintf(msg, cap, "Read-only mount probe released. Game was NOT registered or launched");
+    return 0;
+}
+int app_probe_release(const char *tid, const char *token, char *msg, size_t cap) {
+    if (!probe_auth_consume(tid, "release", token, NULL, NULL, NULL, NULL))
+        return plan_error(msg, cap, "Invalid/expired single-use release confirmation; refresh preview");
+    if (!g_probe.active || strcmp(g_probe.tid, tid))
+        return plan_error(msg, cap, "No matching active probe");
+    return probe_release_internal(msg, cap);
+}
+int app_probe_mount(const char *tid, const char *token, char *msg, size_t cap) {
+    struct stat a, p;
+    char app_path[PATH_MAX], patch_path[PATH_MAX];
+    if (!probe_auth_consume(tid, "mount", token, &a, &p, app_path, patch_path))
+        return plan_error(msg, cap, "Invalid/expired single-use probe confirmation; refresh preview");
+    if (g_probe.active || g_probe.attempted)
+        return plan_error(msg, cap, "A mount was already attempted this session");
+    g_probe.attempted = 1; /* fail-closed: no second attempt, even on failure */
+    title_t *t = catalog_find(tid);
+    title_plan_t plan = {0};
+    char detail[256] = "";
+    int db_status = -2;
+    if (!phase4_ready((unsigned int)phase4_compute(t, &plan, detail, sizeof(detail), &db_status)) ||
+        !t || strcmp(app_path, t->app_path) || strcmp(patch_path, t->patch_path) ||
+        !same_stat(t->app_path, &a) || (t->patch_path[0] && !same_stat(t->patch_path, &p)))
+        return plan_error(msg, cap, "Title changed or failed preflight; NO mounts made");
+    char app_target[64], patch_target[64];
+    snprintf(app_target, sizeof(app_target), "/user/app/%.9s", tid);
+    snprintf(patch_target, sizeof(patch_target), "/user/patch/%.9s", tid);
+    int made_app = 0, made_patch = 0;
+    if (probe_safe_target(app_target, "/user/app", t->dir, &made_app) ||
+        probe_safe_target(patch_target, "/user/patch", t->dir, &made_patch))
+        return plan_error(msg, cap, "Mount target not empty/available; NO mounts made");
+    /* Create only the directories confirmed absent. Reject races or replacements. */
+    if (made_app && mkdir(app_target, 0777))
+        return plan_error(msg, cap, "App mountpoint changed during confirmation; refused");
+    if (t->patch_path[0] && made_patch && mkdir(patch_target, 0777)) {
+        if (made_app) (void)rmdir(app_target);
+        return plan_error(msg, cap, "Patch mountpoint changed during confirmation; refused");
+    }
+    snprintf(g_probe.tid, sizeof(g_probe.tid), "%s", tid);
+    snprintf(g_probe.dir, sizeof(g_probe.dir), "%s", t->dir);
+    g_probe.active = 1;
+    /* Record any targets we created, so an interrupted second mount can be cleaned. */
+    g_probe.made_app_dir = made_app;
+    g_probe.made_patch_dir = t->patch_path[0] && made_patch;
+    int rc = mount_dir(t->dir, app_target, 0); /* ro only: nmount(MNT_RDONLY) */
+    if (!rc && t->patch_path[0]) rc = mount_dir(t->dir, patch_target, 0);
+    if (!rc && (probe_layer(app_target, t->dir) != 1 ||
+                (t->patch_path[0] && probe_layer(patch_target, t->dir) != 1))) {
+        printf("[safe][mount-probe] %s RO source/target verification FAILED\n", tid);
+        rc = -1;
+    }
+    if (rc) {
+        printf("[safe][mount-probe] %s mount FAILED; attempting owned-layer cleanup\n", tid);
+        char rollback[256];
+        if (probe_release_internal(rollback, sizeof(rollback))) {
+            snprintf(msg, cap, "Mount failed and cleanup is INCOMPLETE. Inspect logs; do not retry");
+            return -1;
+        }
+        return plan_error(msg, cap, "Read-only nullfs mount refused/failed; cleanup attempted. See log");
+    }
+    printf("[safe][mount-probe] %s MOUNTED READ-ONLY: %s (no registration, no game launch)\n", tid, t->dir);
+    snprintf(msg, cap, "Temporary READ-ONLY probe mounted for %s. Now RELEASE it in panel; game NOT registered", tid);
+    return 0;
+}
+
 static int phase4_ready(unsigned int checks) {
     return (checks & PH4_REQUIRED) == PH4_REQUIRED;
 }
@@ -1558,27 +1810,10 @@ static void phase4_check_bool(buf_t *out, const char *key, unsigned int flags, u
  * read-only SQLite handle. No mkdir, rename, mount, system write or install. */
 int app_launch_check_json(const char *tid, buf_t *out) {
     title_t *t = catalog_find(tid);
-    unsigned int checks = 0;
-    title_plan_t plan = {0};
     char detail[256] = "";
-    int db_status = -2; /* -2 = not checked, -1 = read error */
-    if (t && t->app_path[0]) checks |= PH4_CATALOG;
-    if ((checks & PH4_CATALOG) && !t->conflict && !t->patch_conflict &&
-        !(t->update_count && !t->patch_path[0])) checks |= PH4_CONFLICT_FREE;
-    if ((checks & PH4_CONFLICT_FREE) && supported_usb(t)) checks |= PH4_USB_MOUNTED;
-    if ((checks & PH4_USB_MOUNTED) && org_pending(t->root) == 0) checks |= PH4_JOURNAL_CLEAR;
-    if ((checks & PH4_JOURNAL_CLEAR) && !installed_internally(tid)) checks |= PH4_NOT_INTERNAL;
-    if ((checks & PH4_NOT_INTERNAL) && !plan_title(t, &plan, detail, sizeof(detail))) {
-        checks |= PH4_SAFE_PATHS;
-        if (!plan.app_move && !plan.patch_move && !plan.create_library && !plan.create_folder)
-            checks |= PH4_ORGANIZED;
-    }
-    if ((checks & PH4_ORGANIZED) && !pkg_matches_catalog(t, detail, sizeof(detail)))
-        checks |= PH4_METADATA_OK;
-    if ((checks & PH4_METADATA_OK) && (db_status = db_registered_status(tid)) >= 0) {
-        checks |= PH4_DB_READABLE;
-        if (db_status == 0) checks |= PH4_DB_ABSENT;
-    }
+    int db_status = -2;
+    title_plan_t plan = {0};
+    unsigned int checks = (unsigned int)phase4_compute(t, &plan, detail, sizeof(detail), &db_status);
     int ready = phase4_ready(checks);
     const char *message = phase4_first_blocker(checks);
     buf_printf(out, "{\"ok\":true,\"title_id\":"); json_str(out, tid);
@@ -1972,11 +2207,19 @@ int main(void) {
     printf("\n======= " VERSION " session start =======\n");
     printf("[safe] shortcut install DISABLED; registration DISABLED; open http://<PS5 IP>:8770\n");
     g_web = web_listen();
-    notify(g_web >= 0 ? VERSION " running. ONE-title USB organization; registration LOCKED; panel :8770" : VERSION " panel unavailable");
+    notify(g_web >= 0 ? VERSION " running. ONE-title RO mount probe; registration LOCKED; panel :8770" : VERSION " panel unavailable");
     unlink(STATE_DIR "/stop");
     for (;;) {
         if (g_stop || exists(STATE_DIR "/stop")) {
             unlink(STATE_DIR "/stop");
+            if (g_probe.active) {
+                char why[256];
+                if (probe_release_internal(why, sizeof(why))) {
+                    printf("[safe][mount-probe] stop REFUSED: unable to release probe safely: %s\n", why);
+                    g_stop = 0; /* stay alive so user can inspect the panel */
+                    continue;
+                }
+            }
             notify(VERSION " stopped");
             return 0;
         }

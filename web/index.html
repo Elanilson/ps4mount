@@ -56,10 +56,15 @@ pre{white-space:pre-wrap;font-size:12px;max-height:60vh;overflow:auto;background
 </main>
 <dialog id="logdlg"><h3>Log</h3><pre id="log"></pre><form method="dialog"><button>Close</button></form></dialog>
 <dialog id="launchdlg"><h3>Fase 4A — verificação de montagem e registro (somente leitura)</h3><pre id="launchinfo"></pre><p class="warn">Este teste NÃO monta, registra ou executa jogos. Resultado positivo valida somente os requisitos locais verificados; a integração com o sistema ainda precisa de auditoria.</p><form method="dialog"><button>Close</button></form></dialog>
+<dialog id="probedlg"><h3>Fase 4B — montagem experimental SOMENTE LEITURA</h3>
+  <pre id="probeinfo"></pre>
+  <p class="warn">Risco experimental: altera TEMPORARIAMENTE os pontos de montagem /user/app e /user/patch para UM jogo. Nunca registra, instala ou inicia jogos. Faça backup dos dados importantes. Remova a montagem pelo painel ANTES de parar o PS4Mount.</p>
+  <div class="bar"><button id="probeaction" class="danger">Confirm</button><form method="dialog"><button>Close (does NOT release mount)</button></form></div>
+</dialog>
 <dialog id="plandlg"><h3>Organization preview — review before writing</h3><pre id="planinfo"></pre><p class="warn">USB FILES MAY BE MOVED by the explicit action below. A BACKUP is strongly recommended. Never unplug during an operation. NO games will be registered or launched.</p><div class="bar"><button id="organizebtn" class="danger">Organize THIS title on USB</button><form method="dialog"><button>Cancel</button></form></div></dialog>
 <div id="toast"></div>
 <script>
-var games = [], busy = {}, currentPlan = null;
+var games = [], busy = {}, currentPlan = null, currentProbe = null;
 var labels = {ready: 'Ready', running: 'Running', internal: 'Installed on console', discovered: 'Discovered', queued: 'Queued', conflict: 'Conflict'};
 var registrationEnabled = false; // safety-preview build: must remain false
 
@@ -90,6 +95,8 @@ function render() {
     if (g.state !== 'conflict' && g.state !== 'internal' && g.state !== 'queued')
       act = '<button data-a="plan" data-t="' + g.title_id + '">Preview folder plan</button>' + act;
     if (g.state !== 'conflict' && g.state !== 'internal' && g.state !== 'queued')
+      act = '<button data-a="probe" data-t="' + g.title_id + '">Temporary read-only mount (Phase 4B)</button>' + act;
+    if (g.state !== 'conflict' && g.state !== 'internal' && g.state !== 'queued')
       act = '<button data-a="launch-check" data-t="' + g.title_id + '">Check launch prerequisites (READ-ONLY)</button>' + act;
     if (busy[g.title_id]) act = '<button disabled>Please wait…</button>';
     html += '<div class="card"><div class="art" style="background-image:url(/icon/' + g.title_id + ')">' +
@@ -108,7 +115,7 @@ function render() {
   });
   $('grid').innerHTML = html;
   $('empty').hidden = games.length > 0;
-  var s = '<span>PHASE 4A · READ-ONLY launch preflight · registration locked</span><span>' + games.length + ' game(s)</span>';
+  var s = '<span>PHASE 4B · ONE-title temporary read-only nullfs probe · registration locked</span><span>' + games.length + ' game(s)</span>';
   for (var k in counts) s += '<span>' + esc(labels[k] || k) + ': ' + counts[k] + '</span>';
   $('summary').innerHTML = s;
 }
@@ -122,6 +129,26 @@ $('grid').addEventListener('click', function (e) {
   var b = e.target.closest('button[data-a]');
   if (!b) return;
   var tid = b.getAttribute('data-t'), a = b.getAttribute('data-a');
+  if (a === 'probe') {
+    busy[tid] = 1; render();
+    api('/api/probe-preview?title_id=' + tid).then(function (p) {
+      currentProbe = p;
+      var action = p.can_release ? 'release' : p.can_mount ? 'mount' : null;
+      $('probeinfo').textContent = [
+        'CUSA: ' + p.title_id,
+        'Status: ' + (action || 'BLOCKED'),
+        'Reason: ' + p.message,
+        'Single attempt this session: ' + (p.attempted ? 'already used' : 'available'),
+        'Mode: READ-ONLY nullfs, one title only',
+        'NO registration, NO AppInstallAll, NO DB modification, NO launch.'
+      ].join('\n');
+      $('probeaction').disabled = !action || !p.confirm_token;
+      $('probeaction').textContent = p.can_release ? 'Release this read-only mount' : 'MOUNT THIS ONE GAME (READ-ONLY)';
+      $('probedlg').showModal();
+    }).catch(function (err) { toast('Mount preview failed: ' + err.message); })
+      .then(function () { delete busy[tid]; render(); });
+    return;
+  }
   if (a === 'launch-check') {
     busy[tid] = 1; render();
     api('/api/launch-check?title_id=' + tid).then(function (p) {
@@ -175,6 +202,23 @@ $('grid').addEventListener('click', function (e) {
     .catch(function (err) { toast('Error: ' + err.message); })
     .then(function () { delete busy[tid]; load(); });
 });
+$('probeaction').onclick = function () {
+  if (!currentProbe || !currentProbe.confirm_token) return toast('Preview again');
+  var p = currentProbe, tid = p.title_id;
+  var action = p.can_release ? 'release' : p.can_mount ? 'mount' : null;
+  if (!action) return;
+  var text = (action === 'mount' ? 'MOUNT ' : 'RELEASE ') + tid;
+  var typed = prompt('EXPERIMENTAL TEMPORARY READ-ONLY MOUNT. Type ' + text + ' to continue:');
+  if (typed !== text) return toast('Cancelled: confirmation did not match');
+  if (!confirm((action === 'mount' ? 'Mount ' : 'Release mount for ') + tid + '? No game will be registered.')) return;
+  currentProbe = null;
+  $('probedlg').close();
+  busy[tid] = 1; render();
+  api('/api/probe-' + action + '?title_id=' + tid, 'POST', p.confirm_token).then(function (j) {
+    alert(j.message + (action === 'mount' ? '\n\nNow reopen the probe panel and RELEASE the mount.' : ''));
+  }).catch(function (e) { alert('Probe action failed: ' + e.message + '\nInspect the log before retrying.'); })
+    .then(function () { delete busy[tid]; load(); });
+};
 $('organizebtn').onclick = function () {
   if (!currentPlan || !currentPlan.confirm_token) return toast('Preview again');
   var p = currentPlan, tid = p.title_id;
