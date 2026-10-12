@@ -33,6 +33,12 @@ main{padding:20px;max-width:1400px;margin:0 auto}
 .empty{color:var(--muted);text-align:center;padding:60px 0}
 .warn{color:#f0c060;font-size:13px;background:#3a2e12;border:1px solid #5c4818;border-radius:8px;padding:6px 8px;margin-top:4px}
 dialog{background:var(--panel);color:var(--fg);border:1px solid var(--line);border-radius:12px;max-width:min(900px,95vw);width:900px}
+#orgconfirm{border:1px solid var(--line);border-radius:8px;padding:12px;margin:12px 0}
+#orgconfirm label{display:block;margin:8px 0}
+#orgconfirm input[type=text]{max-width:100%;background:#0b0d11;color:var(--fg);border:1px solid #647084;border-radius:8px;padding:9px 12px;font:inherit}
+#orgstatus{white-space:pre-wrap;overflow-wrap:anywhere;font-weight:600}
+#orgstatus.error{color:#ffaaa1}
+#orgstatus.success{color:#99e8b8}
 dialog::backdrop{background:#000a}
 pre{white-space:pre-wrap;font-size:12px;max-height:60vh;overflow:auto;background:#0b0d11;padding:12px;border-radius:8px}
 #toast{position:fixed;right:20px;bottom:20px;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px 16px;display:none;max-width:420px}
@@ -61,10 +67,25 @@ pre{white-space:pre-wrap;font-size:12px;max-height:60vh;overflow:auto;background
   <p class="warn">Risco experimental: altera TEMPORARIAMENTE os pontos de montagem /user/app e /user/patch para UM jogo. Nunca registra, instala ou inicia jogos. Faça backup dos dados importantes. Remova a montagem pelo painel ANTES de parar o PS4Mount.</p>
   <div class="bar"><button id="probeaction" class="danger">Confirm</button><form method="dialog"><button>Close (does NOT release mount)</button></form></div>
 </dialog>
-<dialog id="plandlg"><h3>Organization preview — review before writing</h3><pre id="planinfo"></pre><p class="warn">USB FILES MAY BE MOVED by the explicit action below. A BACKUP is strongly recommended. Never unplug during an operation. NO games will be registered or launched.</p><div class="bar"><button id="organizebtn" class="danger">Organize THIS title on USB</button><form method="dialog"><button>Cancel</button></form></div></dialog>
+<dialog id="plandlg"><h3>Organization preview — review before writing</h3>
+  <pre id="planinfo"></pre>
+  <p class="warn">USB FILES MAY BE MOVED by the explicit action below. Keep a backup OUTSIDE this USB drive. Do NOT unplug it during a move. NO games will be registered or launched.</p>
+  <div id="orgconfirm" hidden>
+    <strong>Confirmar organização de UM jogo</strong>
+    <label for="orgtid">Digite exatamente <strong id="orgexpected"></strong>:</label>
+    <input id="orgtid" type="text" inputmode="text" maxlength="9" autocapitalize="characters" autocomplete="off" spellcheck="false" placeholder="CUSA00000">
+    <label><input id="orgbackup" type="checkbox"> Confirmei que existe um backup dos dois PKGs fora deste HD.</label>
+    <p id="orgstatus" role="status" aria-live="polite"></p>
+  </div>
+  <div class="bar">
+    <button id="organizebtn" class="danger" type="button">Organize THIS title on USB</button>
+    <button id="organizeconfirmbtn" class="danger" type="button" hidden>Confirmar movimentação de UM jogo</button>
+    <form method="dialog"><button id="plancancel" type="submit">Cancel / Close</button></form>
+  </div>
+</dialog>
 <div id="toast"></div>
 <script>
-var games = [], busy = {}, currentPlan = null, currentProbe = null;
+var games = [], busy = {}, currentPlan = null, currentProbe = null, organizing = false;
 var labels = {ready: 'Ready', running: 'Running', internal: 'Installed on console', discovered: 'Discovered', queued: 'Queued', conflict: 'Conflict'};
 var registrationEnabled = false; // safety-preview build: must remain false
 
@@ -191,6 +212,18 @@ $('grid').addEventListener('click', function (e) {
         '', 'PREVIEW ONLY: NO FILES CHANGED YET. REGISTRATION LOCKED.'
       ].join('\n');
       currentPlan = p;
+      organizing = false;
+      $('orgconfirm').hidden = true;
+      $('orgtid').value = '';
+      $('orgbackup').checked = false;
+      $('orgstatus').textContent = '';
+      $('orgstatus').className = '';
+      $('orgexpected').textContent = p.title_id;
+      $('organizebtn').hidden = false;
+      $('organizebtn').disabled = !p.confirm_token || (!p.move_base && !p.move_update);
+      $('organizeconfirmbtn').hidden = true;
+      $('organizeconfirmbtn').disabled = false;
+      $('plancancel').disabled = false;
       $('plandlg').showModal();
     }).catch(function (err) { toast('Plan blocked: ' + err.message); })
       .then(function () { delete busy[tid]; render(); });
@@ -219,22 +252,72 @@ $('probeaction').onclick = function () {
   }).catch(function (e) { alert('Probe action failed: ' + e.message + '\nInspect the log before retrying.'); })
     .then(function () { delete busy[tid]; load(); });
 };
+/* Native browser prompt()/confirm() may be suppressed while an HTML <dialog>
+ * is open (especially on TV/mobile clients). Use an in-dialog, two-stage
+ * explicit confirmation with visible results. NEVER retry a USB move blindly. */
 $('organizebtn').onclick = function () {
-  if (!currentPlan || !currentPlan.confirm_token) return toast('Preview again');
-  var p = currentPlan, tid = p.title_id;
-  if (!p.move_base && !p.move_update) return toast('Both packages are already in place');
-  var typed = prompt('USB WRITE OPERATION. Make a backup first. Type ' + tid + ' to organize ONLY this game:');
-  if (typed !== tid) return toast('Cancelled: game ID does not match');
-  if (!confirm('FINAL CONFIRMATION: move PKGs for ' + tid + ' on the EXTERNAL USB drive? Game registration remains DISABLED.')) return;
-  currentPlan = null;
-  $('plandlg').close();
-  busy[tid] = 1; render();
-  api('/api/organize?title_id=' + tid, 'POST', p.confirm_token).then(function (j) {
-    toast(j.message);
-  }).catch(function (e) {
-    alert('Organization was NOT confirmed successful. ' + e.message + '\n\nUse USB recovery and check the log before attempting another move.');
-  }).then(function () { delete busy[tid]; setTimeout(load, 2000); });
+  if (organizing) return;
+  if (!currentPlan || !currentPlan.confirm_token) return toast('Preview expired. Open a new plan.');
+  if (!currentPlan.move_base && !currentPlan.move_update) return toast('Files are already in place');
+  $('orgconfirm').hidden = false;
+  $('organizebtn').hidden = true;
+  $('organizeconfirmbtn').hidden = false;
+  $('orgstatus').textContent = 'Type the exact CUSA and confirm the backup, then press Confirm.';
+  $('orgtid').focus();
 };
+$('organizeconfirmbtn').onclick = function () {
+  if (organizing) return;
+  if (!currentPlan || !currentPlan.confirm_token) {
+    $('orgstatus').textContent = 'Confirmation token missing. Close and preview again.';
+    return;
+  }
+  var p = currentPlan, tid = p.title_id;
+  if ($('orgtid').value.trim() !== tid) {
+    $('orgstatus').className = 'error';
+    $('orgstatus').textContent = 'CUSA does not match. Enter ' + tid + ' exactly.';
+    return;
+  }
+  if (!$('orgbackup').checked) {
+    $('orgstatus').className = 'error';
+    $('orgstatus').textContent = 'Backup confirmation is required before a USB move.';
+    return;
+  }
+  organizing = true;
+  busy[tid] = 1;
+  $('orgstatus').className = '';
+  $('orgstatus').textContent = 'Sending the ONE-title USB move request. Do NOT unplug the drive or close this window.';
+  $('organizeconfirmbtn').disabled = true;
+  $('orgtid').disabled = true;
+  $('orgbackup').disabled = true;
+  $('plancancel').disabled = true;
+  api('/api/organize?title_id=' + tid, 'POST', p.confirm_token).then(function (j) {
+    /* Acknowledged success means the back end has finished and removed the journal. */
+    currentPlan = null;
+    $('orgstatus').className = 'success';
+    $('orgstatus').textContent = 'SUCCESS: ' + j.message + '\n\nClose this window and click Scan for games.';
+    $('organizeconfirmbtn').hidden = true;
+  }).catch(function (e) {
+    /* A lost HTTP response may follow a completed/partial operation. Do NOT retry. */
+    currentPlan = null;
+    $('orgstatus').className = 'error';
+    $('orgstatus').textContent = 'NOT CONFIRMED: ' + e.message +
+      '\n\nDo NOT retry. Inspect USB recovery and the log before any other write.';
+    $('organizeconfirmbtn').hidden = true;
+  }).then(function () {
+    organizing = false;
+    delete busy[tid];
+    $('plancancel').disabled = false;
+    $('orgtid').disabled = false;
+    $('orgbackup').disabled = false;
+    render();
+  });
+};
+$('plandlg').addEventListener('cancel', function (event) {
+  if (organizing) event.preventDefault();
+});
+$('plandlg').addEventListener('close', function () {
+  if (!organizing) currentPlan = null;
+});
 $('recoverbtn').onclick = function () {
   var usb = prompt('Inspect USB drive number (0–7). Your games were found on 0:', '0');
   if (!/^[0-7]$/.test(usb || '')) return;

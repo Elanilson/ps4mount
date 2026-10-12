@@ -206,10 +206,15 @@ void web_serve(int listen_fd) {
         }
     } else if (post && !strncmp(path, "/api/organize?", 14)) {
         char token[33];
-        if (title_param(path, tid) || confirmation_header(req, token))
+        /* Log the incoming action even when confirmation is malformed or expired.
+         * Never log the secret single-use token. */
+        int valid_tid = !title_param(path, tid);
+        printf("[safe][organize-http] POST %s (token not logged)\n", valid_tid ? tid : "invalid-title");
+        if (!valid_tid || confirmation_header(req, token))
             json_msg(fd, 0, "Missing/invalid title id or confirmation token");
         else {
             int rc = app_organize(tid, token, msg, sizeof(msg));
+            printf("[safe][organize-http] %s %s: %s\n", tid, rc ? "REJECTED" : "ACCEPTED", msg);
             json_msg(fd, !rc, msg);
         }
     } else if (!post && !strncmp(path, "/api/recovery?", 14)) {

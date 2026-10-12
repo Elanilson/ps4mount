@@ -1,4 +1,5 @@
-# PS4Mount 0.5.3 — Phase 4B: one-title read-only nullfs probe
+# PS4Mount 0.5.4 — Phase 4C: organizer confirmation UI fix
+
 
 This build adds an **explicit, single-title, temporary read-only nullfs mount** on top
 of version 0.5.2. It does **not** register, install, or launch PS4 titles. The
@@ -130,3 +131,24 @@ Os testes de host verificam seleção, DLCs, conflitos, parser, controles de reg
 **Fase 4:** revisão isolada da integração `nullfs`, montagem, metadados e registro da biblioteca do PS5, sem SQLite direto, registro em massa ou desinstalação forçada. **Fase 5:** testes no console real de lançamento do jogo, reinicialização, desligamento e desconexão do disco. Não habilitar registro apenas porque os testes locais passaram.
 
 Projeto derivado de [gasb07/ps4mount](https://github.com/gasb07/ps4mount), GPL-3.0-or-later.
+
+## Phase 4C — confirmation UI fix (0.5.4)
+
+In the 0.5.3 PS5 logs, the organizer generated a READY plan but never received
+`POST /api/organize` when the user clicked the button. Previous UI depended
+on native `prompt()` + `confirm()` dialogs, which may be suppressed by browsers
+while an HTML `<dialog>` is open. This update replaces both popups with an
+in-panel, two-stage, per-CUSA confirmation. The user first clicks Organize,
+then types the CUSA, confirms an **external** backup, and explicitly clicks the
+second confirmation button. The UI displays success/error and never retries
+a move on uncertain HTTP responses.
+
+The server now logs `[safe][organize-http] POST CUSAxxxxx` when a request
+actually arrives, without logging confirmation tokens. If that line is missing,
+the browser never sent the request. Registration, database writes, game launch
+and bulk moves remain disabled. Mount probe behavior is unchanged.
+
+For hardware testing: select **Uncanny Valley CUSA03323**; preview the folder
+plan; click Organize; type CUSA03323; confirm the backup checkbox; click the
+second Confirm button. Do not disconnect USB. On uncertain outcome, inspect
+USB recovery and do not retry.
