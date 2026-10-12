@@ -54,6 +54,7 @@ pre{white-space:pre-wrap;font-size:12px;max-height:60vh;overflow:auto;background
   <div class="empty" id="empty" hidden>No games found. PKGs may be in any subfolder; rescan to refresh.</div>
 </main>
 <dialog id="logdlg"><h3>Log</h3><pre id="log"></pre><form method="dialog"><button>Close</button></form></dialog>
+<dialog id="plandlg"><h3>Organization preview — NO changes</h3><pre id="planinfo"></pre><p class="warn">This is a read-only plan. No PKGs will be moved or registered. Do not interpret this preview as permission to install.</p><form method="dialog"><button>Close</button></form></dialog>
 <div id="toast"></div>
 <script>
 var games = [], busy = {};
@@ -67,7 +68,7 @@ function toast(msg) { var t = $('toast'); t.textContent = msg; t.style.display =
 
 function api(path, method) {
   return fetch(path, {method: method || 'GET', cache: 'no-store'}).then(function (r) {
-    return r.json().then(function (j) { if (!r.ok) throw new Error(j.error || r.status); return j; });
+    return r.json().then(function (j) { if (!r.ok) throw new Error(j.error || j.message || r.status); return j; });
   });
 }
 
@@ -82,6 +83,8 @@ function render() {
     else if (g.state === 'ready') act = '<button disabled>Registered</button>';
     else if (g.state === 'conflict') act = '<button disabled>Manual review required</button>';
     else if (g.state === 'queued') act = '<button disabled>Queued</button>';
+    if (g.state !== 'conflict' && g.state !== 'internal' && g.state !== 'queued')
+      act = '<button data-a="plan" data-t="' + g.title_id + '">Preview folder plan</button>' + act;
     if (busy[g.title_id]) act = '<button disabled>Please wait…</button>';
     html += '<div class="card"><div class="art" style="background-image:url(/icon/' + g.title_id + ')">' +
       '<span class="badge b-' + g.state + '">' + esc(labels[g.state] || g.state) + '</span></div>' +
@@ -99,7 +102,7 @@ function render() {
   });
   $('grid').innerHTML = html;
   $('empty').hidden = games.length > 0;
-  var s = '<span>SAFE PREVIEW · read-only discovery · game registration disabled</span><span>' + games.length + ' game(s)</span>';
+  var s = '<span>PHASE 3A · READ-ONLY organization preview · NO PKG moves · registration locked</span><span>' + games.length + ' game(s)</span>';
   for (var k in counts) s += '<span>' + esc(labels[k] || k) + ': ' + counts[k] + '</span>';
   $('summary').innerHTML = s;
 }
@@ -113,6 +116,25 @@ $('grid').addEventListener('click', function (e) {
   var b = e.target.closest('button[data-a]');
   if (!b) return;
   var tid = b.getAttribute('data-t'), a = b.getAttribute('data-a');
+  if (a === 'plan') {
+    busy[tid] = 1; render();
+    api('/api/plan?title_id=' + tid).then(function (p) {
+      $('planinfo').textContent = [
+        'Game: ' + p.title_id,
+        'Base source: ' + p.app_source,
+        'Base destination: ' + p.app_destination,
+        'Move base in future: ' + (p.move_base ? 'yes' : 'no — already in place'),
+        'Update source: ' + (p.update_source || '(none)'),
+        'Update destination: ' + (p.update_destination || '(none)'),
+        'Move update in future: ' + (p.move_update ? 'yes' : 'no'),
+        'New directories required: ' + (p.create_folders ? 'yes' : 'no'),
+        '', 'NO FILES CHANGED. REGISTRATION IS LOCKED.'
+      ].join('\n');
+      $('plandlg').showModal();
+    }).catch(function (err) { toast('Plan blocked: ' + err.message); })
+      .then(function () { delete busy[tid]; render(); });
+    return;
+  }
   if (a === 'unmount' && !confirm('Remove ' + tid + ' from the library? The pkg stays on the USB drive.')) return;
   busy[tid] = 1; render();
   api('/api/' + a + '?title_id=' + tid, 'POST').then(function (j) { toast(j.message); })

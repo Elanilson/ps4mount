@@ -126,6 +126,40 @@ int main(void) {
     snprintf(p, sizeof(p), "%s/Original Game.pkg", game); assert(exists(p));
     printf("PASS: all console registration requests are rejected in preview mode\n");
 
+    /* Phase 3A preflight: generates a plan WITHOUT making directories or
+     * renaming files; checks conflicts and refuses overwrite/link destinations. */
+    title_plan_t preview;
+    char why[256];
+    assert(plan_title(t, &preview, why, sizeof(why)) == 0);
+    assert(preview.create_library && preview.create_folder);
+    assert(preview.app_move && preview.patch_move);
+    assert(strstr(preview.app_destination, "/ps4/CUSA01623 - Game_ Test _ PS4/app.pkg"));
+    assert(strstr(preview.patch_destination, "/ps4/CUSA01623 - Game_ Test _ PS4/patch.pkg"));
+    snprintf(p, sizeof(p), "%s/ps4", root); assert(!exists(p));
+    assert(!exists(preview.app_destination) && !exists(preview.patch_destination));
+    printf("PASS: phase 3A plan previews base/update paths without writing\n");
+
+    /* A pre-existing destination blocks a plan: NEVER overwrite. */
+    snprintf(p, sizeof(p), "%s/ps4", root); assert(!mkdir(p, 0700));
+    assert(!mkdir(preview.destination, 0700));
+    write_dummy(preview.app_destination, "someone else's file");
+    assert(plan_title(t, &preview, why, sizeof(why)) != 0);
+    assert(!unlink(preview.app_destination));
+    assert(!rmdir(preview.destination));
+    printf("PASS: existing destination prevents any organization plan\n");
+
+    /* A symlink pointing outside the drive never gets traversed. */
+    snprintf(p, sizeof(p), "%s/ps4", root);
+    assert(!rmdir(p));
+    assert(!symlink(other, p));
+    assert(plan_title(t, &preview, why, sizeof(why)) != 0);
+    assert(!unlink(p));
+    printf("PASS: symlink destination rejected, not followed\n");
+
+    /* Reject PKG whose parent folder has been replaced by a symlink. */
+    snprintf(p, sizeof(p), "%s/Update Version.pkg", updates);
+    assert(checked_source(root, p, (dev_t)0x7fffffff) != 0);
+
     /* Simulate the separate, explicit prepare phase on TEMPORARY files only. */
     assert(prepare_title(t) == 0);
     snprintf(p, sizeof(p), "%s/ps4/CUSA01623 - Game_ Test _ PS4/app.pkg", root);

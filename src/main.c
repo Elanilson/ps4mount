@@ -37,7 +37,7 @@
 #include "web.h"
 #include "icon_data.h"
 
-#define VERSION "PS4Mount 0.4.2-safe-audit"
+#define VERSION "PS4Mount 0.5.0-phase3-plan"
 #define LOCK_PORT 9032
 #define SCAN_SECONDS 10
 #define STATE_DIR "/data/ps4mount"
@@ -1115,6 +1115,117 @@ static int prepare_title(title_t *t) {
     return 0;
 }
 
+/* Phase 3A: READ-ONLY preflight for ONE title. No mkdir/rename/write here.
+ * Deliberately separate from the historical prepare_title() write routine:
+ * the plan is informational only, never an authorization to move PKGs. */
+typedef struct {
+    char destination[PATH_MAX];
+    char app_destination[PATH_MAX];
+    char patch_destination[PATH_MAX];
+    int app_move, patch_move, create_library, create_folder;
+} title_plan_t;
+
+static int plan_error(char *why, size_t cap, const char *message) {
+    if (cap) snprintf(why, cap, "%s", message);
+    return -1;
+}
+
+static int within_root(const char *root, const char *path) {
+    size_t n = strlen(root);
+    return n && !strncmp(root, path, n) && path[n] == '/';
+}
+
+/* Check each component with lstat, not stat, to reject links anywhere below
+ * the USB mountpoint. Also refuse a nested mount on another filesystem. */
+static int checked_source(const char *root, const char *path, dev_t volume) {
+    if (!within_root(root, path)) return -1;
+    char component[PATH_MAX];
+    size_t n = strlen(root);
+    if (n >= sizeof(component)) return -1;
+    memcpy(component, root, n + 1);
+    for (const char *p = path + n + 1; ; p++) {
+        if (*p && *p != '/') continue;
+        size_t k = (size_t)(p - path);
+        if (k >= sizeof(component)) return -1;
+        memcpy(component, path, k);
+        component[k] = 0;
+        struct stat st;
+        if (lstat(component, &st) || st.st_dev != volume) return -1;
+        if (!*p) return S_ISREG(st.st_mode) ? 0 : -1;
+        if (!S_ISDIR(st.st_mode)) return -1;
+    }
+}
+
+/* Missing future directories are fine; existing directories must be real,
+ * on the same volume, and not links or separate mounts. */
+static int checked_folder(const char *path, dev_t volume, int *missing) {
+    struct stat st;
+    if (lstat(path, &st) == 0) {
+        *missing = 0;
+        return S_ISDIR(st.st_mode) && st.st_dev == volume ? 0 : -1;
+    }
+    if (errno != ENOENT) return -1;
+    *missing = 1;
+    return 0;
+}
+
+static int destination_available(const char *source, const char *destination) {
+    if (!strcmp(source, destination)) return 0;
+    struct stat st;
+    if (lstat(destination, &st) == 0) return -1; /* do not overwrite anything */
+    return errno == ENOENT ? 0 : -1;
+}
+
+static int plan_title(const title_t *t, title_plan_t *plan, char *why, size_t cap) {
+    memset(plan, 0, sizeof(*plan));
+    if (!t || !t->app_path[0]) return plan_error(why, cap, "Base PKG not indexed");
+    if (t->conflict || t->patch_conflict)
+        return plan_error(why, cap, "Game or update needs manual review; preparation blocked");
+    /* With an unselected update candidate we cannot silently omit a patch. */
+    if (t->update_count && !t->patch_path[0])
+        return plan_error(why, cap, "Update candidates exist but none is approved");
+    struct stat rootst;
+    if (lstat(t->root, &rootst) || !S_ISDIR(rootst.st_mode))
+        return plan_error(why, cap, "USB drive is unavailable");
+    if (checked_source(t->root, t->app_path, rootst.st_dev))
+        return plan_error(why, cap, "Base is no longer a regular file on this USB drive");
+    if (t->patch_path[0] && checked_source(t->root, t->patch_path, rootst.st_dev))
+        return plan_error(why, cap, "Update is no longer a regular file on this USB drive");
+
+    char library[PATH_MAX], canonical[PATH_MAX];
+    if (snprintf(library, sizeof(library), "%s/ps4", t->root) >= (int)sizeof(library) ||
+        snprintf(canonical, sizeof(canonical), "%s/%s", library, t->tid) >= (int)sizeof(canonical))
+        return plan_error(why, cap, "Destination path is too long");
+    /* Preserve a title already stored in the legacy /ps4/CUSA directory. */
+    char legacy_app[PATH_MAX];
+    if (snprintf(legacy_app, sizeof(legacy_app), "%s/app.pkg", canonical) >= (int)sizeof(legacy_app))
+        return plan_error(why, cap, "Legacy destination path is too long");
+    if (!strcmp(t->app_path, legacy_app)) {
+        snprintf(plan->destination, sizeof(plan->destination), "%s", canonical);
+    } else {
+        char folder[128]; safe_folder_name(t, folder);
+        if (snprintf(plan->destination, sizeof(plan->destination), "%s/%s", library, folder) >=
+            (int)sizeof(plan->destination))
+            return plan_error(why, cap, "Descriptive destination path is too long");
+    }
+    if (snprintf(plan->app_destination, sizeof(plan->app_destination), "%s/app.pkg", plan->destination) >=
+        (int)sizeof(plan->app_destination) ||
+        snprintf(plan->patch_destination, sizeof(plan->patch_destination), "%s/patch.pkg", plan->destination) >=
+        (int)sizeof(plan->patch_destination))
+        return plan_error(why, cap, "Output filename is too long");
+    if (checked_folder(library, rootst.st_dev, &plan->create_library) ||
+        (plan->create_library ? (plan->create_folder = 1, 0) :
+        checked_folder(plan->destination, rootst.st_dev, &plan->create_folder)))
+        return plan_error(why, cap, "Destination directory is not safe (link or different filesystem)");
+    plan->app_move = strcmp(t->app_path, plan->app_destination) != 0;
+    plan->patch_move = t->patch_path[0] && strcmp(t->patch_path, plan->patch_destination) != 0;
+    if (destination_available(t->app_path, plan->app_destination) ||
+        (t->patch_path[0] && destination_available(t->patch_path, plan->patch_destination)))
+        return plan_error(why, cap, "Destination exists or cannot be inspected; no overwrite allowed");
+    if (cap) snprintf(why, cap, "Plan ready: no files changed");
+    return 0;
+}
+
 static void scan_root(const char *root) {
     g_scan_dlc_ignored = g_scan_unreadable = 0;
     catalog_forget_root(root);
@@ -1143,9 +1254,9 @@ static void scan_root(const char *root) {
 
 static void scan_all(void) {
     char root[32];
-    for (int i = 0; i < 10; i++) {
-        if (i < 8) snprintf(root, sizeof(root), "/mnt/usb%d", i);
-        else snprintf(root, sizeof(root), "/mnt/ext%d", i - 8);
+    /* ext* may contain PS5 system app mounts; only index USB game drives. */
+    for (int i = 0; i < 8; i++) {
+        snprintf(root, sizeof(root), "/mnt/usb%d", i);
         int present = is_mountpoint(root);
         if (present && (!g_last_seen[i] || g_manual_scan)) scan_root(root);
         else if (!present && g_last_seen[i]) {
@@ -1339,6 +1450,55 @@ void app_games_json(buf_t *out) {
         first = 0;
     }
     buf_printf(out, "]}");
+}
+
+/* Web endpoint returns paths for review but NEVER mutates the drive. */
+int app_plan_json(const char *tid, buf_t *out) {
+    title_t *t = catalog_find(tid);
+    title_plan_t plan;
+    char why[256];
+    int ok = t && !strncmp(t->root, "/mnt/usb", 8) &&
+             t->root[8] >= '0' && t->root[8] <= '7' && !t->root[9] &&
+             is_mountpoint(t->root);
+    if (!ok) snprintf(why, sizeof(why), "Title is not on a supported mounted USB drive");
+    else if (installed_internally(tid)) {
+        ok = 0;
+        snprintf(why, sizeof(why), "Title is installed internally; no preparation allowed");
+    } else if (plan_title(t, &plan, why, sizeof(why))) ok = 0;
+    /* Re-open both PKG headers immediately before presenting the preview. */
+    if (ok) {
+        char id[10], name[128], version[16], cid[37];
+        unsigned long long size;
+        int kind;
+        if (describe_pkg(t->app_path, id, &kind, name, version, &size, cid) ||
+            kind != 1 || strcmp(id, t->tid) || strcmp(cid, t->content_id) || size != t->size) {
+            ok = 0;
+            snprintf(why, sizeof(why), "Base metadata changed; rescan required");
+        } else if (t->patch_path[0] &&
+                   (describe_pkg(t->patch_path, id, &kind, name, version, &size, cid) ||
+                    kind != 2 || strcmp(id, t->tid) || strcmp(cid, t->content_id) ||
+                    strcmp(version, t->patch_version) || size != t->patch_size)) {
+            ok = 0;
+            snprintf(why, sizeof(why), "Update metadata changed; rescan required");
+        }
+    }
+    buf_printf(out, "{\"ok\":%s,\"title_id\":", ok ? "true" : "false");
+    json_str(out, tid);
+    buf_printf(out, ",\"message\":"); json_str(out, why);
+    if (ok) {
+        buf_printf(out, ",\"app_source\":"); json_str(out, t->app_path);
+        buf_printf(out, ",\"app_destination\":"); json_str(out, plan.app_destination);
+        buf_printf(out, ",\"update_source\":"); json_str(out, t->patch_path);
+        buf_printf(out, ",\"update_destination\":");
+        json_str(out, t->patch_path[0] ? plan.patch_destination : "");
+        buf_printf(out, ",\"move_base\":%s,\"move_update\":%s,\"create_folders\":%s,\"read_only\":true",
+                   plan.app_move ? "true" : "false", plan.patch_move ? "true" : "false",
+                   (plan.create_library || plan.create_folder) ? "true" : "false");
+    }
+    buf_printf(out, "}");
+    printf("[safe][plan] %s %s: %s (NO files moved, registration LOCKED)\n",
+           tid, ok ? "READY" : "BLOCKED", why);
+    return ok ? 0 : -1;
 }
 
 int app_icon(const char *tid, buf_t *out) {
@@ -1570,7 +1730,7 @@ int main(void) {
     printf("\n======= " VERSION " session start =======\n");
     printf("[safe] shortcut install DISABLED; registration DISABLED; open http://<PS5 IP>:8770\n");
     g_web = web_listen();
-    notify(g_web >= 0 ? VERSION " running. Read-only scan; panel http://<PS5 IP>:8770" : VERSION " panel unavailable");
+    notify(g_web >= 0 ? VERSION " running. Read-only plans; panel http://<PS5 IP>:8770" : VERSION " panel unavailable");
     unlink(STATE_DIR "/stop");
     for (;;) {
         if (g_stop || exists(STATE_DIR "/stop")) {

@@ -9,6 +9,7 @@
 
 /* Implemented by main.c for the web panel. */
 void app_games_json(buf_t *out);
+int app_plan_json(const char *tid, buf_t *out);
 int app_add(const char *tid, char *msg, size_t cap);
 int app_remove(const char *tid, char *msg, size_t cap);
 void app_rescan(void);

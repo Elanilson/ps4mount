@@ -135,6 +135,15 @@ void web_serve(int listen_fd) {
         app_games_json(&b);
         reply(fd, "200 OK", "application/json; charset=utf-8", b.data, b.len);
         buf_free(&b);
+    } else if (!strncmp(path, "/api/plan?", 10)) {
+        if (title_param(path, tid)) {
+            json_msg(fd, 0, "invalid title_id");
+        } else {
+            buf_t b = {0};
+            int rc = app_plan_json(tid, &b);
+            reply(fd, rc ? "400 Bad Request" : "200 OK", "application/json; charset=utf-8", b.data, b.len);
+            buf_free(&b);
+        }
     } else if (!strncmp(path, "/icon/", 6)) {
         buf_t b = {0};
         snprintf(tid, sizeof(tid), "%.9s", path + 6);
