@@ -5,6 +5,26 @@
 #undef main
 #include <assert.h>
 
+/* Minimal host buffer helpers needed to exercise the authenticated preview. */
+void buf_put(buf_t *b, const void *data, size_t len) {
+    if (b->len + len + 1 > b->cap) {
+        size_t want = b->len + len + 1;
+        b->data = realloc(b->data, want);
+        assert(b->data);
+        b->cap = want;
+    }
+    memcpy(b->data + b->len, data, len);
+    b->len += len;
+    b->data[b->len] = 0;
+}
+void buf_printf(buf_t *b, const char *fmt, ...) {
+    char tmp[4096];
+    va_list ap; va_start(ap, fmt);
+    int len = vsnprintf(tmp, sizeof(tmp), fmt, ap); va_end(ap);
+    if (len > 0) buf_put(b, tmp, (size_t)len < sizeof(tmp) ? (size_t)len : sizeof(tmp) - 1);
+}
+void buf_free(buf_t *b) { free(b->data); memset(b, 0, sizeof(*b)); }
+
 static char test_root[PATH_MAX];
 
 /* Fake pkg files have "gd CUSA01623" or "gp CUSA01623" or "ac ...". */
@@ -138,6 +158,23 @@ int main(void) {
     snprintf(p, sizeof(p), "%s/ps4", root); assert(!exists(p));
     assert(!exists(preview.app_destination) && !exists(preview.patch_destination));
     printf("PASS: phase 3A plan previews base/update paths without writing\n");
+
+    /* Host test uses /tmp, so only test random nonce authorization here:
+       HTTP preview rejects non-/mnt/usb roots on real PS5 by design. */
+    auth_clear();
+    assert(auth_nonce() == 0);
+    g_move_auth.issued = time(NULL);
+    snprintf(g_move_auth.tid, sizeof(g_move_auth.tid), "%s", "CUSA01623");
+    char auth_token[33]; snprintf(auth_token, sizeof(auth_token), "%s", g_move_auth.nonce);
+    assert(!auth_matches("00000000000000000000000000000000", 0));
+    assert(!auth_matches(auth_token, 1));
+    assert(app_organize("CUSA01234", auth_token, msg, sizeof(msg)) != 0);
+    g_move_auth.issued -= 121;
+    assert(!auth_matches(auth_token, 0));
+    assert(app_organize("CUSA01623", auth_token, msg, sizeof(msg)) != 0);
+    auth_clear();
+    assert(exists(t->app_path) && exists(t->patch_path));
+    printf("PASS: wrong-title and expired organization confirmation tokens rejected\n");
 
     /* A pre-existing destination blocks a plan: NEVER overwrite. */
     snprintf(p, sizeof(p), "%s/ps4", root); assert(!mkdir(p, 0700));

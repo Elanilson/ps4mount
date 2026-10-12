@@ -2,7 +2,8 @@
  * Copyright (C) 2026 gasb07
  * PS4Mount daemon: scans USB drives, registers PS4 fpkgs without installing them, follows klog and serves the web panel. */
 /* Safety-preview design:
- * - Default discovery only READS USB PKGs, including nested updates.
+ * - Discovery only READS USB PKGs; explicit per-title USB relocation requires
+ *   a fresh preview nonce and journal, NEVER automatic registration.
  * - Registration and preparation are disabled from the web/API in this build.
  * - Historical code paths for explicit preparation remain for isolated tests.
  * - No direct SQLite fallback.
@@ -35,9 +36,10 @@
 #include "pkg.h"
 #include "update_version.h"
 #include "web.h"
+#include "organize.h"
 #include "icon_data.h"
 
-#define VERSION "PS4Mount 0.5.0-phase3-plan"
+#define VERSION "PS4Mount 0.5.1-phase3b-single"
 #define LOCK_PORT 9032
 #define SCAN_SECONDS 10
 #define STATE_DIR "/data/ps4mount"
@@ -1452,36 +1454,97 @@ void app_games_json(buf_t *out) {
     buf_printf(out, "]}");
 }
 
+/* Authorization is per-process, single-use and bound to the latest preview.
+ * Fetching another preview invalidates any previous confirmation token. */
+static struct {
+    char nonce[33], tid[10], root[32], app_path[PATH_MAX], patch_path[PATH_MAX];
+    struct stat app_stat, patch_stat;
+    time_t issued;
+    int pending_recovery, usb_number;
+} g_move_auth;
+
+static void auth_clear(void) { memset(&g_move_auth, 0, sizeof(g_move_auth)); }
+
+static int auth_nonce(void) {
+    unsigned char b[16];
+    int fd = open("/dev/urandom", O_RDONLY);
+    if (fd < 0) return -1;
+    size_t n = 0;
+    while (n < sizeof(b)) {
+        ssize_t k = read(fd, b + n, sizeof(b) - n);
+        if (k < 0 && errno == EINTR) continue;
+        if (k <= 0) { close(fd); return -1; }
+        n += (size_t)k;
+    }
+    close(fd);
+    for (int i = 0; i < 16; i++)
+        snprintf(g_move_auth.nonce + i * 2, 3, "%02x", b[i]);
+    return 0;
+}
+static int auth_matches(const char *nonce, int recovery) {
+    if (!nonce || strlen(nonce) != 32 || !g_move_auth.nonce[0] ||
+        g_move_auth.pending_recovery != recovery ||
+        time(NULL) < g_move_auth.issued || time(NULL) - g_move_auth.issued > 120)
+        return 0;
+    unsigned char mismatch = 0;
+    for (int i = 0; i < 32; ++i) mismatch |= (unsigned char)(nonce[i] ^ g_move_auth.nonce[i]);
+    return mismatch == 0;
+}
+static int same_stat(const char *path, const struct stat *old) {
+    struct stat now;
+    return !lstat(path, &now) && S_ISREG(now.st_mode) &&
+           now.st_dev == old->st_dev && now.st_ino == old->st_ino &&
+           now.st_size == old->st_size && now.st_mtime == old->st_mtime &&
+           now.st_ctime == old->st_ctime;
+}
+static int pkg_matches_catalog(const title_t *t, char *why, size_t cap) {
+    char id[10], name[128], version[16], cid[37];
+    unsigned long long size;
+    int kind;
+    if (describe_pkg(t->app_path, id, &kind, name, version, &size, cid) ||
+        kind != 1 || strcmp(id, t->tid) || strcmp(cid, t->content_id) || size != t->size)
+        return plan_error(why, cap, "Base PKG metadata changed; rescan required");
+    if (t->patch_path[0] &&
+        (describe_pkg(t->patch_path, id, &kind, name, version, &size, cid) ||
+         kind != 2 || strcmp(id, t->tid) || strcmp(cid, t->content_id) ||
+         strcmp(version, t->patch_version) || size != t->patch_size))
+        return plan_error(why, cap, "Update PKG metadata changed; rescan required");
+    return 0;
+}
+static int supported_usb(const title_t *t) {
+    return t && !strncmp(t->root, "/mnt/usb", 8) &&
+           t->root[8] >= '0' && t->root[8] <= '7' && !t->root[9] && is_mountpoint(t->root);
+}
+
 /* Web endpoint returns paths for review but NEVER mutates the drive. */
 int app_plan_json(const char *tid, buf_t *out) {
     title_t *t = catalog_find(tid);
     title_plan_t plan;
     char why[256];
-    int ok = t && !strncmp(t->root, "/mnt/usb", 8) &&
-             t->root[8] >= '0' && t->root[8] <= '7' && !t->root[9] &&
-             is_mountpoint(t->root);
+    auth_clear();
+    int ok = supported_usb(t);
     if (!ok) snprintf(why, sizeof(why), "Title is not on a supported mounted USB drive");
     else if (installed_internally(tid)) {
         ok = 0;
         snprintf(why, sizeof(why), "Title is installed internally; no preparation allowed");
+    } else if (org_pending(t->root) != 0) {
+        ok = 0;
+        snprintf(why, sizeof(why), "USB has unfinished organization or unreadable journal; recover first");
     } else if (plan_title(t, &plan, why, sizeof(why))) ok = 0;
-    /* Re-open both PKG headers immediately before presenting the preview. */
-    if (ok) {
-        char id[10], name[128], version[16], cid[37];
-        unsigned long long size;
-        int kind;
-        if (describe_pkg(t->app_path, id, &kind, name, version, &size, cid) ||
-            kind != 1 || strcmp(id, t->tid) || strcmp(cid, t->content_id) || size != t->size) {
-            ok = 0;
-            snprintf(why, sizeof(why), "Base metadata changed; rescan required");
-        } else if (t->patch_path[0] &&
-                   (describe_pkg(t->patch_path, id, &kind, name, version, &size, cid) ||
-                    kind != 2 || strcmp(id, t->tid) || strcmp(cid, t->content_id) ||
-                    strcmp(version, t->patch_version) || size != t->patch_size)) {
-            ok = 0;
-            snprintf(why, sizeof(why), "Update metadata changed; rescan required");
-        }
+    if (ok && pkg_matches_catalog(t, why, sizeof(why))) ok = 0;
+    if (ok && (lstat(t->app_path, &g_move_auth.app_stat) ||
+               (t->patch_path[0] && lstat(t->patch_path, &g_move_auth.patch_stat)) ||
+               auth_nonce())) {
+        ok = 0;
+        snprintf(why, sizeof(why), "Cannot create secure confirmation token; read-only plan only");
     }
+    if (ok) {
+        snprintf(g_move_auth.tid, sizeof(g_move_auth.tid), "%s", tid);
+        snprintf(g_move_auth.root, sizeof(g_move_auth.root), "%s", t->root);
+        snprintf(g_move_auth.app_path, sizeof(g_move_auth.app_path), "%s", t->app_path);
+        snprintf(g_move_auth.patch_path, sizeof(g_move_auth.patch_path), "%s", t->patch_path);
+        g_move_auth.issued = time(NULL);
+    } else auth_clear();
     buf_printf(out, "{\"ok\":%s,\"title_id\":", ok ? "true" : "false");
     json_str(out, tid);
     buf_printf(out, ",\"message\":"); json_str(out, why);
@@ -1491,14 +1554,89 @@ int app_plan_json(const char *tid, buf_t *out) {
         buf_printf(out, ",\"update_source\":"); json_str(out, t->patch_path);
         buf_printf(out, ",\"update_destination\":");
         json_str(out, t->patch_path[0] ? plan.patch_destination : "");
-        buf_printf(out, ",\"move_base\":%s,\"move_update\":%s,\"create_folders\":%s,\"read_only\":true",
+        buf_printf(out, ",\"move_base\":%s,\"move_update\":%s,\"create_folders\":%s,\"read_only\":true,\"confirm_token\":",
                    plan.app_move ? "true" : "false", plan.patch_move ? "true" : "false",
                    (plan.create_library || plan.create_folder) ? "true" : "false");
+        json_str(out, g_move_auth.nonce);
     }
     buf_printf(out, "}");
     printf("[safe][plan] %s %s: %s (NO files moved, registration LOCKED)\n",
            tid, ok ? "READY" : "BLOCKED", why);
     return ok ? 0 : -1;
+}
+
+/* Explicit USB-only relocation. Authorization expires after 2 minutes and
+ * can be consumed exactly once. NO game registration, mounting or SQLite. */
+int app_organize(const char *tid, const char *nonce, char *msg, size_t cap) {
+    if (!auth_matches(nonce, 0) || strcmp(tid, g_move_auth.tid))
+        return plan_error(msg, cap, "Preview expired or confirmation invalid; preview again");
+    /* Consume before any reads or filesystem writes. */
+    char root[32], old_app[PATH_MAX], old_patch[PATH_MAX];
+    struct stat old_app_stat = g_move_auth.app_stat, old_patch_stat = g_move_auth.patch_stat;
+    snprintf(root, sizeof(root), "%s", g_move_auth.root);
+    snprintf(old_app, sizeof(old_app), "%s", g_move_auth.app_path);
+    snprintf(old_patch, sizeof(old_patch), "%s", g_move_auth.patch_path);
+    auth_clear();
+    title_t *t = catalog_find(tid);
+    title_plan_t plan;
+    char why[256];
+    if (!supported_usb(t) || strcmp(t->root, root) || strcmp(t->app_path, old_app) ||
+        strcmp(t->patch_path, old_patch) || installed_internally(tid) ||
+        org_pending(t->root) != 0 || plan_title(t, &plan, why, sizeof(why)))
+        return plan_error(msg, cap, "USB state changed, game conflicted or journal pending; preview again");
+    if (!same_stat(t->app_path, &old_app_stat) ||
+        (t->patch_path[0] && !same_stat(t->patch_path, &old_patch_stat)) ||
+        pkg_matches_catalog(t, why, sizeof(why)))
+        return plan_error(msg, cap, "File changed since preview; rescan and preview again");
+    organization_t *req = calloc(1, sizeof(*req));
+    if (!req) return plan_error(msg, cap, "Insufficient memory to prepare operation");
+    snprintf(req->root, sizeof(req->root), "%s", t->root);
+    snprintf(req->tid, sizeof(req->tid), "%s", t->tid);
+    snprintf(req->app_source, sizeof(req->app_source), "%s", t->app_path);
+    snprintf(req->app_destination, sizeof(req->app_destination), "%s", plan.app_destination);
+    snprintf(req->patch_source, sizeof(req->patch_source), "%s", t->patch_path);
+    snprintf(req->patch_destination, sizeof(req->patch_destination), "%s", plan.patch_destination);
+    int rc = org_apply(req, msg, cap);
+    printf("[safe][organize] %s %s: %s (REGISTRATION LOCKED)\n", tid, rc ? "FAILED" : "DONE", msg);
+    free(req);
+    /* Even on an error, catalog locations may be stale after an interrupted move. */
+    g_manual_scan = 1;
+    g_next_scan = 0;
+    return rc;
+}
+
+int app_recovery_json(int usb, buf_t *out) {
+    auth_clear();
+    if (usb < 0 || usb > 7) return -1;
+    char root[32], msg[256];
+    snprintf(root, sizeof(root), "/mnt/usb%d", usb);
+    if (!is_mountpoint(root)) return -1;
+    int state = org_inspect(root, msg, sizeof(msg));
+    buf_printf(out, "{\"ok\":%s,\"pending\":%s,\"message\":", state < 0 ? "false" : "true", state == 1 ? "true" : "false");
+    json_str(out, msg);
+    if (state == 1 && !auth_nonce()) {
+        g_move_auth.issued = time(NULL);
+        g_move_auth.pending_recovery = 1;
+        g_move_auth.usb_number = usb;
+        buf_printf(out, ",\"confirm_token\":");
+        json_str(out, g_move_auth.nonce);
+    }
+    buf_printf(out, "}");
+    printf("[safe][recovery] %s: %s (READ-ONLY INSPECT)\n", root, msg);
+    return state < 0 ? -1 : 0;
+}
+int app_rollback(int usb, const char *nonce, char *msg, size_t cap) {
+    if (usb < 0 || usb > 7 || !auth_matches(nonce, 1) || usb != g_move_auth.usb_number)
+        return plan_error(msg, cap, "Recovery authorization expired; inspect again");
+    auth_clear();
+    char root[32];
+    snprintf(root, sizeof(root), "/mnt/usb%d", usb);
+    if (!is_mountpoint(root)) return plan_error(msg, cap, "USB is not mounted");
+    int rc = org_rollback(root, msg, cap);
+    printf("[safe][rollback] %s %s: %s\n", root, rc ? "FAILED" : "DONE", msg);
+    g_manual_scan = 1;
+    g_next_scan = 0;
+    return rc;
 }
 
 int app_icon(const char *tid, buf_t *out) {
@@ -1730,7 +1868,7 @@ int main(void) {
     printf("\n======= " VERSION " session start =======\n");
     printf("[safe] shortcut install DISABLED; registration DISABLED; open http://<PS5 IP>:8770\n");
     g_web = web_listen();
-    notify(g_web >= 0 ? VERSION " running. Read-only plans; panel http://<PS5 IP>:8770" : VERSION " panel unavailable");
+    notify(g_web >= 0 ? VERSION " running. ONE-title USB organization; registration LOCKED; panel :8770" : VERSION " panel unavailable");
     unlink(STATE_DIR "/stop");
     for (;;) {
         if (g_stop || exists(STATE_DIR "/stop")) {

@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -82,6 +83,38 @@ static int title_param(const char *path, char *tid) {
     return strncmp(tid, "CUSA", 4) ? -1 : 0;
 }
 
+/* Only same-origin JS with an unpredictable short-lived token can issue a
+ * write request. Browsers cannot set this custom header cross-site without
+ * CORS preflight, and this server never opts in to cross-origin requests. */
+static int confirmation_header(const char *req, char token[33]) {
+    const char header[] = "X-PS4Mount-Token:";
+    const char *line = strstr(req, "\r\n");
+    while (line) {
+        line += 2;
+        const char *end = strstr(line, "\r\n");
+        if (!end) return -1;
+        if (!strncasecmp(line, header, sizeof(header) - 1)) {
+            const char *p = line + sizeof(header) - 1;
+            if (p < end && *p == ' ') p++;
+            if (end - p != 32) return -1;
+            for (int i = 0; i < 32; i++) {
+                char c = p[i];
+                if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return -1;
+                token[i] = c;
+            }
+            token[32] = 0;
+            return 0;
+        }
+        line = end;
+    }
+    return -1;
+}
+static int usb_param(const char *path) {
+    const char *p = strstr(path, "?usb=");
+    if (!p || p[5] < '0' || p[5] > '7' || (p[6] && p[6] != '&')) return -1;
+    return p[5] - '0';
+}
+
 static void send_log(int fd) {
     buf_t b = {0}, j = {0};
     int f = open(LOG_PATH, O_RDONLY);
@@ -143,6 +176,32 @@ void web_serve(int listen_fd) {
             int rc = app_plan_json(tid, &b);
             reply(fd, rc ? "400 Bad Request" : "200 OK", "application/json; charset=utf-8", b.data, b.len);
             buf_free(&b);
+        }
+    } else if (post && !strncmp(path, "/api/organize?", 14)) {
+        char token[33];
+        if (title_param(path, tid) || confirmation_header(req, token))
+            json_msg(fd, 0, "Missing/invalid title id or confirmation token");
+        else {
+            int rc = app_organize(tid, token, msg, sizeof(msg));
+            json_msg(fd, !rc, msg);
+        }
+    } else if (!post && !strncmp(path, "/api/recovery?", 14)) {
+        int usb = usb_param(path);
+        if (usb < 0) json_msg(fd, 0, "Invalid USB index");
+        else {
+            buf_t b = {0};
+            int rc = app_recovery_json(usb, &b);
+            if (rc < 0) json_msg(fd, 0, "Recovery journal cannot be inspected safely or USB missing");
+            else reply(fd, "200 OK", "application/json; charset=utf-8", b.data, b.len);
+            buf_free(&b);
+        }
+    } else if (post && !strncmp(path, "/api/rollback?", 14)) {
+        int usb = usb_param(path);
+        char token[33];
+        if (usb < 0 || confirmation_header(req, token)) json_msg(fd, 0, "Invalid USB index or confirmation token");
+        else {
+            int rc = app_rollback(usb, token, msg, sizeof(msg));
+            json_msg(fd, !rc, msg);
         }
     } else if (!strncmp(path, "/icon/", 6)) {
         buf_t b = {0};

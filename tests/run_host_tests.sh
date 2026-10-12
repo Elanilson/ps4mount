@@ -3,7 +3,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 cc -std=gnu11 -O1 -Wall -Wextra -Wno-unused-parameter -Wno-format-truncation -Wno-unused-function -Wno-unused-variable -Wno-maybe-uninitialized \
   -ffunction-sections -fdata-sections -Itests/host_include \
-  -Wl,--gc-sections tests/test_nested_scan.c -o /tmp/ps4mount-nested-test
+  -Wl,--gc-sections tests/test_nested_scan.c src/organize.c -o /tmp/ps4mount-nested-test
 
 cc -std=gnu11 -O1 -Wall -Wextra -Wno-unused-parameter -Wno-format-truncation -Wno-unused-function -Wno-unused-variable -Wno-maybe-uninitialized \
   -ffunction-sections -fdata-sections -Itests/host_include \
@@ -23,3 +23,8 @@ cc -std=gnu11 -O1 -Wall -Wextra -Ithird_party/sqlite \
 cc -std=gnu11 -O1 -Wall -Wextra -I./src \
   tests/test_sfo_bounds.c src/pkg.c src/crypto.c -o /tmp/ps4mount-sfo-test
 /tmp/ps4mount-sfo-test
+
+# Real temp-directory moves and explicit crash-recovery tests; NEVER PS5 paths.
+cc -std=gnu11 -O1 -Wall -Wextra -Wno-format-truncation -Wno-unused-function \
+  -ffunction-sections -fdata-sections -I./src tests/test_organize.c -o /tmp/ps4mount-organize-test
+/tmp/ps4mount-organize-test

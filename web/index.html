@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PS4Mount Safety Preview</title>
+<title>PS4Mount USB Organizer</title>
 <style>
 :root{--bg:#0e1116;--panel:#171b22;--line:#262c36;--fg:#e8eaed;--muted:#97a0ab;--accent:#3d7bfd;--ok:#2f9e57;--warn:#c98b1f;--bad:#c2453b}
 *{box-sizing:border-box}
@@ -44,6 +44,7 @@ pre{white-space:pre-wrap;font-size:12px;max-height:60vh;overflow:auto;background
   <div class="bar">
     <input id="q" type="search" placeholder="Search game or CUSA">
     <button id="rescan" class="primary">Scan for games</button>
+    <button id="recoverbtn">USB recovery</button>
     <button id="logbtn">Log</button>
     <button id="stop" class="danger">Stop</button>
   </div>
@@ -54,10 +55,10 @@ pre{white-space:pre-wrap;font-size:12px;max-height:60vh;overflow:auto;background
   <div class="empty" id="empty" hidden>No games found. PKGs may be in any subfolder; rescan to refresh.</div>
 </main>
 <dialog id="logdlg"><h3>Log</h3><pre id="log"></pre><form method="dialog"><button>Close</button></form></dialog>
-<dialog id="plandlg"><h3>Organization preview — NO changes</h3><pre id="planinfo"></pre><p class="warn">This is a read-only plan. No PKGs will be moved or registered. Do not interpret this preview as permission to install.</p><form method="dialog"><button>Close</button></form></dialog>
+<dialog id="plandlg"><h3>Organization preview — review before writing</h3><pre id="planinfo"></pre><p class="warn">USB FILES MAY BE MOVED by the explicit action below. A BACKUP is strongly recommended. Never unplug during an operation. NO games will be registered or launched.</p><div class="bar"><button id="organizebtn" class="danger">Organize THIS title on USB</button><form method="dialog"><button>Cancel</button></form></div></dialog>
 <div id="toast"></div>
 <script>
-var games = [], busy = {};
+var games = [], busy = {}, currentPlan = null;
 var labels = {ready: 'Ready', running: 'Running', internal: 'Installed on console', discovered: 'Discovered', queued: 'Queued', conflict: 'Conflict'};
 var registrationEnabled = false; // safety-preview build: must remain false
 
@@ -66,8 +67,10 @@ function esc(s) { return String(s).replace(/[&<>"']/g, function (c) { return '&#
 function gb(n) { return (n / 1073741824).toFixed(n >= 10737418240 ? 0 : 1) + ' GB'; }
 function toast(msg) { var t = $('toast'); t.textContent = msg; t.style.display = 'block'; clearTimeout(toast.t); toast.t = setTimeout(function () { t.style.display = 'none'; }, 4000); }
 
-function api(path, method) {
-  return fetch(path, {method: method || 'GET', cache: 'no-store'}).then(function (r) {
+function api(path, method, token) {
+  var options = {method: method || 'GET', cache: 'no-store'};
+  if (token) options.headers = {'X-PS4Mount-Token': token};
+  return fetch(path, options).then(function (r) {
     return r.json().then(function (j) { if (!r.ok) throw new Error(j.error || j.message || r.status); return j; });
   });
 }
@@ -102,7 +105,7 @@ function render() {
   });
   $('grid').innerHTML = html;
   $('empty').hidden = games.length > 0;
-  var s = '<span>PHASE 3A · READ-ONLY organization preview · NO PKG moves · registration locked</span><span>' + games.length + ' game(s)</span>';
+  var s = '<span>PHASE 3B · ONE title per explicit confirmation · registration locked</span><span>' + games.length + ' game(s)</span>';
   for (var k in counts) s += '<span>' + esc(labels[k] || k) + ': ' + counts[k] + '</span>';
   $('summary').innerHTML = s;
 }
@@ -123,13 +126,14 @@ $('grid').addEventListener('click', function (e) {
         'Game: ' + p.title_id,
         'Base source: ' + p.app_source,
         'Base destination: ' + p.app_destination,
-        'Move base in future: ' + (p.move_base ? 'yes' : 'no — already in place'),
+        'Move base: ' + (p.move_base ? 'yes' : 'no — already in place'),
         'Update source: ' + (p.update_source || '(none)'),
         'Update destination: ' + (p.update_destination || '(none)'),
-        'Move update in future: ' + (p.move_update ? 'yes' : 'no'),
+        'Move update: ' + (p.move_update ? 'yes' : 'no'),
         'New directories required: ' + (p.create_folders ? 'yes' : 'no'),
-        '', 'NO FILES CHANGED. REGISTRATION IS LOCKED.'
+        '', 'PREVIEW ONLY: NO FILES CHANGED YET. REGISTRATION LOCKED.'
       ].join('\n');
+      currentPlan = p;
       $('plandlg').showModal();
     }).catch(function (err) { toast('Plan blocked: ' + err.message); })
       .then(function () { delete busy[tid]; render(); });
@@ -141,6 +145,36 @@ $('grid').addEventListener('click', function (e) {
     .catch(function (err) { toast('Error: ' + err.message); })
     .then(function () { delete busy[tid]; load(); });
 });
+$('organizebtn').onclick = function () {
+  if (!currentPlan || !currentPlan.confirm_token) return toast('Preview again');
+  var p = currentPlan, tid = p.title_id;
+  if (!p.move_base && !p.move_update) return toast('Both packages are already in place');
+  var typed = prompt('USB WRITE OPERATION. Make a backup first. Type ' + tid + ' to organize ONLY this game:');
+  if (typed !== tid) return toast('Cancelled: game ID does not match');
+  if (!confirm('FINAL CONFIRMATION: move PKGs for ' + tid + ' on the EXTERNAL USB drive? Game registration remains DISABLED.')) return;
+  currentPlan = null;
+  $('plandlg').close();
+  busy[tid] = 1; render();
+  api('/api/organize?title_id=' + tid, 'POST', p.confirm_token).then(function (j) {
+    toast(j.message);
+  }).catch(function (e) {
+    alert('Organization was NOT confirmed successful. ' + e.message + '\n\nUse USB recovery and check the log before attempting another move.');
+  }).then(function () { delete busy[tid]; setTimeout(load, 2000); });
+};
+$('recoverbtn').onclick = function () {
+  var usb = prompt('Inspect USB drive number (0–7). Your games were found on 0:', '0');
+  if (!/^[0-7]$/.test(usb || '')) return;
+  api('/api/recovery?usb=' + usb).then(function (j) {
+    if (!j.pending) return alert(j.message);
+    if (!j.confirm_token) return alert('Recovery unavailable: read log and do not move files manually');
+    var text = 'ROLLBACK USB' + usb;
+    var typed = prompt(j.message + '\nType ' + text + ' to restore the original paths. The operation will REFUSE overwrites.');
+    if (typed !== text || !confirm('Attempt rollback on USB' + usb + '?')) return;
+    api('/api/rollback?usb=' + usb, 'POST', j.confirm_token).then(function (r) {
+      alert(r.message); setTimeout(load, 1500);
+    }).catch(function (e) { alert('Rollback NOT completed: ' + e.message + '\nInspect the journal and filesystem before proceeding.'); });
+  }).catch(function (e) { alert('Cannot inspect recovery: ' + e.message); });
+};
 $('q').addEventListener('input', render);
 $('rescan').onclick = function () { api('/api/rescan', 'POST').then(function (j) { toast(j.message); setTimeout(load, 3000); }); };
 $('logbtn').onclick = function () { api('/api/log').then(function (j) { $('log').textContent = j.log; $('logdlg').showModal(); }); };
