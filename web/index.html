@@ -87,7 +87,11 @@ function render() {
       '<span class="badge b-' + g.state + '">' + esc(labels[g.state] || g.state) + '</span></div>' +
       '<div class="info"><div class="name">' + esc(g.name) + '</div>' +
       '<div class="meta">' + g.title_id + ' · v' + esc(g.version) + (g.has_patch ? ' · update v' + esc(g.update_version) : '') +
-      (g.update_candidates > 1 ? ' · ' + g.update_candidates + ' updates found' : '') + ' · ' + gb(g.size) + '</div>' +
+      (g.update_candidates > 1 ? ' · ' + g.update_candidates + ' updates found' : '') +
+      (g.verified_duplicate_updates ? ' · ' + g.verified_duplicate_updates + ' exact duplicate(s)' : '') +
+      (g.unverified_duplicate_updates ? ' · ' + g.unverified_duplicate_updates + ' unverified duplicate(s)' : '') +
+      (g.suspicious_updates ? ' · ' + g.suspicious_updates + ' possible DLC(s)' : '') +
+      ' · ' + gb(g.size) + '</div>' +
       '<div class="meta">' + esc(g.source) + (g.mount ? ' · mounted ' + g.mount : '') + '</div>' +
       (g.update_source ? '<div class="meta">Selected update: ' + esc(g.update_source) + '</div>' : '') +
       (g.update_issue ? '<div class="warn">' + esc(g.update_issue) + '</div>' : '') + '</div>' +

@@ -3,8 +3,9 @@
  * PS4Mount daemon: scans USB drives, registers PS4 fpkgs without installing them, follows klog and serves the web panel. */
 /* Safety-preview design:
  * - Default discovery only READS USB PKGs, including nested updates.
- * - Only explicit /api/mount requests can move/rename into USB/ps4/ and
- *   register one title; no direct SQLite fallback.
+ * - Registration and preparation are disabled from the web/API in this build.
+ * - Historical code paths for explicit preparation remain for isolated tests.
+ * - No direct SQLite fallback.
  * - DLCs (ac) are ignored; existing games and system DB are never bulk-updated.
  * - Any unconfirmed registration blocks further requests until restart.
  * WARNING: experimental homebrew; test on expendable data, NOT a production PS5. */
@@ -17,6 +18,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/mount.h>
 #include <sys/param.h>
 #include <sys/socket.h>
@@ -35,7 +37,7 @@
 #include "web.h"
 #include "icon_data.h"
 
-#define VERSION "PS4Mount 0.4.1-safe-phase2"
+#define VERSION "PS4Mount 0.4.2-safe-audit"
 #define LOCK_PORT 9032
 #define SCAN_SECONDS 10
 #define STATE_DIR "/data/ps4mount"
@@ -44,6 +46,11 @@
 /* USB discovery only runs when USB presence changes or rescan is requested. */
 #define MAX_SAFE_NAME 72
 #define MAX_UPDATE_CANDIDATES 16
+/* Never scan entire multi-GB updates just to remove a duplicate warning.
+ * Exact byte comparison is only automatic for small files; large same-version
+ * files remain blocked unless a different sample disproves equality. */
+#define EXACT_COMPARE_MAX_BYTES (64ULL * 1024 * 1024)
+#define COMPARE_BLOCK_BYTES (16 * 1024)
 /* Until isolated console tests are completed, forbid ALL manual registrations.
  * Flip only in a dedicated test branch after backup/rollback planning. */
 #define ENABLE_EXPERIMENTAL_REGISTRATION 0
@@ -710,6 +717,7 @@ typedef struct {
     char content_id[37];
     char version[16];
     unsigned long long size;
+    int suspicious_label;
 } update_candidate_t;
 
 typedef struct {
@@ -722,6 +730,7 @@ typedef struct {
     unsigned long long size, patch_size;
     update_candidate_t patches[MAX_UPDATE_CANDIDATES];
     int update_count, update_overflow, invalid_updates, incompatible_updates;
+    int suspicious_updates, verified_duplicate_updates, unverified_duplicate_updates;
     int conflict, patch_conflict;
     int state;
 } title_t;
@@ -730,6 +739,78 @@ static title_t g_titles[MAX_TITLES];
 static int g_title_count;
 static int g_manual_scan;
 static int g_last_seen[10];
+static int g_scan_dlc_ignored;
+static int g_scan_unreadable;
+
+/* Filename/folder hints are NOT authoritative PKG metadata. Flag them for
+ * human inspection rather than assuming CATEGORY=gp proves an update is safe.
+ * Examples: /DLCs/Alien-DLC3.pkg or /Addons/patch.pkg. */
+static int has_addon_label(const char *path) {
+    for (const char *p = path; *p; ++p) {
+        if (p != path && p[-1] != '/' && p[-1] != '-' && p[-1] != '_' &&
+            p[-1] != '.' && p[-1] != ' ' && p[-1] != '+') continue;
+        const char *word = NULL;
+        size_t len = 0;
+        if (!strncasecmp(p, "dlc", 3)) { word = p; len = 3; }
+        else if (!strncasecmp(p, "addons", 6)) { word = p; len = 6; }
+        else if (!strncasecmp(p, "add-on", 6)) { word = p; len = 6; }
+        else if (!strncasecmp(p, "add_on", 6)) { word = p; len = 6; }
+        if (!word) continue;
+        unsigned char c = (unsigned char)p[len];
+        if (!c || c == '/' || c == '.' || c == '-' || c == '_' ||
+            c == ' ' || c == '+' || (c >= '0' && c <= '9') ||
+            (len == 3 && (c == 's' || c == 'S'))) return 1;
+    }
+    return 0;
+}
+
+/* Return 1 only when every byte has been checked. Large matching samples
+ * give -2 (INCONCLUSIVE), never "identical". Return 0 on proven mismatch and
+ * -1 on an I/O error. The scan remains bounded even with terabyte libraries. */
+static int read_equal_span(int a, int b, off_t off, size_t n, int *io_error) {
+    unsigned char x[COMPARE_BLOCK_BYTES], y[COMPARE_BLOCK_BYTES];
+    while (n) {
+        size_t k = n < sizeof(x) ? n : sizeof(x);
+        ssize_t ra = pread(a, x, k, off), rb = pread(b, y, k, off);
+        if (ra != (ssize_t)k || rb != (ssize_t)k) { *io_error = 1; return 0; }
+        if (memcmp(x, y, k)) return 0;
+        off += (off_t)k;
+        n -= k;
+    }
+    return 1;
+}
+
+static int compare_update_bytes(const char *left, const char *right) {
+    int a = open(left, O_RDONLY | O_NOFOLLOW);
+    if (a < 0) return -1;
+    int b = open(right, O_RDONLY | O_NOFOLLOW);
+    if (b < 0) { close(a); return -1; }
+    struct stat sa, sb, ea, eb;
+    int result = -1;
+    if (fstat(a, &sa) || fstat(b, &sb) ||
+        !S_ISREG(sa.st_mode) || !S_ISREG(sb.st_mode) ||
+        sa.st_size < 0 || sb.st_size < 0) goto out;
+    if (sa.st_size != sb.st_size) { result = 0; goto out; }
+    int io_error = 0;
+    if ((uint64_t)sa.st_size <= EXACT_COMPARE_MAX_BYTES) {
+        result = read_equal_span(a, b, 0, (size_t)sa.st_size, &io_error) ? 1 : 0;
+    } else {
+        /* Compare three bounded regions. Matching samples cannot establish
+         * full-file equality, especially for modified or repackaged PKGs. */
+        off_t last = sa.st_size - COMPARE_BLOCK_BYTES;
+        off_t mid = sa.st_size / 2 - COMPARE_BLOCK_BYTES / 2;
+        result = (!read_equal_span(a, b, 0, COMPARE_BLOCK_BYTES, &io_error) ||
+                  !read_equal_span(a, b, mid, COMPARE_BLOCK_BYTES, &io_error) ||
+                  !read_equal_span(a, b, last, COMPARE_BLOCK_BYTES, &io_error)) ? 0 : -2;
+    }
+    if (io_error || fstat(a, &ea) || fstat(b, &eb) ||
+        sa.st_size != ea.st_size || sb.st_size != eb.st_size ||
+        sa.st_mtime != ea.st_mtime || sb.st_mtime != eb.st_mtime) result = -1;
+out:
+    close(a);
+    close(b);
+    return result;
+}
 
 static title_t *catalog_find(const char *tid) {
     for (int i = 0; i < g_title_count; i++)
@@ -750,6 +831,7 @@ static void catalog_forget_root(const char *root) {
 static int describe_pkg(const char *path, char tid[10], int *category,
                         char name[128], char ver[16], unsigned long long *size,
                         char content_id[37]) {
+    *category = 0;
     pkg_t pkg;
     if (pkg_open(&pkg, path)) return -1;
     sfo_t sfo;
@@ -757,6 +839,7 @@ static int describe_pkg(const char *path, char tid[10], int *category,
     const sfo_item_t *cat = ok ? sfo_get(&sfo, "CATEGORY") : NULL;
     int kind = cat && !cat->is_int && !strcmp(cat->sval, "gd") ? 1 :
                cat && !cat->is_int && !strcmp(cat->sval, "gp") ? 2 : 0;
+    if (cat && !cat->is_int && !strcmp(cat->sval, "ac")) *category = 3;
     ok = kind && strlen(pkg.title_id) == 9 && !strncmp(pkg.title_id, "CUSA", 4) && pkg_fake_key(&pkg);
     if (ok) {
         const sfo_item_t *n = sfo_get(&sfo, "TITLE"), *v = sfo_get(&sfo, "APP_VER");
@@ -775,8 +858,21 @@ static int describe_pkg(const char *path, char tid[10], int *category,
 static void inspect_pkg(const char *root, const char *path) {
     char tid[10], name[128], ver[16], content_id[37];
     unsigned long long size = 0;
-    int kind;
-    if (describe_pkg(path, tid, &kind, name, ver, &size, content_id)) return;
+    int kind = 0;
+    if (describe_pkg(path, tid, &kind, name, ver, &size, content_id)) {
+        if (kind == 3) {
+            g_scan_dlc_ignored++;
+            if (g_scan_dlc_ignored <= 8)
+                printf("[safe][pkg] CATEGORY=ac DLC ignored: %s\n", path);
+        } else {
+            g_scan_unreadable++;
+            if (g_scan_unreadable <= 8)
+                printf("[safe][pkg] not indexable (unreadable, retail or unsupported): %s\n", path);
+        }
+        return;
+    }
+    printf("[safe][pkg] type=%s CUSA=%s APP_VER=%s content_id=%s pkg_size=%llu: %s\n",
+           kind == 1 ? "base(gd)" : "patch(gp)", tid, ver, content_id, size, path);
     title_t *t = catalog_find(tid);
     if (!t) {
         if (g_title_count >= MAX_TITLES) {
@@ -820,6 +916,9 @@ static void inspect_pkg(const char *root, const char *path) {
         snprintf(c->version, sizeof(c->version), "%s", ver);
         snprintf(c->content_id, sizeof(c->content_id), "%s", content_id);
         c->size = size;
+        c->suspicious_label = has_addon_label(path);
+        if (c->suspicious_label)
+            printf("[safe][update] %s SUSPECT DLC/add-on label despite CATEGORY=gp: %s\n", tid, path);
     }
 }
 
@@ -830,32 +929,69 @@ static void resolve_updates(title_t *t) {
     t->patch_path[0] = t->patch_version[0] = 0;
     t->patch_size = 0;
     t->invalid_updates = t->incompatible_updates = 0;
+    t->suspicious_updates = t->verified_duplicate_updates = t->unverified_duplicate_updates = 0;
     t->patch_conflict = t->update_overflow;
     int best = -1, ties = 0;
     for (int i = 0; i < t->update_count; ++i) {
         update_candidate_t *c = &t->patches[i];
-        if (!t->app_path[0]) continue; /* orphan update has no base yet */
+        if (!t->app_path[0]) continue;
+        if (c->suspicious_label) {
+            t->suspicious_updates++;
+            printf("[safe][update] %s possible DLC/combined package requires manual inspection: %s\n",
+                   t->tid, c->path);
+            continue;
+        }
         if (!t->content_id[0] || !c->content_id[0] ||
             strcmp(t->content_id, c->content_id)) {
             t->incompatible_updates++;
-            printf("[safe][update] %s skipped INCOMPATIBLE content_id %s from %s\n",
-                   t->tid, c->content_id, c->path);
+            printf("[safe][update] %s skipped INCOMPATIBLE base_cid=%s update_cid=%s: %s\n",
+                   t->tid, t->content_id, c->content_id, c->path);
             continue;
         }
         int parts[4];
         if (ps4mount_parse_app_ver(c->version, parts)) {
             t->invalid_updates++;
-            printf("[safe][update] %s UNREADABLE APP_VER from %s\n", t->tid, c->path);
+            printf("[safe][update] %s UNREADABLE APP_VER=%s: %s\n", t->tid, c->version, c->path);
             continue;
         }
         int cmp = best < 0 ? 1 : ps4mount_compare_app_ver(c->version, t->patches[best].version);
         if (cmp > 0) { best = i; ties = 1; }
-        else if (cmp == 0) ties++;
+        else if (cmp == 0) {
+            ties++;
+            /* Deterministic name used only if all tied packages match exactly. */
+            if (strcmp(c->path, t->patches[best].path) < 0) best = i;
+        }
     }
-    if (t->invalid_updates || ties > 1 || t->update_overflow) {
+    if (ties > 1 && best >= 0) {
+        int different = 0;
+        for (int i = 0; i < t->update_count; ++i) {
+            if (i == best || t->patches[i].suspicious_label ||
+                strcmp(t->content_id, t->patches[i].content_id) ||
+                ps4mount_compare_app_ver(t->patches[i].version, t->patches[best].version)) continue;
+            int equal = compare_update_bytes(t->patches[best].path, t->patches[i].path);
+            if (equal == 1) {
+                t->verified_duplicate_updates++;
+                printf("[safe][update] %s VERIFIED byte-identical update: %s == %s\n",
+                       t->tid, t->patches[best].path, t->patches[i].path);
+            } else if (equal == 0) {
+                different++;
+                printf("[safe][update] %s DIFFERENT files with same APP_VER=%s: %s vs %s\n",
+                       t->tid, t->patches[best].version, t->patches[best].path, t->patches[i].path);
+            } else {
+                t->unverified_duplicate_updates++;
+                printf("[safe][update] %s UNVERIFIED same-version packages (%s); BLOCKED: %s vs %s\n",
+                       t->tid, equal == -2 ? "too large for bounded full comparison" : "read error",
+                       t->patches[best].path, t->patches[i].path);
+            }
+        }
+        if (different || t->unverified_duplicate_updates) t->patch_conflict = 1;
+    }
+    if (t->suspicious_updates || t->invalid_updates || t->update_overflow)
         t->patch_conflict = 1;
-        printf("[safe][update] %s BLOCKED: invalid=%d top_ties=%d overflow=%d\n",
-               t->tid, t->invalid_updates, ties, t->update_overflow);
+    if (t->patch_conflict) {
+        printf("[safe][update] %s BLOCKED: suspects=%d invalid=%d top_ties=%d verified_duplicates=%d unverified=%d overflow=%d\n",
+               t->tid, t->suspicious_updates, t->invalid_updates, ties,
+               t->verified_duplicate_updates, t->unverified_duplicate_updates, t->update_overflow);
         return;
     }
     if (best >= 0) {
@@ -863,10 +999,10 @@ static void resolve_updates(title_t *t) {
         snprintf(t->patch_path, sizeof(t->patch_path), "%s", c->path);
         snprintf(t->patch_version, sizeof(t->patch_version), "%s", c->version);
         t->patch_size = c->size;
-        printf("[safe][update] %s selected APP_VER=%s among %d update(s): %s\n",
-               t->tid, c->version, t->update_count, c->path);
+        printf("[safe][update] %s selected APP_VER=%s among %d update(s), verified_duplicates=%d: %s\n",
+               t->tid, c->version, t->update_count, t->verified_duplicate_updates, c->path);
     } else if (t->update_count && t->app_path[0]) {
-        t->patch_conflict = 1; /* no compatible candidate; manual review required */
+        t->patch_conflict = 1;
         printf("[safe][update] %s no compatible update; BLOCKED\n", t->tid);
     }
 }
@@ -980,11 +1116,13 @@ static int prepare_title(title_t *t) {
 }
 
 static void scan_root(const char *root) {
+    g_scan_dlc_ignored = g_scan_unreadable = 0;
     catalog_forget_root(root);
     scan_nested(root, root, 0);
     for (int i = 0; i < g_title_count; ++i)
         if (!strcmp(root, g_titles[i].root)) resolve_updates(&g_titles[i]);
     int games = 0, conflicts = 0, updates = 0, total_candidates = 0, ignored_incompatible = 0;
+    int suspicious = 0, duplicates_verified = 0, duplicates_unverified = 0;
     for (int i = 0; i < g_title_count; i++) {
         title_t *t = &g_titles[i];
         if (strcmp(root, t->root) || !t->app_path[0]) continue;
@@ -993,9 +1131,13 @@ static void scan_root(const char *root) {
         if (t->patch_path[0]) updates++;
         total_candidates += t->update_count;
         ignored_incompatible += t->incompatible_updates;
+        suspicious += t->suspicious_updates;
+        duplicates_verified += t->verified_duplicate_updates;
+        duplicates_unverified += t->unverified_duplicate_updates;
     }
-    printf("[safe][scan] %s: games=%d selected_updates=%d candidates=%d incompatible=%d conflicts=%d; NO files moved, NO games registered\n",
-           root, games, updates, total_candidates, ignored_incompatible, conflicts);
+    printf("[safe][scan] %s: games=%d selected_updates=%d candidates=%d incompatible=%d conflicts=%d suspects=%d verified_duplicates=%d unverified_duplicates=%d ignored_dlc=%d unreadable=%d; NO files moved, NO games registered\n",
+           root, games, updates, total_candidates, ignored_incompatible, conflicts,
+           suspicious, duplicates_verified, duplicates_unverified, g_scan_dlc_ignored, g_scan_unreadable);
     notify("%d games indexed on %s (read-only); registration LOCKED", games, root);
 }
 
@@ -1180,6 +1322,8 @@ void app_games_json(buf_t *out) {
         buf_printf(out, ",\"update_version\":"); json_str(out, t->patch_version);
         buf_printf(out, ",\"update_candidates\":%d", t->update_count);
         buf_printf(out, ",\"incompatible_updates\":%d", t->incompatible_updates);
+        buf_printf(out, ",\"suspicious_updates\":%d,\"verified_duplicate_updates\":%d,\"unverified_duplicate_updates\":%d",
+                   t->suspicious_updates, t->verified_duplicate_updates, t->unverified_duplicate_updates);
         buf_printf(out, ",\"size\":%llu,\"has_patch\":%s,\"state\":\"%s\",\"mount\":\"\",\"source\":",
                    t->size + t->patch_size, t->patch_path[0] ? "true" : "false", state);
         json_str(out, t->app_path);
@@ -1187,7 +1331,9 @@ void app_games_json(buf_t *out) {
         json_str(out, t->patch_path);
         buf_printf(out, ",\"update_issue\":");
         json_str(out, t->conflict ? "Duplicate base PKGs for this CUSA; no action allowed" :
-                       t->patch_conflict ? "No unambiguous compatible latest update; review required" :
+                       t->patch_conflict && t->suspicious_updates ? "Suspicious DLC/add-on label in update source; manual inspection required" :
+                       t->patch_conflict && t->unverified_duplicate_updates ? "Same-version large/unreadable files cannot be verified identical; manual review required" :
+                       t->patch_conflict ? "Same-version different PKGs or missing valid update; review required" :
                        t->incompatible_updates ? "Incompatible updates skipped (content ID mismatch)" : "");
         buf_printf(out, "}");
         first = 0;

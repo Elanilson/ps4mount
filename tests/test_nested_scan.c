@@ -151,9 +151,47 @@ int main(void) {
     /* The existing base is duplicated, but update ambiguity is independent. */
     g_title_count = 0; scan_nested(root, root, 0);
     for (int i = 0; i < g_title_count; ++i) resolve_updates(&g_titles[i]);
-    title_t *amb = catalog_find("CUSA01234"); assert(amb && amb->patch_conflict);
+    title_t *amb = catalog_find("CUSA01234");
+    assert(amb && !amb->patch_conflict && amb->verified_duplicate_updates == 1);
+    assert(amb->patch_path[0] && !strcmp(amb->patch_version, "01.05"));
+    printf("PASS: exact byte-for-byte duplicate small updates can share one choice\n");
+
+    /* Equal APP_VER and content id are not enough when package bytes differ. */
+    snprintf(p, sizeof(p), "%s/AuxB.pkg", other);
+    write_dummy(p, "gp CUSA01234 01.05 changed");
+    g_title_count = 0; scan_nested(root, root, 0);
+    for (int i = 0; i < g_title_count; ++i) resolve_updates(&g_titles[i]);
+    amb = catalog_find("CUSA01234");
+    assert(amb && amb->patch_conflict && !amb->patch_path[0]);
+    assert(amb->verified_duplicate_updates == 0);
+    printf("PASS: distinct PKG bytes with the same version are blocked\n");
+
+    /* Large files must NOT be considered identical from sampled data only. */
+    snprintf(p, sizeof(p), "%s/AuxA.pkg", other);
+    int fd = open(p, O_RDWR); assert(fd >= 0);
+    assert(!ftruncate(fd, EXACT_COMPARE_MAX_BYTES + 1)); close(fd);
+    snprintf(p, sizeof(p), "%s/AuxB.pkg", other);
+    write_dummy(p, "gp CUSA01234 01.05");
+    fd = open(p, O_RDWR); assert(fd >= 0);
+    assert(!ftruncate(fd, EXACT_COMPARE_MAX_BYTES + 1)); close(fd);
+    g_title_count = 0; scan_nested(root, root, 0);
+    for (int i = 0; i < g_title_count; ++i) resolve_updates(&g_titles[i]);
+    amb = catalog_find("CUSA01234");
+    assert(amb && amb->patch_conflict && amb->unverified_duplicate_updates == 1);
     assert(!amb->patch_path[0]);
-    printf("PASS: identical highest version in two PKGs blocks patch selection\n");
+    printf("PASS: matching samples of large PKGs remain inconclusive and blocked\n");
+    snprintf(p, sizeof(p), "%s/AuxA.pkg", other); assert(!unlink(p));
+    snprintf(p, sizeof(p), "%s/AuxB.pkg", other); assert(!unlink(p));
+
+    /* A gp package located in a DLC folder must be reviewed, not mounted. */
+    snprintf(p, sizeof(p), "%s/Alien-Isolation-DLC3.pkg", dlcs);
+    write_dummy(p, "gp CUSA01623 99.99");
+    g_title_count = 0; scan_nested(root, root, 0);
+    for (int i = 0; i < g_title_count; ++i) resolve_updates(&g_titles[i]);
+    t = catalog_find("CUSA01623");
+    assert(t && t->suspicious_updates == 1 && t->patch_conflict && !t->patch_path[0]);
+    printf("PASS: DLC-looking gp PKG is flagged despite its SFO category\n");
+    assert(!unlink(p));
 
     /* Bad version cannot be sorted; do not silently choose another update. */
     snprintf(p, sizeof(p), "%s/Unparseable.pkg", updates); write_dummy(p, "gp CUSA01623 unknown");
