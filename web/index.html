@@ -67,6 +67,11 @@ pre{white-space:pre-wrap;font-size:12px;max-height:60vh;overflow:auto;background
   <p class="warn">Risco experimental: altera TEMPORARIAMENTE os pontos de montagem /user/app e /user/patch para UM jogo. Nunca registra, instala ou inicia jogos. Faça backup dos dados importantes. Remova a montagem pelo painel ANTES de parar o PS4Mount.</p>
   <div class="bar"><button id="probeaction" class="danger">Confirm</button><form method="dialog"><button>Close (does NOT release mount)</button></form></div>
 </dialog>
+<dialog id="autodlg"><h3>Preparação automática — um jogo</h3>
+  <pre id="autostatus" role="status" aria-live="polite"></pre>
+  <p class="warn">A ação movimenta app.pkg/patch.pkg SOMENTE do CUSA escolhido, dentro do mesmo HD USB. Mantenha um backup externo e não desconecte o USB. NÃO monta nem registra jogos.</p>
+  <form method="dialog"><button id="autoclose">Fechar</button></form>
+</dialog>
 <dialog id="plandlg"><h3>Organization preview — review before writing</h3>
   <pre id="planinfo"></pre>
   <p class="warn">USB FILES MAY BE MOVED by the explicit action below. Keep a backup OUTSIDE this USB drive. Do NOT unplug it during a move. NO games will be registered or launched.</p>
@@ -86,6 +91,7 @@ pre{white-space:pre-wrap;font-size:12px;max-height:60vh;overflow:auto;background
 <div id="toast"></div>
 <script>
 var games = [], busy = {}, currentPlan = null, currentProbe = null, organizing = false;
+var autoBusy = false;
 var labels = {ready: 'Ready', running: 'Running', internal: 'Installed on console', discovered: 'Discovered', queued: 'Queued', conflict: 'Conflict'};
 var registrationEnabled = false; // safety-preview build: must remain false
 
@@ -113,6 +119,8 @@ function render() {
     else if (g.state === 'ready') act = '<button disabled>Registered</button>';
     else if (g.state === 'conflict') act = '<button disabled>Manual review required</button>';
     else if (g.state === 'queued') act = '<button disabled>Queued</button>';
+    if (g.state !== 'conflict' && g.state !== 'internal' && g.state !== 'queued')
+      act = '<button data-a="auto-prepare" data-t="' + g.title_id + '" class="primary">Preparar automaticamente (1 jogo)</button>' + act;
     if (g.state !== 'conflict' && g.state !== 'internal' && g.state !== 'queued')
       act = '<button data-a="plan" data-t="' + g.title_id + '">Preview folder plan</button>' + act;
     if (g.state !== 'conflict' && g.state !== 'internal' && g.state !== 'queued')
@@ -149,7 +157,9 @@ function load() {
 $('grid').addEventListener('click', function (e) {
   var b = e.target.closest('button[data-a]');
   if (!b) return;
+  if (autoBusy) return toast('Já estou preparando um jogo. Aguarde a conclusão.');
   var tid = b.getAttribute('data-t'), a = b.getAttribute('data-a');
+  if (a === 'auto-prepare') return autoPrepareOne(tid);
   if (a === 'probe') {
     busy[tid] = 1; render();
     api('/api/probe-preview?title_id=' + tid).then(function (p) {
@@ -235,6 +245,64 @@ $('grid').addEventListener('click', function (e) {
     .catch(function (err) { toast('Error: ' + err.message); })
     .then(function () { delete busy[tid]; load(); });
 });
+/* Explicitly selected ONE CUSA -> plan -> one protected rename transaction ->
+ * scan -> read-only preflight.  Never run at startup, never enumerate/move
+ * every title, never install, register or mount automatically. A failed/lost
+ * response is terminal: do NOT retry a possibly-completed transaction. */
+function autoSetStatus(text) { $('autostatus').textContent = text; }
+function autoWaitCatalog(tid, plan, attempt) {
+  return api('/api/games').then(function (data) {
+    var item = (data.games || []).find(function (g) { return g.title_id === tid; });
+    var ready = item && item.source === plan.app_destination &&
+      (!plan.move_update || item.update_source === plan.update_destination);
+    if (ready) { games = data.games; render(); return item; }
+    if (attempt >= 14) throw new Error('Movimentação confirmada, mas o catálogo ainda não atualizou. Confira o log e faça um único Scan for games. Não repita a movimentação.');
+    return new Promise(function (resolve) { setTimeout(resolve, 1800); }).then(function () {
+      return autoWaitCatalog(tid, plan, attempt + 1);
+    });
+  });
+}
+function autoPrepareOne(tid) {
+  if (autoBusy) return;
+  autoBusy = true;
+  busy[tid] = 1;
+  render();
+  $('autoclose').disabled = true;
+  autoSetStatus('CUSA: ' + tid + '\nVerificando os arquivos e preparando o plano...');
+  $('autodlg').showModal();
+  var plan, didMove = false;
+  api('/api/plan?title_id=' + tid).then(function (p) {
+    if (p.title_id !== tid || !p.confirm_token) throw new Error('Plano inválido ou sem autorização; nenhum arquivo modificado.');
+    plan = p;
+    if (!p.move_base && !p.move_update) {
+      autoSetStatus('CUSA: ' + tid + '\nPKGs já estão organizados; verificando requisitos...');
+      return null;
+    }
+    autoSetStatus('CUSA: ' + tid + '\nMovimentando somente este jogo. Não desconecte o HD...');
+    /* POST exactly once. Backend uses the existing single-use nonce + journal. */
+    return api('/api/organize?title_id=' + tid, 'POST', p.confirm_token).then(function (r) {
+      didMove = true;
+      autoSetStatus('CUSA: ' + tid + '\n' + r.message + '\nAtualizando a lista automaticamente...');
+      return api('/api/rescan', 'POST').then(function () { return autoWaitCatalog(tid, p, 0); });
+    });
+  }).then(function () {
+    return api('/api/launch-check?title_id=' + tid);
+  }).then(function (check) {
+    autoSetStatus('CUSA: ' + tid + '\nOrganização: ' + (didMove ? 'CONCLUÍDA' : 'JÁ ESTAVA PRONTA') +
+      '\nVerificação: ' + (check.preflight_passed ? 'PREFLIGHT-PASS' : 'BLOCKED') +
+      '\nMotivo: ' + check.message +
+      '\n\nNenhum jogo registrado ou iniciado. Montagem continua sendo um teste separado.');
+  }).catch(function (e) {
+    autoSetStatus('CUSA: ' + tid + '\nPROCESSO NÃO CONFIRMADO: ' + e.message +
+      '\n\nNÃO tente novamente. Consulte o log e USB recovery antes de qualquer outra movimentação.');
+  }).then(function () {
+    autoBusy = false;
+    delete busy[tid];
+    $('autoclose').disabled = false;
+    load();
+  });
+}
+$('autodlg').addEventListener('cancel', function (event) { if (autoBusy) event.preventDefault(); });
 $('probeaction').onclick = function () {
   if (!currentProbe || !currentProbe.confirm_token) return toast('Preview again');
   var p = currentProbe, tid = p.title_id;

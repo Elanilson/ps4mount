@@ -305,5 +305,48 @@ int main(void) {
     printf("PASS: atomic file replacement and symlink protection\n");
 
     cleanup_fixture(root);
+
+    /* Phase 4E regression: on PS5's exFAT USB, readdir() can report /PS4/
+     * even when the organizer uses /ps4/. The app and patch must be accepted
+     * as ALREADY organized, not mistaken for unsafe destination collisions.
+     * Run on a case-sensitive host with a real capitalized directory. */
+    char upper_tmp[] = "/tmp/ps4mount-case-XXXXXX";
+    char *upper_root = mkdtemp(upper_tmp); assert(upper_root);
+    char upper_lib[PATH_MAX], upper_dir[PATH_MAX], upper_app[PATH_MAX], upper_patch[PATH_MAX];
+    snprintf(upper_lib, sizeof(upper_lib), "%s/PS4", upper_root);
+    assert(!mkdir(upper_lib, 0700));
+    snprintf(upper_dir, sizeof(upper_dir), "%s/CUSA03323 - Game_ Test _ PS4", upper_lib);
+    assert(!mkdir(upper_dir, 0700));
+    snprintf(upper_app, sizeof(upper_app), "%s/app.pkg", upper_dir);
+    snprintf(upper_patch, sizeof(upper_patch), "%s/patch.pkg", upper_dir);
+    write_dummy(upper_app, "gd CUSA03323 01.00");
+    write_dummy(upper_patch, "gp CUSA03323 01.02");
+    g_title_count = 0;
+    scan_nested(upper_root, upper_root, 0);
+    for (int i = 0; i < g_title_count; ++i) resolve_updates(&g_titles[i]);
+    t = catalog_find("CUSA03323"); assert(t && t->patch_path[0]);
+    assert(plan_title(t, &preview, why, sizeof(why)) == 0);
+    assert(!preview.app_move && !preview.patch_move &&
+           !preview.create_library && !preview.create_folder);
+    assert(!strcmp(preview.app_destination, upper_app));
+    assert(!strcmp(preview.patch_destination, upper_patch));
+    assert(pkg_matches_catalog(t, why, sizeof(why)) == 0);
+    printf("PASS: pre-organized /PS4/CUSA folder with two PKGs passes post-rescan plan without moving\n");
+
+    /* The legacy /PS4/CUSAxxxxx/app.pkg form must also remain valid. */
+    char legacy_dir[PATH_MAX], legacy_file[PATH_MAX];
+    snprintf(legacy_dir, sizeof(legacy_dir), "%s/CUSA01234", upper_lib);
+    assert(!mkdir(legacy_dir, 0700));
+    snprintf(legacy_file, sizeof(legacy_file), "%s/app.pkg", legacy_dir);
+    write_dummy(legacy_file, "gd CUSA01234 01.00");
+    g_title_count = 0;
+    scan_nested(upper_root, upper_root, 0);
+    for (int i = 0; i < g_title_count; ++i) resolve_updates(&g_titles[i]);
+    title_t *legacy = catalog_find("CUSA01234"); assert(legacy);
+    assert(plan_title(legacy, &preview, why, sizeof(why)) == 0);
+    assert(!preview.app_move && !preview.create_folder && !preview.create_library);
+    assert(!strcmp(preview.app_destination, legacy_file));
+    printf("PASS: legacy uppercase /PS4/CUSA path remains recognized without renames\n");
+    cleanup_fixture(upper_root);
     return 0;
 }

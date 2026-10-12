@@ -1,3 +1,44 @@
+# PS4Mount 0.5.6 — Corrige prévia após organizar no USB (Fase 4E)
+
+**Confirmado no log real da 0.5.4:** `CUSA03323 DONE`, e no rescan os dois PKGs aparecem em
+`/mnt/usb0/PS4/CUSA03323 - Uncanny Valley/`. A prévia de montagem foi bloqueada porque o
+plano gerava `/mnt/usb0/ps4/...` (pasta com letra minúscula), e a comparação literal de
+caminhos não reconhecia os PKGs **já movidos** no exFAT. Isso é um bloqueio lógico,
+não uma falha de movimentação dos arquivos.
+
+Esta versão mantém a preparação automática **por UM jogo** da 0.5.5 e corrige a
+normalização limitada ao nome da pasta `PS4/ps4` **quando a origem já está na
+localização esperada**. Não ignora verificações de origem, proteção contra
+symlinks, sobregravação ou conflitos. O diagnóstico `mount-probe` passa a registrar
+`plan_detail` para tornar o próximo bloqueio visível.
+
+**Próximo teste:** NÃO organize o Uncanny Valley outra vez. Ele já foi organizado.
+Abra a 0.5.6, selecione CUSA03323 e use apenas `Check launch prerequisites`.
+Se `PREFLIGHT-PASS`, a preparação foi validada; o teste temporário `nullfs` é opcional,
+separado e envolve riscos de montagem do PS5. **Nenhum jogo é instalado, registrado
+ou executado por esta versão.** Não reativa AppInstallAll ou SQLite WRITE.
+
+---
+
+# PS4Mount 0.5.5 — Preparação automática de UM jogo (Fase 4D)
+
+**Novidade:** botão **Preparar automaticamente (1 jogo)** em cada cartão. Um único clique, no CUSA selecionado, executa as etapas anteriores que exigiam várias janelas: GET /api/plan, POST /api/organize com token individual descartável, POST /api/rescan, conferência dos caminhos atualizados e GET /api/launch-check. A preparação altera somente os arquivos do CUSA selecionado no USB (rename transacional); não registra, monta ou inicia o jogo.
+
+- **Nunca organiza a biblioteca toda ao iniciar.** O processo só roda por clique no cartão do jogo escolhido. Nada é feito automaticamente durante o scan dos 147 jogos.
+- A proteção no backend permanece: nenhum conflito, nenhum journal pendente, arquivos estáveis, sem sobrescrever destinos e token de uso único com validade curta. Falhas **nunca** iniciam tentativa automática de novo POST.
+- O painel mostra se a organização foi concluída e o resultado real do `launch-check`. Um `PREFLIGHT-PASS` **não significa que o jogo inicia**; registro continua desabilitado e sem chamadas AppInstallAll ou SQLite WRITE.
+- O teste do `nullfs` continua sendo uma ação separada e experimental, por CUSA, com desbloqueio somente se passar no preflight.
+- Faça backup dos PKGs em outro disco antes de usar; nenhuma promessa de ausência de risco em exFAT ou montagens experimentais. A porta 8770 não tem autenticação e deve ficar apenas em uma LAN confiável.
+
+**Teste rápido:** no PS5 escolha `Uncanny Valley / CUSA03323`, clique `Preparar automaticamente (1 jogo)` UMA VEZ, aguarde resultado na janela e envie `/data/ps4mount/log.txt`. Se houver erro ou perda de conexão, **não repita**. Use o painel `USB recovery` para inspecionar o journal.
+
+```bash
+bash tests/run_host_tests.sh
+PS5_PAYLOAD_SDK="$HOME/ps5-payload-sdk" bash build.sh
+```
+
+---
+
 # PS4Mount 0.5.4 — Phase 4C: organizer confirmation UI fix
 
 

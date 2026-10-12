@@ -39,7 +39,7 @@
 #include "organize.h"
 #include "icon_data.h"
 
-#define VERSION "PS4Mount 0.5.4-phase4c-organize-ui-fix"
+#define VERSION "PS4Mount 0.5.6-phase4e-usb-path-case"
 #define LOCK_PORT 9032
 #define SCAN_SECONDS 10
 #define STATE_DIR "/data/ps4mount"
@@ -1198,6 +1198,32 @@ static int plan_title(const title_t *t, title_plan_t *plan, char *why, size_t ca
     if (snprintf(library, sizeof(library), "%s/ps4", t->root) >= (int)sizeof(library) ||
         snprintf(canonical, sizeof(canonical), "%s/%s", library, t->tid) >= (int)sizeof(canonical))
         return plan_error(why, cap, "Destination path is too long");
+    /* exFAT folds ASCII filename case while readdir() retains its spelling.
+     * A pre-existing /PS4 directory may back our /ps4 organizer target.
+     * After rescan, the indexed app path uses /PS4/... but a literal strcmp
+     * against /ps4/... would wrongly treat the SAME existing PKG as a
+     * destination collision (PH4_SAFE_PATHS blocked).  Use the spelling of
+     * the *actual indexed source* only when it is already exactly inside
+     * the expected canonical or descriptive library directory.
+     *
+     * Do not use strcasecmp on full paths, and never bypass the checked_source,
+     * checked_folder, symlink, device, or no-overwrite checks below. */
+    {
+        char folder[128], expected_legacy[160], expected_named[256];
+        safe_folder_name(t, folder);
+        snprintf(expected_legacy, sizeof(expected_legacy), "%s/app.pkg", t->tid);
+        snprintf(expected_named, sizeof(expected_named), "%s/app.pkg", folder);
+        const char *rel = t->app_path + strlen(t->root);
+        if (!strncasecmp(rel, "/ps4/", 5) &&
+            (!strcmp(rel + 5, expected_legacy) || !strcmp(rel + 5, expected_named))) {
+            /* rel[1..3] is the filesystem's actual PS4/ps4 spelling. */
+            if (snprintf(library, sizeof(library), "%s/%.3s", t->root, rel + 1) >=
+                (int)sizeof(library) ||
+                snprintf(canonical, sizeof(canonical), "%s/%s", library, t->tid) >=
+                (int)sizeof(canonical))
+                return plan_error(why, cap, "Actual library path is too long");
+        }
+    }
     /* Preserve a title already stored in the legacy /ps4/CUSA directory. */
     char legacy_app[PATH_MAX];
     if (snprintf(legacy_app, sizeof(legacy_app), "%s/app.pkg", canonical) >= (int)sizeof(legacy_app))
@@ -1698,8 +1724,8 @@ int app_probe_preview_json(const char *tid, buf_t *out) {
     json_str(out, message);
     buf_printf(out, ",\"confirm_token\":"); json_str(out, mode[0] ? g_probe_auth.token : "");
     buf_printf(out, "}");
-    printf("[safe][mount-probe] %s PREVIEW %s: %s (NO DB write, NO registration)\n",
-           tid, mode[0] ? mode : "blocked", message);
+    printf("[safe][mount-probe] %s PREVIEW %s: %s; plan_detail=%s (NO DB write, NO registration)\n",
+           tid, mode[0] ? mode : "blocked", message, detail[0] ? detail : "not_checked");
     return 0;
 }
 
