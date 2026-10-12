@@ -47,9 +47,10 @@ jobs:
             exit 1
           fi
 
-      - name: Safety-preview guard and host tests
+      - name: Phase 2 safety guard and host tests
         run: |
           grep -q '^#define ENABLE_EXPERIMENTAL_REGISTRATION 0$' src/main.c
+          grep -q '\[safe\]\[db\] direct registration BLOCKED' src/db.c
           bash tests/run_host_tests.sh
 
       - name: Build

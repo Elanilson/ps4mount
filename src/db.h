@@ -19,7 +19,7 @@ typedef struct {
 /* 1 registered, 0 not registered, -1 DB read/lock/schema error. */
 int db_registered_status(const char *title_id);
 int db_is_registered(const char *title_id);
-/* Inserts rows into app.db and appinfo.db. Returns 0 on success. */
+/* DISABLED in safety build: always returns -1, never writes to app.db/appinfo.db. */
 int db_register(const db_title_t *t);
-/* Removes every row of title_id from app.db and appinfo.db. */
+/* DISABLED in safety build: always returns -1, never deletes DB rows. */
 int db_unregister(const char *title_id);

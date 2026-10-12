@@ -31,10 +31,11 @@
 #include "build.h"
 #include "db.h"
 #include "pkg.h"
+#include "update_version.h"
 #include "web.h"
 #include "icon_data.h"
 
-#define VERSION "PS4Mount 0.4.0-safe-preview"
+#define VERSION "PS4Mount 0.4.1-safe-phase2"
 #define LOCK_PORT 9032
 #define SCAN_SECONDS 10
 #define STATE_DIR "/data/ps4mount"
@@ -42,6 +43,7 @@
 #define MAX_FOLDER_DEPTH 8
 /* USB discovery only runs when USB presence changes or rescan is requested. */
 #define MAX_SAFE_NAME 72
+#define MAX_UPDATE_CANDIDATES 16
 /* Until isolated console tests are completed, forbid ALL manual registrations.
  * Flip only in a dedicated test branch after backup/rollback planning. */
 #define ENABLE_EXPERIMENTAL_REGISTRATION 0
@@ -84,22 +86,44 @@ static void mkdirs(const char *path, mode_t mode) {
     mkdir(tmp, mode);
 }
 
+/* Atomic replacement for small metadata files. No O_TRUNC on the destination.
+ * This does not make a sequence of metadata files a single transaction. */
 static int write_file(const char *path, const void *data, size_t len, mode_t mode) {
-    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, mode);
-    if (fd < 0)
+    static unsigned int sequence;
+    char tmp[PATH_MAX];
+    struct stat st;
+    if (lstat(path, &st) == 0 && !S_ISREG(st.st_mode)) {
+        printf("[safe][io] refusing non-regular destination %s\n", path);
         return -1;
-    const uint8_t *p = data;
-    while (len) {
-        ssize_t n = write(fd, p, len);
-        if (n <= 0) {
-            close(fd);
-            return -1;
-        }
-        p += n;
-        len -= (size_t)n;
     }
-    close(fd);
+    if (snprintf(tmp, sizeof(tmp), "%s.ps4mount-tmp-%ld-%u", path,
+                 (long)getpid(), ++sequence) >= (int)sizeof(tmp)) return -1;
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL, mode);
+    if (fd < 0) return -1;
+    const unsigned char *p = data;
+    size_t remaining = len;
+    while (remaining) {
+        ssize_t n = write(fd, p, remaining);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) goto fail;
+        p += n;
+        remaining -= (size_t)n;
+    }
+    int sync_rc = fsync(fd);
+    int close_rc = close(fd);
+    if (sync_rc || close_rc) {
+        printf("[safe][io] sync/close failed %s\n", tmp);
+        unlink(tmp);
+        return -1;
+    }
+    /* Repeat the symlink guard immediately before replacing the destination. */
+    if (lstat(path, &st) == 0 && !S_ISREG(st.st_mode)) { unlink(tmp); return -1; }
+    if (rename(tmp, path)) { unlink(tmp); return -1; }
     return 0;
+fail:
+    close(fd);
+    unlink(tmp);
+    return -1;
 }
 
 static int64_t file_mtime(const char *path) {
@@ -196,7 +220,7 @@ static int src_open(title_src_t *t, const char *dir, const char *tid) {
              * installed games run with base 01.02 + update 01.00.) */
             const sfo_item_t *uv = sfo_get(&t->patch_sfo, "VERSION");
             const char *gver = gv ? gv->sval : "?", *uver = uv ? uv->sval : "?";
-            if (strcmp(t->patch.title_id, tid)) {
+            if (strcmp(t->patch.title_id, tid) || strcmp(t->patch.content_id, t->app.content_id)) {
                 snprintf(t->update_issue, sizeof(t->update_issue),
                          "Update ignored: it is for %s version %s, the game is %s version %s", t->patch.title_id, uver,
                          tid, gver);
@@ -245,27 +269,8 @@ static void write_meta(pkg_t *pkg, const char *meta_dir, int *rc) {
     }
 }
 
-static void rm_tree(const char *path) {
-    DIR *d = opendir(path);
-    if (!d) {
-        unlink(path);
-        return;
-    }
-    struct dirent *e;
-    char p[PATH_MAX];
-    while ((e = readdir(d))) {
-        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, ".."))
-            continue;
-        snprintf(p, sizeof(p), "%s/%s", path, e->d_name);
-        struct stat st;
-        if (!lstat(p, &st) && S_ISDIR(st.st_mode))
-            rm_tree(p);
-        else
-            unlink(p);
-    }
-    closedir(d);
-    rmdir(path);
-}
+/* Intentionally no recursive removal helper in this daemon. Uninstall, cleanup
+ * and rollback of system metadata require a separately audited transaction. */
 
 static int place_files(title_src_t *t) {
     pkg_t *app = &t->app, *pat = t->has_patch ? &t->patch : NULL;
@@ -363,7 +368,9 @@ static int place_files(title_src_t *t) {
         snprintf(q, sizeof(q), "%s/d1.pdb", p);
         rc |= write_buf(q, &patch_pdb);
     } else {
-        rm_tree(p);
+        /* Never recursively delete system playgo state during registration.
+         * A stale patch must be reconciled in a separately audited workflow. */
+        printf("[safe][reg] %s no patch: preserving any existing playgo files\n", tid);
     }
 out:
     free(pg);
@@ -405,8 +412,8 @@ static managed_t *managed_by(const char *tid, const char *cid) {
 /* Top mount on target: 0 none, 1 our read-only layer, 2 our read-write layer, -1 something else. */
 static int top_layer(const char *target, const char *dir) {
     struct statfs sf;
-    if (statfs(target, &sf) || strcmp(sf.f_mntonname, target))
-        return 0;
+    if (statfs(target, &sf)) return -1; /* unknown, never safe to unmount */
+    if (strcmp(sf.f_mntonname, target)) return 0;
     if (strcmp(sf.f_fstypename, "nullfs") || strcmp(sf.f_mntfromname, dir))
         return -1;
     return sf.f_flags & MNT_RDONLY ? 1 : 2;
@@ -430,12 +437,12 @@ static int title_running(const char *tid) {
     snprintf(want, sizeof(want), "/mnt/sandbox/pfsmnt/%s-app0", tid);
     int n = getfsstat(NULL, 0, MNT_NOWAIT);
     if (n <= 0)
-        return 0;
+        return 1; /* fail closed when the running state cannot be determined */
     struct statfs *list = malloc(sizeof(*list) * (size_t)(n + 16));
     if (!list)
-        return 0;
+        return 1;
     n = getfsstat(list, (long)(sizeof(*list) * (size_t)(n + 16)), MNT_NOWAIT);
-    int found = 0;
+    int found = n < 0; /* fail closed on getfsstat error */
     for (int i = 0; i < n && !found; i++)
         found = !strcmp(list[i].f_mntonname, want);
     free(list);
@@ -443,36 +450,61 @@ static int title_running(const char *tid) {
 }
 
 static int mount_dir(const char *dir, const char *target, int rw) {
-    mkdir(target, 0777);
+    struct stat st;
+    if (lstat(target, &st) == 0) {
+        if (!S_ISDIR(st.st_mode)) return -1; /* no symlink targets */
+    } else if (errno != ENOENT || mkdir(target, 0777)) {
+        return -1;
+    }
     int top = top_layer(target, dir);
-    if (top == (rw ? 2 : 1))
-        return 0;
-    while (top != 0) {
+    if (top == (rw ? 2 : 1)) return 0;
+    if (top == -1) {
+        printf("[safe][mount] %s occupied by foreign mount; refused\n", target);
+        return -1;
+    }
+    const char *tid = strrchr(target, '/');
+    if (!tid || title_running(tid + 1)) {
+        printf("[safe][mount] %s running/unknown state; refusing transition\n", target);
+        return -1;
+    }
+    if (top != 0) {
         if (unmount(target, 0)) {
             printf("[mount] unmount %s: %s\n", target, strerror(errno));
             return -1;
         }
-        top = top_layer(target, dir);
+        if (top_layer(target, dir) != 0) {
+            printf("[safe][mount] unexpected layered mount at %s; refused\n", target);
+            return -1;
+        }
     }
     return nullfs_mount(dir, target, rw);
 }
 
-static void unmount_all_layers(const char *target, int force) {
-    for (int i = 0; i < 8 && mounted_from(target, NULL, 0); i++)
-        if (unmount(target, force ? MNT_FORCE : 0)) {
-            printf("[mount] unmount %s: %s\n", target, strerror(errno));
-            if (!force)
-                return;
-        }
+/* Only unmount our own layer, never force, and never while a game may run. */
+static int unmount_owned_layer(const char *target, const char *dir) {
+    int top = top_layer(target, dir);
+    if (top == 0) return 0;
+    if (top < 0) {
+        printf("[safe][mount] foreign layer at %s; untouched\n", target);
+        return -1;
+    }
+    const char *tid = strrchr(target, '/');
+    if (!tid || title_running(tid + 1)) return -1;
+    if (unmount(target, 0)) {
+        printf("[safe][mount] unmount %s failed: %s\n", target, strerror(errno));
+        return -1;
+    }
+    return 0;
 }
 
-/* Removes every layer of the title (forced: a system uninstall is about to run). */
 static void unmount_title(const char *tid) {
+    managed_t *m = managed_by(tid, NULL);
+    if (!m) return;
     char target[64];
     snprintf(target, sizeof(target), "/user/app/%s", tid);
-    unmount_all_layers(target, 0);
+    unmount_owned_layer(target, m->dir);
     snprintf(target, sizeof(target), "/user/patch/%s", tid);
-    unmount_all_layers(target, 0);
+    unmount_owned_layer(target, m->dir);
 }
 
 /* /user/app/<TID> always, /user/patch/<TID> only with an update. */
@@ -484,8 +516,7 @@ static int mount_paths(const char *dir, const char *tid, int has_patch, int rw) 
     snprintf(target, sizeof(target), "/user/patch/%s", tid);
     if (has_patch)
         return mount_dir(dir, target, rw);
-    unmount_all_layers(target, 0);
-    return 0;
+    return unmount_owned_layer(target, dir);
 }
 
 static int mount_title(const title_src_t *t, int rw) { return mount_paths(t->dir, t->app.title_id, t->has_patch, rw); }
@@ -675,13 +706,22 @@ static int first_time(const char *path) {
  * one selected title. The index joins base and update by metadata CUSA across
  * different folders. More than one distinct base or update is AMBIGUOUS. */
 typedef struct {
+    char path[PATH_MAX];
+    char content_id[37];
+    char version[16];
+    unsigned long long size;
+} update_candidate_t;
+
+typedef struct {
     char tid[10];
     char root[32];
     char dir[PATH_MAX];       /* before preparation: the base file's directory */
     char app_path[PATH_MAX];  /* original, possibly nested, PKG path */
     char patch_path[PATH_MAX];
-    char name[128], ver[16];
+    char name[128], ver[16], content_id[37], patch_version[16];
     unsigned long long size, patch_size;
+    update_candidate_t patches[MAX_UPDATE_CANDIDATES];
+    int update_count, update_overflow, invalid_updates, incompatible_updates;
     int conflict, patch_conflict;
     int state;
 } title_t;
@@ -708,7 +748,8 @@ static void catalog_forget_root(const char *root) {
 
 /* Read-only metadata extraction. Retail and DLC (ac) are ignored. */
 static int describe_pkg(const char *path, char tid[10], int *category,
-                        char name[128], char ver[16], unsigned long long *size) {
+                        char name[128], char ver[16], unsigned long long *size,
+                        char content_id[37]) {
     pkg_t pkg;
     if (pkg_open(&pkg, path)) return -1;
     sfo_t sfo;
@@ -720,9 +761,11 @@ static int describe_pkg(const char *path, char tid[10], int *category,
     if (ok) {
         const sfo_item_t *n = sfo_get(&sfo, "TITLE"), *v = sfo_get(&sfo, "APP_VER");
         snprintf(tid, 10, "%s", pkg.title_id);
+        snprintf(content_id, 37, "%s", pkg.content_id);
         *category = kind;
         snprintf(name, 128, "%s", n && !n->is_int ? n->sval : pkg.title_id);
-        snprintf(ver, 16, "%s", v && !v->is_int ? v->sval : "01.00");
+        /* Missing APP_VER is not safe for choosing the newest update. */
+        snprintf(ver, 16, "%s", v && !v->is_int ? v->sval : "");
         *size = (unsigned long long)pkg.pkg_size;
     }
     pkg_close(&pkg);
@@ -730,10 +773,10 @@ static int describe_pkg(const char *path, char tid[10], int *category,
 }
 
 static void inspect_pkg(const char *root, const char *path) {
-    char tid[10], name[128], ver[16];
+    char tid[10], name[128], ver[16], content_id[37];
     unsigned long long size = 0;
     int kind;
-    if (describe_pkg(path, tid, &kind, name, ver, &size)) return;
+    if (describe_pkg(path, tid, &kind, name, ver, &size, content_id)) return;
     title_t *t = catalog_find(tid);
     if (!t) {
         if (g_title_count >= MAX_TITLES) {
@@ -761,17 +804,70 @@ static void inspect_pkg(const char *root, const char *path) {
         snprintf(t->name, sizeof(t->name), "%s", name);
         snprintf(t->ver, sizeof(t->ver), "%s", ver);
         t->size = size;
+        snprintf(t->content_id, sizeof(t->content_id), "%s", content_id);
         snprintf(t->dir, sizeof(t->dir), "%s", path);
         char *slash = strrchr(t->dir, '/');
         if (slash) *slash = 0;
     } else {
-        if (t->patch_path[0] && strcmp(t->patch_path, path)) {
+        if (t->update_count >= MAX_UPDATE_CANDIDATES) {
+            t->update_overflow = 1;
             t->patch_conflict = 1;
-            printf("[safe][scan] %s multiple updates; update will not be moved\n", tid);
+            printf("[safe][scan] %s too many updates; BLOCKED\n", tid);
             return;
         }
-        snprintf(t->patch_path, sizeof(t->patch_path), "%s", path);
-        t->patch_size = size;
+        update_candidate_t *c = &t->patches[t->update_count++];
+        snprintf(c->path, sizeof(c->path), "%s", path);
+        snprintf(c->version, sizeof(c->version), "%s", ver);
+        snprintf(c->content_id, sizeof(c->content_id), "%s", content_id);
+        c->size = size;
+    }
+}
+
+/* Choose the newest compatible patch from all directories, not the first one.
+ * Equal highest versions, invalid versions, or truncated lists are blocked.
+ * The base and update must have the same complete content_id, not just CUSA. */
+static void resolve_updates(title_t *t) {
+    t->patch_path[0] = t->patch_version[0] = 0;
+    t->patch_size = 0;
+    t->invalid_updates = t->incompatible_updates = 0;
+    t->patch_conflict = t->update_overflow;
+    int best = -1, ties = 0;
+    for (int i = 0; i < t->update_count; ++i) {
+        update_candidate_t *c = &t->patches[i];
+        if (!t->app_path[0]) continue; /* orphan update has no base yet */
+        if (!t->content_id[0] || !c->content_id[0] ||
+            strcmp(t->content_id, c->content_id)) {
+            t->incompatible_updates++;
+            printf("[safe][update] %s skipped INCOMPATIBLE content_id %s from %s\n",
+                   t->tid, c->content_id, c->path);
+            continue;
+        }
+        int parts[4];
+        if (ps4mount_parse_app_ver(c->version, parts)) {
+            t->invalid_updates++;
+            printf("[safe][update] %s UNREADABLE APP_VER from %s\n", t->tid, c->path);
+            continue;
+        }
+        int cmp = best < 0 ? 1 : ps4mount_compare_app_ver(c->version, t->patches[best].version);
+        if (cmp > 0) { best = i; ties = 1; }
+        else if (cmp == 0) ties++;
+    }
+    if (t->invalid_updates || ties > 1 || t->update_overflow) {
+        t->patch_conflict = 1;
+        printf("[safe][update] %s BLOCKED: invalid=%d top_ties=%d overflow=%d\n",
+               t->tid, t->invalid_updates, ties, t->update_overflow);
+        return;
+    }
+    if (best >= 0) {
+        update_candidate_t *c = &t->patches[best];
+        snprintf(t->patch_path, sizeof(t->patch_path), "%s", c->path);
+        snprintf(t->patch_version, sizeof(t->patch_version), "%s", c->version);
+        t->patch_size = c->size;
+        printf("[safe][update] %s selected APP_VER=%s among %d update(s): %s\n",
+               t->tid, c->version, t->update_count, c->path);
+    } else if (t->update_count && t->app_path[0]) {
+        t->patch_conflict = 1; /* no compatible candidate; manual review required */
+        printf("[safe][update] %s no compatible update; BLOCKED\n", t->tid);
     }
 }
 
@@ -852,10 +948,13 @@ static int prepare_title(title_t *t) {
         return -1;
     }
     /* Verify metadata again before changing any paths. */
-    char id[10], name[128], ver[16]; int kind; unsigned long long bytes;
-    if (describe_pkg(t->app_path, id, &kind, name, ver, &bytes) || kind != 1 || strcmp(id, t->tid)) return -1;
+    char id[10], name[128], ver[16], cid[37]; int kind; unsigned long long bytes;
+    if (describe_pkg(t->app_path, id, &kind, name, ver, &bytes, cid) ||
+        kind != 1 || strcmp(id, t->tid) || strcmp(cid, t->content_id) || bytes != t->size) return -1;
     if (t->patch_path[0] &&
-        (describe_pkg(t->patch_path, id, &kind, name, ver, &bytes) || kind != 2 || strcmp(id, t->tid))) return -1;
+        (describe_pkg(t->patch_path, id, &kind, name, ver, &bytes, cid) ||
+         kind != 2 || strcmp(id, t->tid) || strcmp(cid, t->content_id) ||
+         strcmp(ver, t->patch_version) || bytes != t->patch_size)) return -1;
     char original[PATH_MAX]; snprintf(original, sizeof(original), "%s", t->app_path);
     int moved_app = 0;
     if (strcmp(t->app_path, app_dst)) {
@@ -883,17 +982,21 @@ static int prepare_title(title_t *t) {
 static void scan_root(const char *root) {
     catalog_forget_root(root);
     scan_nested(root, root, 0);
-    int games = 0, conflicts = 0, updates = 0;
+    for (int i = 0; i < g_title_count; ++i)
+        if (!strcmp(root, g_titles[i].root)) resolve_updates(&g_titles[i]);
+    int games = 0, conflicts = 0, updates = 0, total_candidates = 0, ignored_incompatible = 0;
     for (int i = 0; i < g_title_count; i++) {
         title_t *t = &g_titles[i];
         if (strcmp(root, t->root) || !t->app_path[0]) continue;
         games++;
         if (t->conflict || t->patch_conflict) conflicts++;
         if (t->patch_path[0]) updates++;
+        total_candidates += t->update_count;
+        ignored_incompatible += t->incompatible_updates;
     }
-    printf("[safe][scan] %s: games=%d with_updates=%d conflicts=%d; NO files moved, NO games registered\n",
-           root, games, updates, conflicts);
-    notify("%d games indexed on %s (read-only); use web panel to add one", games, root);
+    printf("[safe][scan] %s: games=%d selected_updates=%d candidates=%d incompatible=%d conflicts=%d; NO files moved, NO games registered\n",
+           root, games, updates, total_candidates, ignored_incompatible, conflicts);
+    notify("%d games indexed on %s (read-only); registration LOCKED", games, root);
 }
 
 static void scan_all(void) {
@@ -1074,12 +1177,18 @@ void app_games_json(buf_t *out) {
         buf_printf(out, "%s{\"title_id\":\"%s\",\"name\":", first ? "" : ",", t->tid);
         json_str(out, t->name);
         buf_printf(out, ",\"version\":"); json_str(out, t->ver);
+        buf_printf(out, ",\"update_version\":"); json_str(out, t->patch_version);
+        buf_printf(out, ",\"update_candidates\":%d", t->update_count);
+        buf_printf(out, ",\"incompatible_updates\":%d", t->incompatible_updates);
         buf_printf(out, ",\"size\":%llu,\"has_patch\":%s,\"state\":\"%s\",\"mount\":\"\",\"source\":",
                    t->size + t->patch_size, t->patch_path[0] ? "true" : "false", state);
         json_str(out, t->app_path);
+        buf_printf(out, ",\"update_source\":");
+        json_str(out, t->patch_path);
         buf_printf(out, ",\"update_issue\":");
         json_str(out, t->conflict ? "Duplicate base PKGs for this CUSA; no action allowed" :
-                       t->patch_conflict ? "Multiple updates for this CUSA; no action allowed" : "");
+                       t->patch_conflict ? "No unambiguous compatible latest update; review required" :
+                       t->incompatible_updates ? "Incompatible updates skipped (content ID mismatch)" : "");
         buf_printf(out, "}");
         first = 0;
     }
@@ -1303,14 +1412,17 @@ int main(void) {
         return 0;
     }
     sceUserServiceInitialize(0);
+#if ENABLE_EXPERIMENTAL_REGISTRATION
     sceAppInstUtilInitialize();
+#endif
     mkdirs(STATE_DIR, 0777);
     freopen(STATE_DIR "/log.txt", "a", stdout);
     setvbuf(stdout, NULL, _IOLBF, 0);
     signal(SIGPIPE, SIG_IGN);
     /* SAFE PREVIEW: shortcut installation invokes AppInstallAll and writes
      * to PS5 DB even during discovery; never install it automatically. */
-    printf("[safe] shortcut install DISABLED; open http://<PS5 IP>:8770\n");
+    printf("\n======= " VERSION " session start =======\n");
+    printf("[safe] shortcut install DISABLED; registration DISABLED; open http://<PS5 IP>:8770\n");
     g_web = web_listen();
     notify(g_web >= 0 ? VERSION " running. Read-only scan; panel http://<PS5 IP>:8770" : VERSION " panel unavailable");
     unlink(STATE_DIR "/stop");

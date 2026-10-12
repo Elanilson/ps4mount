@@ -80,14 +80,16 @@ function render() {
     var act = '';
     if (g.state === 'discovered') act = '<button disabled title="Safety-preview: registration not enabled">Registration locked (preview)</button>';
     else if (g.state === 'ready') act = '<button disabled>Registered</button>';
-    else if (g.state === 'conflict') act = '<button disabled>Resolve duplicate PKGs</button>';
+    else if (g.state === 'conflict') act = '<button disabled>Manual review required</button>';
     else if (g.state === 'queued') act = '<button disabled>Queued</button>';
     if (busy[g.title_id]) act = '<button disabled>Please wait…</button>';
     html += '<div class="card"><div class="art" style="background-image:url(/icon/' + g.title_id + ')">' +
       '<span class="badge b-' + g.state + '">' + esc(labels[g.state] || g.state) + '</span></div>' +
       '<div class="info"><div class="name">' + esc(g.name) + '</div>' +
-      '<div class="meta">' + g.title_id + ' · v' + esc(g.version) + (g.has_patch ? ' (with update)' : '') + ' · ' + gb(g.size) + '</div>' +
+      '<div class="meta">' + g.title_id + ' · v' + esc(g.version) + (g.has_patch ? ' · update v' + esc(g.update_version) : '') +
+      (g.update_candidates > 1 ? ' · ' + g.update_candidates + ' updates found' : '') + ' · ' + gb(g.size) + '</div>' +
       '<div class="meta">' + esc(g.source) + (g.mount ? ' · mounted ' + g.mount : '') + '</div>' +
+      (g.update_source ? '<div class="meta">Selected update: ' + esc(g.update_source) + '</div>' : '') +
       (g.update_issue ? '<div class="warn">' + esc(g.update_issue) + '</div>' : '') + '</div>' +
       '<div class="actions">' + act + '</div></div>';
   });

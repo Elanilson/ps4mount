@@ -14,11 +14,17 @@ int pkg_open(pkg_t *pkg, const char *path) {
     if (pkg->fd < 0) return -1;
     char category[4] = "", id[12] = "";
     FILE *f = fdopen(dup(pkg->fd), "r");
-    int ok = f && fscanf(f, "%3s %11s", category, id) == 2;
+    char version[16] = "01.03";
+    int count = f ? fscanf(f, "%3s %11s %15s", category, id, version) : 0;
+    int ok = count >= 2;
     if (f) fclose(f);
     if (!ok) { close(pkg->fd); pkg->fd = -1; return -1; }
-    memcpy(pkg->header, category, 3);
+    snprintf((char *)pkg->header, sizeof(pkg->header), "%.2s %s", category, version);
     snprintf(pkg->title_id, sizeof(pkg->title_id), "%s", id);
+    snprintf(pkg->content_id, sizeof(pkg->content_id), "UP0000-%.9s_00-TESTGAME00000000", id);
+    /* optional trailing mismatched content ID marker for incompatibility test */
+    if (strstr(path, "Foreign"))
+        snprintf(pkg->content_id, sizeof(pkg->content_id), "UP0000-%.9s_00-FOREIGN000000000", id);
     pkg->pkg_size = 123;
     return 0;
 }
@@ -26,9 +32,9 @@ void pkg_close(pkg_t *pkg) { if (pkg->fd >= 0) close(pkg->fd); pkg->fd = -1; }
 int pkg_fake_key(pkg_t *pkg) { (void)pkg; return 1; }
 uint8_t *pkg_entry(pkg_t *pkg, uint32_t id, size_t *len) {
     if (id != 0x1000) return NULL;
-    *len = 3;
-    uint8_t *data = malloc(4);
-    memcpy(data, pkg->header, 4);
+    *len = strlen((char *)pkg->header) + 1;
+    uint8_t *data = malloc(*len);
+    memcpy(data, pkg->header, *len);
     return data;
 }
 int sfo_parse(const uint8_t *data, size_t len, sfo_t *sfo) {
@@ -40,7 +46,7 @@ int sfo_parse(const uint8_t *data, size_t len, sfo_t *sfo) {
     strcpy(sfo->items[1].key, "TITLE");
     strcpy(sfo->items[1].sval, "Game: Test / PS4");
     strcpy(sfo->items[2].key, "APP_VER");
-    strcpy(sfo->items[2].sval, "01.03");
+    strcpy(sfo->items[2].sval, (const char *)data + 3);
     return 0;
 }
 const sfo_item_t *sfo_get(const sfo_t *sfo, const char *key) {
@@ -52,6 +58,22 @@ int statfs(const char *p, struct statfs *sf) {
     memset(sf, 0, sizeof(*sf));
     snprintf(sf->f_mntonname, sizeof(sf->f_mntonname), "%s", p);
     return 0;
+}
+
+static void cleanup_fixture(const char *path) {
+    DIR *d = opendir(path);
+    if (!d) { unlink(path); return; }
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        char p[PATH_MAX];
+        snprintf(p, sizeof(p), "%s/%s", path, e->d_name);
+        struct stat st;
+        if (!lstat(p, &st) && S_ISDIR(st.st_mode)) cleanup_fixture(p);
+        else unlink(p);
+    }
+    closedir(d);
+    rmdir(path);
 }
 
 static void write_dummy(const char *p, const char *txt) {
@@ -69,16 +91,27 @@ int main(void) {
     snprintf(dlcs, sizeof(dlcs), "%s/DLC", game); assert(!mkdir(dlcs, 0700));
     snprintf(other, sizeof(other), "%s/Another Game", root); assert(!mkdir(other, 0700));
     snprintf(p, sizeof(p), "%s/Original Game.pkg", game); write_dummy(p, "gd CUSA01623");
-    snprintf(p, sizeof(p), "%s/Update Version.pkg", updates); write_dummy(p, "gp CUSA01623");
+    snprintf(p, sizeof(p), "%s/Update Old.pkg", updates); write_dummy(p, "gp CUSA01623 01.09");
+    snprintf(p, sizeof(p), "%s/Update Version.pkg", updates); write_dummy(p, "gp CUSA01623 01.10");
+    snprintf(p, sizeof(p), "%s/Update Much Older.pkg", updates); write_dummy(p, "gp CUSA01623 01.02");
+    snprintf(p, sizeof(p), "%s/Foreign Update.pkg", updates); write_dummy(p, "gp CUSA01623 99.99");
     snprintf(p, sizeof(p), "%s/DLC.pkg", dlcs); write_dummy(p, "ac CUSA01623");
     snprintf(p, sizeof(p), "%s/Another Game.pkg", other); write_dummy(p, "gd CUSA01234");
     snprintf(p, sizeof(p), "%s/Orphan Update.pkg", updates); write_dummy(p, "gp CUSA09999");
 
     g_title_count = 0; scan_nested(root, root, 0);
+    for (int i = 0; i < g_title_count; ++i) resolve_updates(&g_titles[i]);
     title_t *t = catalog_find("CUSA01623"), *t2 = catalog_find("CUSA01234");
     assert(t && t2 && t->app_path[0] && t->patch_path[0]);
     assert(strstr(t->app_path, "Original Game.pkg"));
     assert(strstr(t->patch_path, "Update Version.pkg"));
+    assert(!strcmp(t->patch_version, "01.10"));
+    assert(t->update_count == 4 && t->incompatible_updates == 1 && !t->patch_conflict);
+    assert(ps4mount_compare_app_ver("01.10", "01.09") > 0);
+    assert(ps4mount_compare_app_ver("01.10", "01.10") == 0);
+    assert(ps4mount_compare_app_ver("01.10", "02.00") < 0);
+    int vparts[4]; assert(ps4mount_parse_app_ver("01.X", vparts) != 0);
+    printf("PASS: most recent compatible APP_VER wins, unrelated content id ignored\n");
     assert(!t->conflict && !t->patch_conflict);
     assert(!t2->patch_path[0]);
     snprintf(p, sizeof(p), "%s/app.pkg", game); assert(!exists(p));
@@ -98,16 +131,50 @@ int main(void) {
     snprintf(p, sizeof(p), "%s/ps4/CUSA01623 - Game_ Test _ PS4/app.pkg", root);
     snprintf(q, sizeof(q), "%s/ps4/CUSA01623 - Game_ Test _ PS4/patch.pkg", root);
     assert(exists(p) && exists(q));
+    snprintf(p, sizeof(p), "%s/Update Old.pkg", updates); assert(exists(p));
+    snprintf(p, sizeof(p), "%s/Update Much Older.pkg", updates); assert(exists(p));
+    snprintf(p, sizeof(p), "%s/Foreign Update.pkg", updates); assert(exists(p));
     snprintf(p, sizeof(p), "%s/DLC.pkg", dlcs); assert(exists(p));
     printf("PASS: deliberate same-volume move to ps4/CUSA - sanitized TITLE; DLC intact\n");
 
     /* Duplicate base PKG must make this CUSA unselectable. */
     snprintf(p, sizeof(p), "%s/Duplicate Base.pkg", other); write_dummy(p, "gd CUSA01234");
     g_title_count = 0; scan_nested(root, root, 0);
+    for (int i = 0; i < g_title_count; ++i) resolve_updates(&g_titles[i]);
     assert(catalog_find("CUSA01234") && catalog_find("CUSA01234")->conflict);
     assert(prepare_title(catalog_find("CUSA01234")) != 0);
     printf("PASS: duplicate base is blocked rather than overwritten\n");
 
-    rm_tree(root);
+    /* Ambiguous same-version updates: do not select an arbitrary file. */
+    snprintf(p, sizeof(p), "%s/AuxA.pkg", other); write_dummy(p, "gp CUSA01234 01.05");
+    snprintf(p, sizeof(p), "%s/AuxB.pkg", other); write_dummy(p, "gp CUSA01234 01.05");
+    /* The existing base is duplicated, but update ambiguity is independent. */
+    g_title_count = 0; scan_nested(root, root, 0);
+    for (int i = 0; i < g_title_count; ++i) resolve_updates(&g_titles[i]);
+    title_t *amb = catalog_find("CUSA01234"); assert(amb && amb->patch_conflict);
+    assert(!amb->patch_path[0]);
+    printf("PASS: identical highest version in two PKGs blocks patch selection\n");
+
+    /* Bad version cannot be sorted; do not silently choose another update. */
+    snprintf(p, sizeof(p), "%s/Unparseable.pkg", updates); write_dummy(p, "gp CUSA01623 unknown");
+    g_title_count = 0; scan_nested(root, root, 0);
+    for (int i = 0; i < g_title_count; ++i) resolve_updates(&g_titles[i]);
+    t = catalog_find("CUSA01623"); assert(t && t->invalid_updates == 1 && t->patch_conflict);
+    assert(!t->patch_path[0]);
+    printf("PASS: unknown APP_VER blocks automatic update selection\n");
+
+    /* Small file metadata writes use atomic replace, reject symlink targets. */
+    snprintf(p, sizeof(p), "%s/marker.txt", root); write_dummy(p, "old");
+    assert(write_file(p, "new", 3, 0600) == 0);
+    char readbuf[32] = {0}; FILE *f = fopen(p, "r"); assert(f);
+    assert(fread(readbuf, 1, 3, f) == 3); fclose(f); assert(!strcmp(readbuf, "new"));
+    snprintf(q, sizeof(q), "%s/alias", root);
+    assert(symlink(p, q) == 0);
+    assert(write_file(q, "damage", 6, 0600) != 0);
+    memset(readbuf, 0, sizeof(readbuf)); f = fopen(p, "r"); assert(f);
+    assert(fread(readbuf, 1, 3, f) == 3); fclose(f); assert(!strcmp(readbuf, "new"));
+    printf("PASS: atomic file replacement and symlink protection\n");
+
+    cleanup_fixture(root);
     return 0;
 }
