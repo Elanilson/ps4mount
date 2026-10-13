@@ -21,6 +21,7 @@ function setup(shared) {
       shared.count=Number(url.split('=')[1]);
       return {message:'Queue accepted in ELF'};
     }
+    if(url==='/api/sync-status')return {phase:'completed',processed:0,total:0,eligible:0,registered:0,blocked:0,unknown:0};
     if(url==='/api/games')return {games:[],version:'0.5.9',fault:false};
     if(url==='/api/batch-status')return {phase:shared.running?'register':shared.completed?'completed':'idle',
       running:shared.running,count:shared.count,processed:shared.processed,registered:shared.processed,

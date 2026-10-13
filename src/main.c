@@ -41,7 +41,7 @@
 #include "organize.h"
 #include "icon_data.h"
 
-#define VERSION "PS4Mount 0.5.10-phase4i-autoboot5"
+#define VERSION "PS4Mount 0.5.11-phase4j-safe-sync"
 #define LOCK_PORT 9032
 #define SCAN_SECONDS 10
 #define STATE_DIR "/data/ps4mount"
@@ -1295,20 +1295,96 @@ static void scan_root(const char *root) {
     notify("%d games indexed on %s (read-only); registration LOCKED", games, root);
 }
 
+static void json_str(buf_t *b,const char *s);
+static int supported_usb(const title_t *t);
+/* A read-only catalog audit is stepped by the ELF event loop so the panel can
+ * poll actual progress; no scheduling, organizing, mounting or registering here.
+ * Scan itself is synchronous (metadata enumeration); the count is established
+ * after discovery, then each per-game eligibility check is counted. */
+typedef struct {
+    int active, complete, processed, total, eligible, registered, blocked, uncertain;
+    unsigned generation;
+    char message[192];
+} sync_progress_t;
+static sync_progress_t g_sync;
+static void sync_begin(void) {
+    memset(&g_sync, 0, sizeof(g_sync));
+    g_sync.active=1;g_sync.generation=1;
+    for(int i=0;i<g_title_count;i++) if(g_titles[i].app_path[0]) g_sync.total++;
+    snprintf(g_sync.message,sizeof(g_sync.message),"Verificando jogos do USB: 0/%d",g_sync.total);
+    printf("[safe][sync] BEGIN titles=%d (READ ONLY; no register)\n",g_sync.total);
+    if(g_sync.total>0) notify("PS4Mount: verificando jogos 1/%d (somente leitura)",g_sync.total);
+    else notify("PS4Mount: nenhum jogo encontrado (somente leitura)");
+}
+static void sync_tick(void) {
+    if(!g_sync.active) return;
+    /* g_sync.processed indexes only base-game entries, not orphan updates. */
+    for(int k=0;k<4 && g_sync.processed < g_sync.total;k++) {
+        int ordinal=0;
+        title_t *t=NULL;
+        for(int i=0;i<g_title_count;i++) {
+            if(!g_titles[i].app_path[0]) continue;
+            if(ordinal++==g_sync.processed) {t=&g_titles[i];break;}
+        }
+        if(!t){g_sync.active=0;g_sync.uncertain++;break;}
+        /* Consult the SAME catalog and read-only DB status as batch_candidate.
+         * This does not call batch_candidate while a batch could be active. */
+        int db=db_registered_status(t->tid);
+        if(db==1)g_sync.registered++;
+        else if(db<0)g_sync.uncertain++;
+        else if(t->conflict || t->patch_conflict || t->suspicious_updates ||
+                t->unverified_duplicate_updates || (t->update_count&&!t->patch_path[0]) ||
+                !supported_usb(t) || installed_internally(t->tid) || org_pending(t->root))
+            g_sync.blocked++;
+        else g_sync.eligible++;
+        g_sync.processed++;
+        snprintf(g_sync.message,sizeof(g_sync.message),"Verificando jogos: %d/%d",g_sync.processed,g_sync.total);
+        if(g_sync.processed==1 || g_sync.processed%25==0)
+            printf("[safe][sync] CHECK %d/%d eligible=%d registered=%d blocked=%d unknown=%d\n",
+                   g_sync.processed,g_sync.total,g_sync.eligible,g_sync.registered,g_sync.blocked,g_sync.uncertain);
+        if(g_sync.processed%25==0 && g_sync.processed<g_sync.total)
+            notify("PS4Mount: lendo jogos %d/%d",g_sync.processed,g_sync.total);
+    }
+    if(g_sync.processed>=g_sync.total || !g_sync.active){
+        g_sync.active=0;g_sync.complete=1;
+        snprintf(g_sync.message,sizeof(g_sync.message),"Sincronizacao finalizada: %d/%d jogos verificados",
+                 g_sync.processed,g_sync.total);
+        printf("[safe][sync] FINISHED %d/%d eligible=%d registered=%d blocked=%d unknown=%d; NO REGISTRATION\n",
+               g_sync.processed,g_sync.total,g_sync.eligible,g_sync.registered,g_sync.blocked,g_sync.uncertain);
+        notify("PS4Mount: finalizado %d/%d, %d elegiveis (%d bloqueados)",
+               g_sync.processed,g_sync.total,g_sync.eligible,g_sync.blocked+g_sync.uncertain);
+    }
+}
+void app_sync_status_json(buf_t *out) {
+    buf_printf(out,"{\"ok\":true,\"phase\":");
+    json_str(out,g_sync.active?"verifying":g_sync.complete?"completed":"waiting");
+    buf_printf(out,",\"processed\":%d,\"total\":%d,\"eligible\":%d,\"registered\":%d,\"blocked\":%d,\"unknown\":%d,\"registration_auto_enabled\":false,\"message\":",
+        g_sync.processed,g_sync.total,g_sync.eligible,g_sync.registered,g_sync.blocked,g_sync.uncertain);
+    json_str(out,g_sync.message);
+    buf_printf(out,"}");
+}
+
 static void scan_all(void) {
     char root[32];
+    int changed=0;
     /* ext* may contain PS5 system app mounts; only index USB game drives. */
     for (int i = 0; i < 8; i++) {
         snprintf(root, sizeof(root), "/mnt/usb%d", i);
         int present = is_mountpoint(root);
-        if (present && (!g_last_seen[i] || g_manual_scan)) scan_root(root);
+        if (present && (!g_last_seen[i] || g_manual_scan)) {
+            changed=1;
+            notify("PS4Mount: lendo PKGs do USB%d (somente leitura)...",i);
+            scan_root(root);
+        }
         else if (!present && g_last_seen[i]) {
+            changed=1;
             printf("[safe][scan] disconnected %s, forgetting catalog without force-unmount\n", root);
             catalog_forget_root(root);
         }
         g_last_seen[i] = present;
     }
     g_manual_scan = 0;
+    if(changed)sync_begin();
 }
 
 /* Remove stale mounts only through explicit recovery tooling (not on a timer).
@@ -1442,7 +1518,7 @@ static time_t g_next_scan;
 static int g_stop;
 
 void app_rescan(void) {
-    if (!g_registration_busy && !batch_running()) { g_next_scan = 0; g_manual_scan = 1; }
+    if (!g_registration_busy && !batch_running() && !g_sync.active) { g_next_scan = 0; g_manual_scan = 1; }
 }
 void app_stop(void) { g_stop = 1; }
 
@@ -2153,7 +2229,7 @@ int app_organize(const char *tid, const char *nonce, char *msg, size_t cap) {
 /* This distribution is the explicitly opted-in auto-boot edition.
  * ONE batch per ELF process, at most 5 titles. No endless background batches.
  * Set to 0 before building if auto-registration is NOT wanted. */
-#define AUTO_BOOT_BATCH_LIMIT 5
+#define AUTO_BOOT_BATCH_LIMIT 0
 #ifndef BATCH_FILE
 #define BATCH_FILE STATE_DIR "/batch-v1.state"
 #endif
@@ -2346,7 +2422,7 @@ int app_batch_start(int limit,const char *token,char *msg,size_t cap) {
     snprintf(msg,cap,"Backend queue accepted (%d games). You may leave/reopen panel, but keep ELF/PS5/USB powered",count);
     return 0;
 }
-/* Phase 4I: one-shot daemon auto-boot: NO browser actions and NO repeated
+/* Disabled auto-registration on this safe-sync edition. Phase 4I: one-shot daemon auto-boot: NO browser actions and NO repeated
  * registrations. It invokes the SAME reviewed preview/start path as the panel,
  * with a per-CUSA non-replayable token and a durable fail-closed batch state.
  * The limit is hard-coded to FIVE for this opt-in build. It never auto-chains. */
@@ -2799,9 +2875,9 @@ int main(void) {
      * to PS5 DB even during discovery; never install it automatically. */
     batch_restore();
     printf("\n======= " VERSION " session start =======\n");
-    printf("[safe] shortcut install DISABLED; bulk registration DISABLED; auto-boot opt-in max %d titles/ELF; open http://<PS5 IP>:8770\n", AUTO_BOOT_BATCH_LIMIT);
+    printf("[safe] shortcut install DISABLED; bulk registration DISABLED; read-only synchronization; automatic registration DISABLED (limit=%d); open http://<PS5 IP>:8770\n", AUTO_BOOT_BATCH_LIMIT);
     g_web = web_listen();
-    notify(g_web >= 0 ? VERSION " running. AUTO BOOT 5 max, targeted only; panel :8770" : VERSION " AUTO BOOT 5 max; panel unavailable");
+    notify(g_web >= 0 ? VERSION " lendo jogos (somente leitura); painel :8770" : VERSION " lendo jogos (somente leitura); painel indisponivel");
     unlink(STATE_DIR "/stop");
     for (;;) {
         if ((g_stop || exists(STATE_DIR "/stop")) && !batch_running()) {
@@ -2826,11 +2902,13 @@ int main(void) {
                 set_rw(m, 0);
             }
         }
-        if (time(NULL) >= g_next_scan && !g_deleting && !g_registration_busy && !batch_running()) {
+        if (time(NULL) >= g_next_scan && !g_deleting && !g_registration_busy && !batch_running() && !g_sync.active) {
             scan_all();
             g_next_scan = time(NULL) + SCAN_SECONDS;
         }
-        batch_autoboot_once(); /* Waits for first indexed USB; one batch per process. */
+        /* Zero limit: no automatic registration; opening the browser is GET-only. */
+        batch_autoboot_once();
+        if (g_sync.active) sync_tick();
         if (batch_running()) batch_tick();
         process_queue();
         pump_events(batch_running() ? 400 : 1000);

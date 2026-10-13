@@ -1,3 +1,41 @@
+# PS4Mount 0.5.11 — Sincronizacao segura com progresso (Phase 4J)
+
+**Diagnostico comprovado no log da 0.5.10:** somente 2 jogos foram verificados
+(CUSA00074, CUSA13285). Em CUSA06886 houve `foreign layer at
+/user/patch/CUSA06886; untouched`, seguida por `FAILED at 3/5`.
+NAO registrar todos automaticamente enquanto essa camada nao for investigada.
+
+Esta versao faz uma leitura automatica do USB ao iniciar o ELF, depois valida
+os jogos do catalogo, mostrando notificacoes de progresso (`1/N`, `25/N`, etc.)
+e notificacao de conclusao. `N` inclui jogos com base PKG catalogada;
+`elegiveis` e um subconjunto separado, nao significa jogos comprovadamente
+executaveis. A API `/api/sync-status` retorna o progresso real em passos;
+a pagina atualiza a barra e os numeros usando SOMENTE GET.
+
+O botao **Sincronizar (somente leitura)** solicita reindexacao da lista sem
+organizar PKGs, montar ou registrar. Abrir/fechar/recarregar a pagina nao inicia
+escrita nem sincronizacao nova. O registro automatico da 0.5.10 foi desligado
+(`AUTO_BOOT_BATCH_LIMIT 0`) para evitar repeticoes apos o erro documentado.
+O estado de falha existente em `/data/ps4mount/batch-v1.state` e preservado,
+sem limpar ou contornar as protecoes.
+
+Os metodos originais de registro individual permanecem no codigo mas nao sao
+automaticamente chamados. Nunca usa `AppInstallAll`, nem SQLite WRITE. A
+varredura USB ainda e sincrona, portanto a barra de progresso acompanha a
+VALIDACAO dos jogos depois da descoberta, nao o progresso de leitura byte a byte
+de cada PKG. Ela pode demorar para mostrar 1/N durante um scan USB longo.
+
+**Uso:** compilar via GitHub Actions, executar ELF, observar notificacoes de
+leitura e conclusao, abrir painel 8770 para consultar. Para atualizar arquivos
+posteriormente, clique Sincronizar; isso nao repete registros.
+
+**Importante:** para liberar um modo de registro de toda a biblioteca sera
+necessario diagnosticar o mountpoint estrangeiro do CUSA06886, e testar
+recuperacao e enumeracao de titulos em um console de teste com backup. Esta
+versao NAO registra 147 jogos.
+
+---
+
 ## 0.5.10 Phase 4I — auto-boot (ate 5 jogos)
 
 **Esta distribuicao e a variante com auto-boot ATIVO.** Assim que o ELF for

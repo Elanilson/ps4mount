@@ -23,6 +23,7 @@ const tid = 'CUSA03323', token = 'a'.repeat(32), regtoken = 'b'.repeat(32);
 let registerReady = false;
 let mounted = false;
 const handlers = {
+  '/api/sync-status': () => ({phase:'completed',processed:1,total:1,eligible:1,registered:0,blocked:0,unknown:0}),
   '/api/batch-status': () => ({phase:'idle',running:false,count:0,processed:0,registered:0,current:'',titles:[],message:''}),
   '/api/games': () => ({version: '0.5.7-test', games: [{title_id:tid,name:'Uncanny Valley',state:'discovered',version:'01.00',has_patch:true,update_version:'01.02',source:'/mnt/usb0/PS4/CUSA03323 - Uncanny Valley/app.pkg',size:90000000}],fault:false}),
   ['/api/probe-preview?title_id='+tid]: () => ({title_id:tid,can_mount:!mounted,can_release:mounted,attempted:mounted,confirm_token:token,message:'ready'}),

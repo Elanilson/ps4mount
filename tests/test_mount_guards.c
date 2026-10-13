@@ -102,7 +102,7 @@ int main(void) {
     puts("PASS: Phase 4H restores unfinished work as INTERRUPTED without any automatic replay");
     /* Phase 4I: no batch before USB discovery; interrupted state blocks
      * unattended writes permanently for the current ELF session. */
-    assert(AUTO_BOOT_BATCH_LIMIT == 5);
+    assert(AUTO_BOOT_BATCH_LIMIT == 0); /* disabled after real PS5 mount conflict */
     g_auto_boot_attempted = 0;
     g_title_count = 0;
     assert(batch_autoboot_gate() == 0);
@@ -116,7 +116,7 @@ int main(void) {
     g_managed[0].used = 1;
     g_managed[0].running = 1;
     assert(batch_autoboot_gate() == -2); /* active game */
-    puts("PASS: Phase 4I auto-boot waits for USB, blocks crash state, never retries");
+    puts("PASS: Phase 4J retains crash/active-game gating, auto-boot disabled");
     assert(rmdir(target) == 0);
     assert(rmdir(root) == 0);
     puts("PASS: foreign mounts left untouched and unreadable running-state blocks mutations");

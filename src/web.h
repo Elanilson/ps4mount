@@ -35,3 +35,6 @@ int app_batch_preview_json(int limit, buf_t *out);
 int app_batch_start(int limit,const char *token,char *msg,size_t cap);
 void app_batch_status_json(buf_t *out);
 int app_batch_active(void);
+
+/* Safe catalog synchronization status; GET-only. */
+void app_sync_status_json(buf_t *out);

@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="pt-BR">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -49,8 +49,8 @@ pre{white-space:pre-wrap;font-size:12px;max-height:60vh;overflow:auto;background
   <h1>PS4Mount <small id="ver"></small></h1>
   <div class="bar">
     <input id="q" type="search" placeholder="Search game or CUSA">
-    <button id="batchpreview" class="primary">Consultar lote automatico (ELF)</button>
-    <button id="rescan" class="primary">Scan for games</button>
+    <button id="batchpreview" hidden>Consultar lote (desativado nesta versao)</button>
+    <button id="rescan" class="primary">Sincronizar (somente leitura)</button>
     <button id="recoverbtn">USB recovery</button>
     <button id="logbtn">Log</button>
     <button id="stop" class="danger">Stop</button>
@@ -58,6 +58,11 @@ pre{white-space:pre-wrap;font-size:12px;max-height:60vh;overflow:auto;background
 </header>
 <main>
   <div class="summary" id="summary"></div>
+  <section aria-label="Sincronizacao" style="margin-bottom:14px;padding:12px;border:1px solid var(--line);border-radius:10px;background:var(--panel)">
+    <div id="syncstatus" role="status" aria-live="polite">Aguardando leitura dos jogos...</div>
+    <progress id="syncprogress" value="0" max="1" style="width:100%;height:16px"></progress>
+    <div class="warn" style="margin-top:8px">Sincronizacao SOMENTE LEITURA. Registro automatico desativado: falha anterior de montagem em CUSA06886 necessita inspecao.</div>
+  </section>
   <div class="grid" id="grid"></div>
   <div class="empty" id="empty" hidden>No games found. PKGs may be in any subfolder; rescan to refresh.</div>
 </main>
@@ -173,7 +178,7 @@ function render() {
   });
   $('grid').innerHTML = html;
   $('empty').hidden = games.length > 0;
-  var s = '<span>PHASE 4I · auto-boot: ate 5 jogos por ELF · apenas registro individual</span><span>' + games.length + ' game(s)</span>';
+  var s = '<span>PHASE 4J · sincronizacao sem registro automatico</span><span>' + games.length + ' game(s)</span>';
   for (var k in counts) s += '<span>' + esc(labels[k] || k) + ': ' + counts[k] + '</span>';
   $('summary').innerHTML = s;
 }
@@ -553,7 +558,30 @@ $('recoverbtn').onclick = function () {
   }).catch(function (e) { alert('Cannot inspect recovery: ' + e.message); });
 };
 $('q').addEventListener('input', render);
-$('rescan').onclick = function () { if (batchBusy) return toast('Lote em andamento'); api('/api/rescan', 'POST').then(function (j) { toast(j.message); setTimeout(load, 3000); }); };
+function syncRefresh() {
+  return api('/api/sync-status').then(function(s) {
+    var total = Math.max(1, s.total || 0);
+    $('syncprogress').max = total;
+    $('syncprogress').value = Math.min(total, s.processed || 0);
+    $('syncstatus').textContent = (s.phase === 'completed' ? 'Finalizado: ' :
+      s.phase === 'verifying' ? 'Lendo jogos: ' : 'Aguardando USB: ') +
+      (s.processed || 0) + '/' + (s.total || 0) +
+      ' | Elegiveis: ' + (s.eligible || 0) +
+      ' | Ja registrados: ' + (s.registered || 0) +
+      ' | Bloqueados: ' + ((s.blocked || 0)+(s.unknown || 0));
+    $('rescan').disabled = s.phase === 'verifying' || batchBusy;
+    return s;
+  }).catch(function(e) { $('syncstatus').textContent = 'Erro consultando status: ' + e.message; });
+}
+$('rescan').onclick = function () {
+  if (batchBusy) return toast('Lote em andamento');
+  $('rescan').disabled = true;
+  $('syncstatus').textContent = 'Solicitando nova leitura dos PKGs...';
+  api('/api/rescan', 'POST').then(function(j) { toast('Sincronizacao solicitada (nao registra jogos)'); })
+    .catch(function(e) { toast('Erro: ' + e.message); $('rescan').disabled = false; });
+};
+setInterval(syncRefresh, 1000);
+syncRefresh();
 $('logbtn').onclick = function () { api('/api/log').then(function (j) { $('log').textContent = j.log; $('logdlg').showModal(); }); };
 $('stop').onclick = function () {
   if (batchBusy) return toast('Lote em andamento: nao pare o daemon durante uma escrita.');

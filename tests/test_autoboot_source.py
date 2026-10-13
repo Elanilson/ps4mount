@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 from pathlib import Path
-main=Path("src/main.c").read_text()
-web=Path("web/index.html").read_text()
-assert '#define AUTO_BOOT_BATCH_LIMIT 5' in main
-assert 'batch_autoboot_once(); /* Waits for first indexed USB' in main
-assert 'app_batch_preview_json(AUTO_BOOT_BATCH_LIMIT, &preview);' in main
-assert 'app_batch_start(AUTO_BOOT_BATCH_LIMIT, token, msg, sizeof(msg))' in main
-assert 'if (g_auto_boot_attempted || g_title_count <= 0) return 0;' in main
-assert 'g_batch.phase == BATCH_INTERRUPTED' in main
-assert 'g_batch.phase == BATCH_FAILED' in main
-assert 'g_auto_boot_attempted = 1;' in main
-assert 'if (batch_running()) batch_tick();' in main
-assert '#define ENABLE_EXPERIMENTAL_REGISTRATION 0' in main
-assert not any(w in main for w in ('sceAppInstUtilAppInstallAll(', 'AppInstallAll(NULL)', 'AppInstallAll(0)'))
-assert 'AUTO-BOOT' in web
-print('PASS: automatic mode bounded to one five-title batch per ELF, no bulk API or JS start')
+m=Path('src/main.c').read_text(); w=Path('src/web.c').read_text(); ui=Path('web/index.html').read_text()
+assert '#define AUTO_BOOT_BATCH_LIMIT 0' in m
+assert 'batch_autoboot_once();' in m
+assert '#if AUTO_BOOT_BATCH_LIMIT > 0' in m
+assert 'static void sync_tick(void)' in m
+assert 'void app_sync_status_json(buf_t *out)' in m
+assert 'if(changed)sync_begin();' in m
+assert 'sync_tick();' in m
+assert 'if(g_sync.processed%25==0 && g_sync.processed<g_sync.total)' in m
+assert 'NO REGISTRATION' in m
+assert '"/api/sync-status"' in w and 'app_sync_status_json(&b)' in w
+assert 'Sincronizar (somente leitura)' in ui
+assert "api('/api/sync-status')" in ui
+assert "api('/api/rescan', 'POST')" in ui
+assert 'batchpreview" hidden' in ui
+assert not any(x in m for x in ('sceAppInstUtilAppInstallAll(', 'AppInstallAll(NULL)', 'AppInstallAll(0)'))
+print('PASS: read-only incremental sync and safe web refresh, no auto-registration')

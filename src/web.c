@@ -173,6 +173,9 @@ void web_serve(int listen_fd) {
      * GETs, batch status and the existing PS5 game launch monitor remain usable. */
     if (post && app_batch_active() && strncmp(path,"/api/batch-",11)) {
         json_msg(fd,0,"Backend batch is running. Other write operations are blocked");
+    } else if (!post && !strcmp(path,"/api/sync-status")) {
+        buf_t b={0};app_sync_status_json(&b);
+        reply(fd,"200 OK","application/json; charset=utf-8",b.data,b.len);buf_free(&b);
     } else if (!post && !strcmp(path,"/api/batch-status")) {
         buf_t b={0};app_batch_status_json(&b);
         reply(fd,"200 OK","application/json; charset=utf-8",b.data,b.len);buf_free(&b);
