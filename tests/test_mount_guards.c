@@ -1,10 +1,17 @@
 /* Host-only test: mount functions must not touch foreign mounts. */
 #define BATCH_FILE "/tmp/ps4mount-phase4h-host-safety.state"
+#define GROUP_FILE "/tmp/ps4mount-phase4m-host-group.state"
 #define main ps4mount_console_main
 #include "../src/main.c"
 #undef main
 #include <assert.h>
 
+/* Simulated PS5 API/DB: unknown DB status must fail every group barrier. */
+int db_registered_status(const char *tid) { (void)tid; return -1; }
+int org_pending(const char *root) { (void)root; return 0; }
+int sceKernelSendNotificationRequest(int u, notify_request_t *r, size_t z, int p) {
+    (void)u; (void)r; (void)z; (void)p; return 0;
+}
 static int unmount_calls, mount_calls;
 static int test_base_only_mode, patch_statfs_reads;
 /* Simulate a PS5 with a known RO app mount and an UNRELATED foreign layer at
@@ -127,6 +134,80 @@ int main(void) {
     assert(strstr(g_batch.message,"No automatic replay"));
     unlink(BATCH_FILE);
     puts("PASS: Phase 4H restores unfinished work as INTERRUPTED without any automatic replay");
+
+    assert(group_next_count(12,0)==5 && group_next_count(12,5)==5 &&
+           group_next_count(12,10)==2 && group_next_count(12,12)==0);
+    puts("PASS: Phase 4M groups exactly 5 + 5 + 2 for 12 titles");
+        /* Manual group job: persisted full snapshot may NEVER auto-resume on restart. */
+    unlink(GROUP_FILE);memset(&g_job,0,sizeof(g_job));
+    g_job.phase=JOB_RUNNING;g_job.total=12;g_job.done=5;
+    g_job.verified=5;g_job.current_group=1;
+    for(int i=0;i<12;i++)snprintf(g_job.titles[i],10,"CUSA%05d",i);
+    snprintf(g_job.message,sizeof(g_job.message),"group two prepared");
+    assert(job_store()==0);
+    memset(&g_job,0,sizeof(g_job));job_restore();
+    assert(g_job.phase==JOB_INTERRUPTED);
+    assert(g_job.total==12 && g_job.done==5 && g_job.verified==5);
+    assert(strstr(g_job.message,"NO automatic replay"));
+    assert(!job_active());
+    /* Even if a restart finds the old group already completed, a pending full
+     * queue cannot silently run the next group. */
+    unlink(GROUP_FILE);memset(&g_job,0,sizeof(g_job));
+    g_job.phase=JOB_WAITING;g_job.total=12;g_job.done=5;g_job.verified=5;
+    g_job.current_group=1;g_job.wait_until=time(NULL)+10;
+    for(int i=0;i<12;i++)snprintf(g_job.titles[i],10,"CUSA%05d",i);
+    assert(job_store()==0);memset(&g_job,0,sizeof(g_job));job_restore();
+    assert(g_job.phase==JOB_INTERRUPTED && !job_active());
+    unlink(GROUP_FILE);
+    puts("PASS: Phase 4M full-group snapshots RUNNING/WAITING never replay after restart");
+    /* Authorization is scoped to exactly one CUSA and BATCH_REGISTER step. */
+    memset(&g_job,0,sizeof(g_job));memset(&g_batch,0,sizeof(g_batch));
+    g_job.phase=JOB_RUNNING;g_job.total=6;
+    snprintf(g_job.titles[0],10,"CUSA11111");
+    g_batch.phase=BATCH_REGISTER;g_batch.count=1;
+    snprintf(g_batch.titles[0],10,"CUSA11111");
+    assert(batch_authorized_title("CUSA11111"));
+    assert(!batch_authorized_title("CUSA22222"));
+    g_batch.phase=BATCH_VERIFY;
+    assert(!batch_authorized_title("CUSA11111"));
+    g_job.phase=JOB_FAILED;
+    assert(!batch_authorized_title("CUSA11111"));
+    memset(&g_job,0,sizeof(g_job));memset(&g_batch,0,sizeof(g_batch));
+    puts("PASS: Phase 4M per-CUSA authorization requires active group register step");
+
+    /* A partly successful group is terminal; never advance to group #2. */
+    memset(&g_job,0,sizeof(g_job));memset(&g_batch,0,sizeof(g_batch));
+    g_job.phase=JOB_RUNNING;g_job.total=7;g_job.current_group=0;
+    g_batch.phase=BATCH_DONE;g_batch.count=5;g_batch.index=5;g_batch.registered=4;
+    group_tick();
+    assert(g_job.phase==JOB_FAILED && g_job.done==0 && !job_active());
+    assert(strstr(g_job.message,"Group not completely verified"));
+    unlink(GROUP_FILE);
+    /* Even a nominally completed group with unconfirmed DB records fails. */
+    memset(&g_job,0,sizeof(g_job));memset(&g_batch,0,sizeof(g_batch));
+    g_job.phase=JOB_RUNNING;g_job.total=1;
+    g_batch.phase=BATCH_DONE;g_batch.count=1;g_batch.index=1;g_batch.registered=1;
+    snprintf(g_batch.titles[0],10,"CUSA11111");
+    group_tick();
+    assert(g_job.phase==JOB_FAILED && g_job.done==0);
+    assert(strstr(g_job.message,"barrier FAILED"));
+    unlink(GROUP_FILE);
+    memset(&g_job,0,sizeof(g_job));memset(&g_batch,0,sizeof(g_batch));
+    puts("PASS: Phase 4M incomplete and DB-uncertain groups NEVER start next group");
+    /* A title that disappears from app.db during the cooldown also blocks
+     * the start of the following group. */
+    g_job.phase=JOB_WAITING;g_job.total=6;g_job.done=5;g_job.verified=5;
+    g_job.current_group=1;g_job.wait_until=time(NULL)-1;
+    g_batch.phase=BATCH_DONE;g_batch.count=5;g_batch.index=5;g_batch.registered=5;
+    for(int i=0;i<5;i++)snprintf(g_batch.titles[i],10,"CUSA%05d",i);
+    group_tick();
+    assert(g_job.phase==JOB_FAILED && g_job.done==5);
+    assert(strstr(g_job.message,"Previous group changed during pause"));
+    unlink(GROUP_FILE);
+    memset(&g_job,0,sizeof(g_job));memset(&g_batch,0,sizeof(g_batch));
+    puts("PASS: Phase 4M rechecks all prior titles AFTER cooldown before advancing");
+
+
     /* Phase 4I: no batch before USB discovery; interrupted state blocks
      * unattended writes permanently for the current ELF session. */
     assert(AUTO_BOOT_BATCH_LIMIT == 0); /* disabled after real PS5 mount conflict */
@@ -134,6 +215,7 @@ int main(void) {
     g_title_count = 0;
     assert(batch_autoboot_gate() == 0);
     g_title_count = 1;
+    g_batch.phase = BATCH_INTERRUPTED;
     assert(batch_autoboot_gate() == -1); /* crash state blocks */
     g_batch.phase = BATCH_IDLE;
     assert(batch_autoboot_gate() == 1); /* eligible to inspect */

@@ -214,12 +214,12 @@ void web_serve(int listen_fd) {
         reply(fd,"200 OK","application/json; charset=utf-8",b.data,b.len);buf_free(&b);
     } else if (!post && !strncmp(path,"/api/batch-preview?",19)) {
         int limit=batch_limit_param(path);
-        if(limit<0) json_msg(fd,0,"Batch limit must be 3 or 5");
+        if(limit!=5) json_msg(fd,0,"Manual groups require limit=5");
         else {buf_t b={0};app_batch_preview_json(limit,&b);
               reply(fd,"200 OK","application/json; charset=utf-8",b.data,b.len);buf_free(&b);}
     } else if (post && !strncmp(path,"/api/batch-start?",17)) {
         int limit=batch_limit_param(path);char token[33];
-        if(limit<0 || confirmation_header(req,token))json_msg(fd,0,"Invalid batch confirmation");
+        if(limit!=5 || confirmation_header(req,token))json_msg(fd,0,"Invalid manual groups confirmation");
         else {int rc=app_batch_start(limit,token,msg,sizeof(msg));json_msg(fd,!rc,msg);}
     } else if (!strcmp(path, "/") || !strcmp(path, "/index.html")) {
         reply(fd, "200 OK", "text/html; charset=utf-8", index_html, sizeof(index_html));

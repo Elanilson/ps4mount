@@ -1,3 +1,13 @@
+# PS4Mount 0.5.14 — Fila manual de grupos de cinco
+
+**A partir desta versão, o registro acontece somente após confirmação no painel web.** Após iniciar o ELF, aguarde a sincronização USB, abra a página, clique **Iniciar registro em grupos de 5**, revise a fila elegível, confirme backup e inicie. O ELF registra cada CUSA **individualmente**, verifica o `app.db` + montagem própria RO + marcador de acompanhamento para **todos os jogos do grupo**, espera **10 segundos** e só então avança para o grupo seguinte. A página exibe progresso da fila completa e permite voltar sem repetir o POST. **Qualquer falha interrompe tudo**, sem replay automático. **DLCs continuam apenas catalogados**.
+
+**ATENÇÃO:** o log anterior mostrou um lote 0.5.10 `FAILED` no CUSA06886. Se `/data/ps4mount/batch-v1.state` ainda registrar essa falha, **o novo botão ficará bloqueado intencionalmente**. Não exclua o journal para contornar isso. Verifique montagens e metadados no console antes de iniciar uma nova fila. A versão foi validada apenas em testes locais, não foi testada nem compilada para o PS5 neste ambiente.
+
+Veja [MANUAL_GROUPS_5.md](MANUAL_GROUPS_5.md) para os procedimentos, endpoints, riscos e garantias detalhados. Histórico das versões anteriores abaixo.
+
+---
+
 # PS4Mount 0.5.13 — Integração segura de funcionalidades do original 0.4.0
 
 Esta versão é baseada na nossa **0.5.12**, com leitura de DLCs, configurações de busca e prévia de grupos inspiradas na versão original de gasb07. **Não** instala DLCs, **não** executa grupos no sistema e **não** reativa `AppInstallAll`. Abrir/reabrir a página é uma operação de consulta. Para uma descrição exata das melhorias e das partes ainda pendentes, leia [`UPSTREAM_040_MERGE.md`](UPSTREAM_040_MERGE.md).

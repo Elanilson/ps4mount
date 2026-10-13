@@ -4,11 +4,11 @@
 /* Safety-preview design:
  * - Discovery only READS USB PKGs; explicit per-title USB relocation requires
  *   a fresh preview nonce and journal, NEVER automatic registration.
- * - Only explicitly confirmed isolated CUSA06886 registration can write
- *   metadata, after RO probe and release. Batch and auto-boot are blocked.
+ * - Explicitly confirmed manual queue: groups of five, per-CUSA targeted API,
+ *   persisted fail-closed checkpoints, and DB verification between groups.
  * - No bulk API or SQLite fallback.
  * - No direct SQLite fallback.
- * - DLCs (ac) are ignored; existing games and system DB are never bulk-updated.
+ * - DLCs (ac) remain metadata-only; no DLC installation or bulk registration.
  * - Any unconfirmed registration blocks further requests until restart.
  * WARNING: experimental homebrew; test on expendable data, NOT a production PS5. */
 #include <dirent.h>
@@ -41,9 +41,10 @@
 #include "organize.h"
 #include "icon_data.h"
 
-#define VERSION "PS4Mount 0.5.13-phase4l-upstream040-safe"
+#define VERSION "PS4Mount 0.5.14-phase4m-manual-groups5"
 #define ISOLATED_TEST_TID "CUSA06886"
 static int prior_batch_unresolved(void);
+static int batch_authorized_title(const char *tid);
 #define LOCK_PORT 9032
 #define SCAN_SECONDS 10
 #define STATE_DIR "/data/ps4mount"
@@ -1513,8 +1514,8 @@ void app_sync_status_json(buf_t *out) {
     buf_printf(out,"}");
 }
 
-/* Preview of the eligible snapshot, not an executable queue. All endpoints
- * remain read-only; no 125-game registration can be started in Phase 4K. */
+/* Read-only planning endpoint. Separate explicitly-confirmed manual-group flow
+ * is available only through POST /api/batch-start?limit=5. */
 void app_registration_plan_json(buf_t *out) {
     buf_printf(out,"{\"ok\":true,\"phase\":");
     json_str(out,g_sync.active?"scanning":g_sync.complete?"ready":"waiting");
@@ -2306,12 +2307,13 @@ int app_launch_check_json(const char *tid, buf_t *out) {
     return 0;
 }
 
-/* Phase 4F: targeted SINGLE-CUSA registration, never AppInstallAll.
+/* Phase 4F/4M: targeted SINGLE-CUSA registration, never AppInstallAll.
  * Must be invoked after a real read-only mount succeeded AND was released.
  * We deliberately do not attempt to launch from this daemon: on many firmwares
  * sceLncUtilLaunchApp must run inside SceShellUI; use the home-screen tile.
  * Metadata preparation WRITES USB and title-scoped internal files; do this
- * only on a sacrificial/fully backed-up console. No unsafe automatic retry. */
+ * only on a sacrificial/fully backed-up console. Manual group orchestration
+ * is tightly scoped to exactly the current CUSA and register phase. */
 int app_register_preview_json(const char *tid, buf_t *out) {
     title_t *t = catalog_find(tid);
     title_plan_t plan = {0};
@@ -2321,12 +2323,12 @@ int app_register_preview_json(const char *tid, buf_t *out) {
     int verified = tid && !strcmp(g_verified_ro_tid, tid) && g_probe.attempted && !g_probe.active;
     app_install_title_dir_fn single = one_title_install_api();
     int supported = single != NULL;
-    int isolated = tid && !strcmp(tid, ISOLATED_TEST_TID);
-    int ready = isolated && !prior_batch_unresolved() && verified && supported &&
+    int isolated = tid && (!strcmp(tid, ISOLATED_TEST_TID) || batch_authorized_title(tid));
+    int ready = isolated && (batch_authorized_title(tid) || !prior_batch_unresolved()) && verified && supported &&
                 !g_registration_busy && !g_registration_fault && phase4_ready(checks);
     /* A blocked registration preview must NOT invalidate an active release token. */
     if (ready && probe_auth_generate(tid, "register", t)) ready = 0;
-    const char *message = !isolated ? "Phase 4K permits registration ONLY for isolated CUSA06886" :
+    const char *message = !isolated ? "Only isolated CUSA06886 or current authenticated group title may register" :
         prior_batch_unresolved() ? "Previous batch FAILED/INTERRUPTED: inspect its state before any new system writes" :
         g_probe.active ? "Release the read-only mount before registration" :
         !verified ? "Complete an ACTUAL read-only mount and release it in this PS4Mount session first" :
@@ -2351,8 +2353,9 @@ int app_register_one(const char *tid, const char *token, char *msg, size_t cap) 
     char app_path[PATH_MAX], patch_path[PATH_MAX];
     if (!probe_auth_consume(tid, "register", token, &a, &p, app_path, patch_path))
         return plan_error(msg, cap, "Invalid or expired ONE-title registration nonce");
-    if (!tid || strcmp(tid, ISOLATED_TEST_TID) || prior_batch_unresolved())
-        return plan_error(msg, cap, "Only isolated CUSA06886 allowed; old failed batch must be investigated first");
+    if (!tid || (!batch_authorized_title(tid) &&
+                 (strcmp(tid, ISOLATED_TEST_TID) || prior_batch_unresolved())))
+        return plan_error(msg, cap, "Title not authorized by current group; unresolved prior failure must be inspected");
     if (g_probe.active || !g_probe.attempted || strcmp(g_verified_ro_tid, tid) ||
         g_registration_busy || g_registration_fault)
         return plan_error(msg, cap, "RO mount not verified/released or registration already attempted");
@@ -2560,7 +2563,7 @@ int app_organize(const char *tid, const char *nonce, char *msg, size_t cap) {
  * AppInstallAll or replays. Work advances one phase per daemon event-loop turn.
  * Crash recovery is fail-closed: incomplete batches NEVER resume automatically. */
 #define BATCH_MAX 5
-/* No unattended registration: preview-only planning for the whole catalog. */
+/* Unattended registration DISABLED. Only an explicit web POST can start. */
 #define AUTO_BOOT_BATCH_LIMIT 0
 #ifndef BATCH_FILE
 #define BATCH_FILE STATE_DIR "/batch-v1.state"
@@ -2581,17 +2584,105 @@ static int prior_batch_unresolved(void) {
     return g_batch.phase == BATCH_FAILED || g_batch.phase == BATCH_INTERRUPTED ||
            (g_batch.phase >= BATCH_PREPARE && g_batch.phase <= BATCH_VERIFY);
 }
+/* The complete one-click job is snapshotted and persisted separately from the
+ * per-five-group BATCH-1 journal. A restart during any active job is terminal:
+ * NO replay, NO next group and NO automatic repair of internal PS5 metadata. */
+#ifndef GROUP_FILE
+#define GROUP_FILE STATE_DIR "/manual-groups-v1.state"
+#endif
+#define GROUP_SIZE 5
+#define GROUP_PAUSE_SECONDS 10
+typedef enum { JOB_IDLE=0, JOB_RUNNING=1, JOB_WAITING=2, JOB_COMPLETED=3,
+               JOB_FAILED=4, JOB_INTERRUPTED=5 } group_phase_t;
+typedef struct {
+    group_phase_t phase;
+    int total, done, verified, current_group;
+    time_t wait_until;
+    char titles[MAX_TITLES][10];
+    char message[256];
+} group_state_t;
+static group_state_t g_job;
 static int g_auto_boot_attempted;
 static struct {
     char token[33];
-    char titles[BATCH_MAX][10];
+    char titles[MAX_TITLES][10];
     int count;
     time_t issued;
 } g_batch_auth;
 static int batch_running(void) {
     return g_batch.phase >= BATCH_PREPARE && g_batch.phase <= BATCH_VERIFY;
 }
-int app_batch_active(void) { return batch_running(); }
+static int job_active(void) { return g_job.phase==JOB_RUNNING || g_job.phase==JOB_WAITING; }
+int app_batch_active(void) { return batch_running() || job_active(); }
+static int batch_authorized_title(const char *tid) {
+    return tid && job_active() && g_job.phase==JOB_RUNNING && batch_running() &&
+           g_batch.phase==BATCH_REGISTER && g_batch.index<g_batch.count &&
+           !strcmp(tid,g_batch.titles[g_batch.index]) &&
+           g_job.done+g_batch.index<g_job.total &&
+           !strcmp(tid,g_job.titles[g_job.done+g_batch.index]);
+}
+static const char *job_phase_name(group_phase_t p) {
+    switch(p) {
+    case JOB_IDLE:return "idle"; case JOB_RUNNING:return "running";
+    case JOB_WAITING:return "waiting"; case JOB_COMPLETED:return "completed";
+    case JOB_FAILED:return "failed"; case JOB_INTERRUPTED:return "interrupted";
+    } return "invalid";
+}
+static int job_store(void) {
+    char content[4096];
+    int n=snprintf(content,sizeof(content),"PS4MOUNT-GROUPS-1 %d %d %d %d %d %lld\n",
+      g_job.phase,g_job.total,g_job.done,g_job.verified,g_job.current_group,
+      (long long)g_job.wait_until);
+    if(n<0 || n>=(int)sizeof(content))return -1;
+    for(int i=0;i<g_job.total;i++) {
+        int z=snprintf(content+n,sizeof(content)-(size_t)n,"%s\n",g_job.titles[i]);
+        if(z<0 || z>=(int)(sizeof(content)-(size_t)n))return -1;
+        n+=z;
+    }
+    int z=snprintf(content+n,sizeof(content)-(size_t)n,"%s\n",g_job.message);
+    if(z<0 || z>=(int)(sizeof(content)-(size_t)n))return -1;
+    return write_file(GROUP_FILE,content,(size_t)(n+z),0600);
+}
+static void job_restore(void) {
+    memset(&g_job,0,sizeof(g_job));
+    int fd=open(GROUP_FILE,O_RDONLY|O_NOFOLLOW);
+    if(fd<0) {
+        if(errno!=ENOENT) {g_job.phase=JOB_INTERRUPTED;
+            snprintf(g_job.message,sizeof(g_job.message),"Cannot read persistent group state");}
+        return;
+    }
+    char buf[4096]; ssize_t n=read(fd,buf,sizeof(buf)-1);close(fd);
+    if(n<=0 || n>=(ssize_t)sizeof(buf)-1)goto corrupt;
+    buf[n]=0;
+    int phase,total,done,verified,group;
+    long long wait;
+    if(sscanf(buf,"PS4MOUNT-GROUPS-1 %d %d %d %d %d %lld",
+        &phase,&total,&done,&verified,&group,&wait)!=6 ||
+        phase<JOB_IDLE || phase>JOB_INTERRUPTED || total<0 || total>MAX_TITLES ||
+        done<0 || done>total || verified<0 || verified>done ||
+        group<0 || group>=(MAX_TITLES+GROUP_SIZE-1)/GROUP_SIZE || wait<0)goto corrupt;
+    char *p=strchr(buf,'\n');if(!p)goto corrupt;p++;
+    g_job.total=total;g_job.done=done;g_job.verified=verified;
+    g_job.current_group=group;g_job.wait_until=(time_t)wait;
+    for(int i=0;i<total;i++) {
+        char *e=strchr(p,'\n');if(!e || e-p!=9 || strncmp(p,"CUSA",4))goto corrupt;
+        for(int j=4;j<9;j++)if(p[j]<'0'||p[j]>'9')goto corrupt;
+        memcpy(g_job.titles[i],p,9);g_job.titles[i][9]=0;p=e+1;
+    }
+    char *e=strchr(p,'\n');if(!e || e-p>=(int)sizeof(g_job.message))goto corrupt;
+    memcpy(g_job.message,p,(size_t)(e-p));
+    g_job.phase=(group_phase_t)phase;
+    if(job_active()) {
+        g_job.phase=JOB_INTERRUPTED;
+        snprintf(g_job.message,sizeof(g_job.message),"ELF stopped mid-queue. Inspect group, mounts and app.db; NO automatic replay");
+        (void)job_store();
+        printf("[safe][groups] INTERRUPTED: saved running job NOT resumed\n");
+    }
+    return;
+corrupt:
+    memset(&g_job,0,sizeof(g_job));g_job.phase=JOB_INTERRUPTED;
+    snprintf(g_job.message,sizeof(g_job.message),"Corrupt job journal. Inspect before any writes");
+}
 static const char *batch_phase_name(batch_phase_t p) {
     switch (p) {
     case BATCH_IDLE: return "idle";
@@ -2683,84 +2774,126 @@ static int batch_candidate(title_t *t) {
        !supported_usb(t) || installed_internally(t->tid) || org_pending(t->root)) return 0;
     return db_registered_status(t->tid) == 0;
 }
-/* A deterministic, server-reviewed queue. Sort by PKG byte size like v0.5.8;
- * previews and starts use the SAME snapshot, and a new preview revokes old token. */
-int app_batch_preview_json(int limit, buf_t *out) {
+/* Full snapshot is constructed only by explicit GET preview; no mounts or writes.
+ * Sorting is deterministic by total PKG size, with title-ID as tie breaker. */
+static int group_sort(const void *a,const void *b) {
+    const title_t *x=*(const title_t *const *)a,*y=*(const title_t *const *)b;
+    unsigned long long xs=x->size+x->patch_size,ys=y->size+y->patch_size;
+    if(xs<ys)return -1;
+    if(xs>ys)return 1;
+    return strcmp(x->tid,y->tid);
+}
+int app_batch_preview_json(int limit,buf_t *out) {
     memset(&g_batch_auth,0,sizeof(g_batch_auth));
-    int allowed = 0 && (limit==3 || limit==5) && !batch_running() &&
-        g_batch.phase!=BATCH_INTERRUPTED && g_batch.phase!=BATCH_FAILED &&
-        !g_probe.active && !g_probe.attempted && !g_registration_busy &&
-        !g_registration_fault && !g_deleting && !g_queued_tid[0] && one_title_install_api();
-    title_t *chosen[BATCH_MAX] = {0};
+    int allowed=limit==GROUP_SIZE && !job_active() && !batch_running() &&
+       g_job.phase!=JOB_INTERRUPTED && g_job.phase!=JOB_FAILED &&
+       g_batch.phase!=BATCH_INTERRUPTED && g_batch.phase!=BATCH_FAILED &&
+       !g_sync.active && !g_probe.active && !g_probe.attempted &&
+       !g_registration_busy && !g_registration_fault && !g_deleting &&
+       !g_queued_tid[0] && one_title_install_api();
+    title_t *chosen[MAX_TITLES];int count=0,unknown=0;
     if(allowed) {
         for(int i=0;i<g_title_count;i++) {
             title_t *t=&g_titles[i];
-            if(!batch_candidate(t)) continue;
-            int j=0;
-            while(j<limit && chosen[j] &&
-                  (chosen[j]->size+chosen[j]->patch_size < t->size+t->patch_size ||
-                  (chosen[j]->size+chosen[j]->patch_size==t->size+t->patch_size &&
-                   strcmp(chosen[j]->tid,t->tid)<0))) j++;
-            if(j>=limit) continue;
-            for(int k=limit-1;k>j;k--) chosen[k]=chosen[k-1];
-            chosen[j]=t;
+            if(!t->app_path[0] || t->conflict || t->patch_conflict ||
+               t->suspicious_updates || t->unverified_duplicate_updates ||
+               (t->update_count && !t->patch_path[0]) || !supported_usb(t) ||
+               installed_internally(t->tid) || org_pending(t->root)) continue;
+            int db=db_registered_status(t->tid);
+            if(db<0) {unknown=1;break;}
+            if(db==0 && count<MAX_TITLES)chosen[count++]=t;
         }
-        for(int i=0;i<limit && chosen[i];i++) {
-            snprintf(g_batch_auth.titles[i],10,"%s",chosen[i]->tid);
-            g_batch_auth.count++;
+        if(unknown)allowed=0;
+        if(allowed) {
+            qsort(chosen,(size_t)count,sizeof(chosen[0]),group_sort);
+            for(int i=0;i<count;i++)snprintf(g_batch_auth.titles[i],10,"%s",chosen[i]->tid);
+            g_batch_auth.count=count;
+            if(!count || batch_nounce_create(g_batch_auth.token))allowed=0;
+            else g_batch_auth.issued=time(NULL);
         }
-        if(g_batch_auth.count && !batch_nounce_create(g_batch_auth.token))
-            g_batch_auth.issued=time(NULL);
-        else allowed=0;
     }
-    buf_printf(out,"{\"ok\":true,\"can_start\":%s,\"count\":%d,\"limit\":%d,\"games\":[",
-        allowed && g_batch_auth.count ? "true":"false",g_batch_auth.count,limit);
-    for(int i=0;i<g_batch_auth.count;i++) {
-        title_t *t=chosen[i];
-        buf_printf(out,"%s{\"title_id\":",i?",":""); json_str(out,t->tid);
-        buf_printf(out,",\"name\":"); json_str(out,t->name);
+    buf_printf(out,"{\"ok\":true,\"can_start\":%s,\"count\":%d,\"limit\":%d,\"group_size\":%d,\"groups\":%d,\"games\":[",
+        allowed?"true":"false",allowed?count:0,limit,GROUP_SIZE,
+        allowed?(count+GROUP_SIZE-1)/GROUP_SIZE:0);
+    if(allowed)for(int i=0;i<count;i++) {
+        title_t *t=chosen[i];buf_printf(out,"%s{\"title_id\":",i?",":"");json_str(out,t->tid);
+        buf_printf(out,",\"name\":");json_str(out,t->name);
         buf_printf(out,",\"size\":%llu}",t->size+t->patch_size);
     }
-    buf_printf(out,"],\"confirm_token\":"); json_str(out,allowed?g_batch_auth.token:"");
+    buf_printf(out,"],\"confirm_token\":");json_str(out,allowed?g_batch_auth.token:"");
     buf_printf(out,",\"message\":");
-    json_str(out,allowed?(g_batch_auth.count?"Confirm backup before starting backend batch":"No eligible unregistered games"):
-        "Another operation, unresolved batch or registration fault blocks automatic writes");
-    buf_printf(out,"}");
+    json_str(out,allowed?"Preview valid for 120 seconds. One click starts all groups; first uncertain result stops all" :
+        unknown?"app.db unreadable. Refusing a partial queue":
+        prior_batch_unresolved()?"PREVIOUS BATCH FAILED/INTERRUPTED. Inspect mounts, app.db and logs before restarting":
+        g_job.phase==JOB_FAILED||g_job.phase==JOB_INTERRUPTED?"PREVIOUS GROUP JOB FAILED/INTERRUPTED. Inspect before restarting":
+        g_sync.active?"Catalog synchronization is still running. Wait for completion":
+        !one_title_install_api()?"Targeted AppInstallTitleDir API unavailable; no bulk fallback":
+        "Queue unavailable, prior failure or another operation is active, or no pending games");
+    buf_printf(out,"}");return 0;
+}
+static int group_next_count(int total,int done) {
+    int remaining=total-done;
+    return remaining<=0?0:remaining<GROUP_SIZE?remaining:GROUP_SIZE;
+}
+static int job_open_group(char *err,size_t cap) {
+    if(g_job.done>=g_job.total || g_job.phase!=JOB_RUNNING)
+        return plan_error(err,cap,"Invalid group boundary");
+    /* Re-validate before any phase, fail if DB or source changed. */
+    int count=group_next_count(g_job.total,g_job.done);
+    for(int i=0;i<count;i++) {
+        title_t *t=catalog_find(g_job.titles[g_job.done+i]);
+        if(!batch_candidate(t)) {
+            snprintf(err,cap,"%s no longer eligible, registered or app.db unavailable before group; inspect log",
+                     g_job.titles[g_job.done+i]);
+            return -1;
+        }
+    }
+    memset(&g_batch,0,sizeof(g_batch));g_batch.phase=BATCH_PREPARE;g_batch.count=count;
+    for(int i=0;i<count;i++)snprintf(g_batch.titles[i],10,"%s",g_job.titles[g_job.done+i]);
+    snprintf(g_batch.message,sizeof(g_batch.message),"Group %d/%d started, individually verified",g_job.current_group+1,
+        (g_job.total+GROUP_SIZE-1)/GROUP_SIZE);
+    if(batch_store()) {g_batch.phase=BATCH_FAILED;
+        return plan_error(err,cap,"Cannot persist group journal; NO write attempted");}
+    printf("[safe][groups] GROUP %d/%d START titles=%d total=%d completed=%d\n",
+        g_job.current_group+1,(g_job.total+GROUP_SIZE-1)/GROUP_SIZE,count,g_job.total,g_job.done);
+    notify("PS4Mount: grupo %d/%d, jogos %d-%d/%d",
+        g_job.current_group+1,(g_job.total+GROUP_SIZE-1)/GROUP_SIZE,
+        g_job.done+1,g_job.done+count,g_job.total);
     return 0;
 }
 int app_batch_start(int limit,const char *token,char *msg,size_t cap) {
-    (void)limit; (void)token;
-    return plan_error(msg,cap,"Phase 4K: bulk/batch registration intentionally disabled; inspect CUSA06886 first");
-#if 0 /* Keep the reviewed state-machine implementation for a later opt-in build. */
-    int count=g_batch_auth.count;
-    time_t now=time(NULL);
-    int valid=(limit==3 || limit==5) && count>0 && count<=limit &&
+    int count=g_batch_auth.count;time_t now=time(NULL);
+    int valid=limit==GROUP_SIZE && count>0 && count<=MAX_TITLES &&
         g_batch_auth.token[0] && token && strlen(token)==32 &&
         now>=g_batch_auth.issued && now-g_batch_auth.issued<=120;
     unsigned char diff=0;
-    if(valid) for(int i=0;i<32;i++) diff |= (unsigned char)(token[i]^g_batch_auth.token[i]);
-    if(diff) valid=0;
-    char titles[BATCH_MAX][10];
-    memcpy(titles,g_batch_auth.titles,sizeof(titles));
-    memset(&g_batch_auth,0,sizeof(g_batch_auth)); /* consumed even on failure */
-    if(!valid || batch_running() || g_batch.phase==BATCH_INTERRUPTED ||
-       g_batch.phase==BATCH_FAILED || g_probe.active || g_probe.attempted ||
-       g_registration_busy || g_registration_fault || g_deleting || g_queued_tid[0])
-        return plan_error(msg,cap,"Batch preview expired or cannot start; no changes made");
-    for(int i=0;i<count;i++) if(!batch_candidate(catalog_find(titles[i])))
-        return plan_error(msg,cap,"A previewed game changed or is registered; preview again");
-    memset(&g_batch,0,sizeof(g_batch));
-    g_batch.phase=BATCH_PREPARE; g_batch.count=count;
-    memcpy(g_batch.titles,titles,sizeof(titles));
-    snprintf(g_batch.message,sizeof(g_batch.message),"Accepted %d games; controlled by ELF, not browser",count);
-    if(batch_store()) {
-        g_batch.phase=BATCH_FAILED;
-        return plan_error(msg,cap,"Cannot persist queue; refusing any writes");
+    if(valid)for(int i=0;i<32;i++)diff|=(unsigned char)(token[i]^g_batch_auth.token[i]);
+    if(diff)valid=0;
+    char titles[MAX_TITLES][10];memcpy(titles,g_batch_auth.titles,sizeof(titles));
+    memset(&g_batch_auth,0,sizeof(g_batch_auth)); /* one-time even on errors */
+    if(!valid || app_batch_active() || prior_batch_unresolved() ||
+       g_job.phase==JOB_FAILED || g_job.phase==JOB_INTERRUPTED ||
+       g_sync.active || g_probe.active || g_probe.attempted ||
+       g_registration_busy || g_registration_fault || g_deleting || g_queued_tid[0] ||
+       !one_title_install_api())
+        return plan_error(msg,cap,"Queue refused: expired token, unresolved previous failure or changed PS5 state");
+    for(int i=0;i<count;i++)if(!batch_candidate(catalog_find(titles[i])))
+        return plan_error(msg,cap,"Title or app.db changed after preview. Re-preview. NO writes");
+    memset(&g_job,0,sizeof(g_job));g_job.phase=JOB_RUNNING;g_job.total=count;
+    memcpy(g_job.titles,titles,sizeof(titles));
+    snprintf(g_job.message,sizeof(g_job.message),"User confirmed %d pending games; group size 5",count);
+    if(job_store()) {g_job.phase=JOB_FAILED;
+        return plan_error(msg,cap,"Cannot persist complete group snapshot; refusing writes");}
+    if(job_open_group(msg,cap)) {
+        g_job.phase=JOB_FAILED;
+        snprintf(g_job.message,sizeof(g_job.message),"Initial group journal failure, inspect before reattempt");
+        (void)job_store();return -1;
     }
-    printf("[safe][batch] START count=%d first=%s (daemon-owned, no bulk API)\n",count,g_batch.titles[0]);
-    snprintf(msg,cap,"Backend queue accepted (%d games). You may leave/reopen panel, but keep ELF/PS5/USB powered",count);
+    printf("[safe][groups] MANUAL POST ACCEPTED total=%d groups=%d (NO AppInstallAll)\n",count,
+      (count+GROUP_SIZE-1)/GROUP_SIZE);
+    snprintf(msg,cap,"Manual group queue accepted: %d games, %d groups. Keep PS5/ELF/USB active",count,
+      (count+GROUP_SIZE-1)/GROUP_SIZE);
     return 0;
-#endif
 }
 /* Disabled auto-registration on this safe-sync edition. Phase 4I: one-shot daemon auto-boot: NO browser actions and NO repeated
  * registrations. It invokes the SAME reviewed preview/start path as the panel,
@@ -2816,14 +2949,28 @@ static void batch_autoboot_once(void) {
 #endif
 }
 void app_batch_status_json(buf_t *out) {
-    buf_printf(out,"{\"ok\":true,\"phase\":"); json_str(out,batch_phase_name(g_batch.phase));
-    buf_printf(out,",\"running\":%s,\"autoboot\":%s,\"autoboot_limit\":%d,\"autoboot_attempted\":%s,\"count\":%d,\"processed\":%d,\"registered\":%d,\"current\":",
-      batch_running()?"true":"false",AUTO_BOOT_BATCH_LIMIT>0?"true":"false",AUTO_BOOT_BATCH_LIMIT,
-      g_auto_boot_attempted?"true":"false",g_batch.count,g_batch.index,g_batch.registered);
-    json_str(out,(g_batch.index<g_batch.count)?g_batch.titles[g_batch.index]:"");
+    int running=job_active();
+    int current=g_job.phase==JOB_RUNNING && g_job.done+g_batch.index<g_job.total?g_job.done+g_batch.index:-1;
+    buf_printf(out,"{\"ok\":true,\"phase\":");json_str(out,job_phase_name(g_job.phase));
+    buf_printf(out,",\"group_phase\":");json_str(out,batch_phase_name(g_batch.phase));
+    buf_printf(out,",\"previous_batch_unresolved\":%s,\"legacy_batch_phase\":",
+      prior_batch_unresolved()?"true":"false");
+    json_str(out,batch_phase_name(g_batch.phase));
+    buf_printf(out,",\"legacy_batch_message\":");json_str(out,g_batch.message);
+    buf_printf(out,",\"running\":%s,\"autoboot\":false,\"autoboot_limit\":0,\"autoboot_attempted\":false",
+        running?"true":"false");
+    buf_printf(out,",\"count\":%d,\"processed\":%d,\"registered\":%d,\"current\":",
+        g_job.total,g_job.done+(g_job.phase==JOB_RUNNING?g_batch.index:0),
+        g_job.verified+(g_job.phase==JOB_RUNNING?g_batch.registered:0));
+    json_str(out,current>=0?g_job.titles[current]:"");
+    buf_printf(out,",\"group_size\":%d,\"group_index\":%d,\"group_total\":%d,\"group_processed\":%d,\"group_count\":%d,\"wait_seconds\":%lld",
+       GROUP_SIZE,g_job.current_group+1,(g_job.total+GROUP_SIZE-1)/GROUP_SIZE,
+       g_job.phase==JOB_WAITING?0:g_batch.index,
+       g_job.phase==JOB_WAITING?group_next_count(g_job.total,g_job.done):g_batch.count,
+       (long long)(g_job.phase==JOB_WAITING && g_job.wait_until>time(NULL)?g_job.wait_until-time(NULL):0));
     buf_printf(out,",\"titles\":[");
-    for(int i=0;i<g_batch.count;i++){if(i) buf_printf(out,",");json_str(out,g_batch.titles[i]);}
-    buf_printf(out,"],\"message\":"); json_str(out,g_batch.message);
+    for(int i=0;i<g_job.total;i++){if(i)buf_printf(out,",");json_str(out,g_job.titles[i]);}
+    buf_printf(out,"],\"message\":");json_str(out,g_job.message);
     buf_printf(out,"}");
 }
 /* Only internally-produced previews are parsed, never user-provided JSON.
@@ -2855,6 +3002,16 @@ static void batch_fail(const char *error) {
     g_batch.phase=BATCH_FAILED;
     snprintf(g_batch.message,sizeof(g_batch.message),"%s; DO NOT auto-retry, inspect log/recovery",error);
     (void)batch_store();
+    if(job_active()) {
+        g_job.phase=JOB_FAILED;
+        snprintf(g_job.message,sizeof(g_job.message),
+           "Group %d FAILED at game %d/%d (%s): %.150s",g_job.current_group+1,
+           g_job.done+g_batch.index+1,g_job.total,
+           g_batch.index<g_batch.count?g_batch.titles[g_batch.index]:"unknown",error);
+        (void)job_store();
+        notify("PS4Mount: ERRO grupo %d, jogo %d/%d. Veja log",g_job.current_group+1,
+               g_job.done+g_batch.index+1,g_job.total);
+    }
     printf("[safe][batch] FAILED at %d/%d %s: %s\n",g_batch.index+1,g_batch.count,
            g_batch.index<g_batch.count?g_batch.titles[g_batch.index]:"none",g_batch.message);
 }
@@ -2875,17 +3032,7 @@ static void batch_tick(void) {
     int db=db_registered_status(tid);
     if(db<0) {batch_fail("Cannot read app.db for next title");return;}
     if(db==1 && g_batch.phase!=BATCH_VERIFY) {
-        /* A different process registered this title mid-queue. Never overwrite;
-         * never skip a mounted/partially processed title without inspection. */
-        if(g_batch.phase!=BATCH_PREPARE) {
-            batch_fail("Title became registered mid-operation; inspect mount and app.db");
-            return;
-        }
-        snprintf(g_batch.message,sizeof(g_batch.message),"%s already registered: skipped",tid);
-        printf("[safe][batch] %s SKIP already registered\n",tid);
-        g_batch.index++;
-        g_batch.phase=g_batch.index==g_batch.count?BATCH_DONE:BATCH_PREPARE;
-        if(batch_store()) batch_fail("Cannot persist skipped title");
+        batch_fail("Game registered before its own verification step. Stop entire queue; inspect external writes");
         return;
     }
     if(g_batch.phase==BATCH_PREPARE) {
@@ -2939,7 +3086,8 @@ static void batch_tick(void) {
             err=1;snprintf(detail,sizeof(detail),"Registration verification failed; stop batch");
         } else {
             printf("[safe][batch] %s VERIFIED %d/%d\n",tid,g_batch.index+1,g_batch.count);
-            notify("PS4Mount: registro %d/%d concluido (%s)",g_batch.index+1,g_batch.count,tid);
+            notify("PS4Mount: registro %d/%d concluido (grupo %d, %s)",
+                   g_job.done+g_batch.index+1,g_job.total,g_job.current_group+1,tid);
             g_batch.registered++;g_batch.index++;
             g_batch.phase=g_batch.index==g_batch.count?BATCH_DONE:BATCH_PREPARE;
         }
@@ -2952,6 +3100,88 @@ static void batch_tick(void) {
     if(batch_store()) batch_fail("Cannot persist updated progress; no further operations");
     else printf("[safe][batch] PROGRESS %d/%d registered=%d next_phase=%s\n",
        g_batch.index,g_batch.count,g_batch.registered,batch_phase_name(g_batch.phase));
+}
+
+/* Group barriers: ALL five (or final remainder) must still be present in
+ * read-only app.db, have a tracking marker and an owned RO nullfs layer.
+ * No AppInstallAll, no SQL writes, no skipping a failed group. */
+static const char *group_barrier_bad_title(void) {
+    for(int i=0;i<g_batch.count;i++) {
+        const char *tid=g_batch.titles[i];
+        managed_t *m=managed_by(tid,NULL);
+        char marker[64],target[64];
+        snprintf(marker,sizeof(marker),STATE_DIR "/%s.src",tid);
+        snprintf(target,sizeof(target),"/user/app/%s",tid);
+        if(db_registered_status(tid)!=1 || !m || m->rw || m->running ||
+           !exists(marker) || top_layer(target,m->dir)!=1) return tid;
+    }
+    return NULL;
+}
+static void group_tick(void) {
+    if(!job_active() || batch_running())return;
+    if(g_job.phase==JOB_WAITING) {
+        if(time(NULL)<g_job.wait_until)return;
+        if(g_registration_fault || g_probe.active || g_deleting) {
+            g_job.phase=JOB_FAILED;
+            snprintf(g_job.message,sizeof(g_job.message),"PS5 state changed during inter-group pause");
+            (void)job_store();return;
+        }
+        /* Re-check the whole LAST group AFTER the cooldown as well, before
+         * authorizing a single phase of the next group. */
+        const char *bad=group_barrier_bad_title();
+        if(bad) {
+            g_job.phase=JOB_FAILED;
+            snprintf(g_job.message,sizeof(g_job.message),
+               "Previous group changed during pause (%s). STOP, inspect app.db/mount",bad);
+            printf("[safe][groups] POST-PAUSE BARRIER FAILED: %s\n",g_job.message);
+            (void)job_store();notify("PS4Mount: verificacao apos pausa falhou; veja log");
+            return;
+        }
+        g_job.phase=JOB_RUNNING;
+        snprintf(g_job.message,sizeof(g_job.message),"Opening next group after verified pause");
+        if(job_store() || job_open_group(g_job.message,sizeof(g_job.message))) {
+            g_job.phase=JOB_FAILED;
+            printf("[safe][groups] FAILED preparing group %d: %s\n",g_job.current_group+1,g_job.message);
+            (void)job_store();notify("PS4Mount: group preparation failed; inspect log");
+        }
+        return;
+    }
+    if(g_batch.phase!=BATCH_DONE || g_batch.count<=0 ||
+       g_batch.index!=g_batch.count || g_batch.registered!=g_batch.count) {
+        g_job.phase=JOB_FAILED;
+        snprintf(g_job.message,sizeof(g_job.message),"Group not completely verified; stopped");
+        (void)job_store();return;
+    }
+    const char *bad=group_barrier_bad_title();
+    if(bad) {
+        g_job.phase=JOB_FAILED;
+        snprintf(g_job.message,sizeof(g_job.message),
+            "Group %d DB/mount/marker barrier FAILED on %s; no next group",g_job.current_group+1,bad);
+        (void)job_store();
+        printf("[safe][groups] BARRIER FAILED: %s\n",g_job.message);
+        notify("PS4Mount: ERRO conferindo grupo %d; veja log",g_job.current_group+1);
+        return;
+    }
+    g_job.done+=g_batch.count;g_job.verified+=g_batch.registered;
+    printf("[safe][groups] VERIFIED %d/%d group=%d (all app.db + RO mounts + markers)\n",
+      g_job.done,g_job.total,g_job.current_group+1);
+    notify("PS4Mount: grupo %d confirmado (%d/%d jogos)",
+       g_job.current_group+1,g_job.done,g_job.total);
+    if(g_job.done==g_job.total) {
+        g_job.phase=JOB_COMPLETED;
+        snprintf(g_job.message,sizeof(g_job.message),"ALL %d verified individually and at each group barrier",g_job.total);
+        if(job_store()) {g_job.phase=JOB_FAILED;
+            snprintf(g_job.message,sizeof(g_job.message),"Final group state persistence failed; inspect manually");}
+        else notify("PS4Mount: registro finalizado %d/%d",g_job.total,g_job.total);
+    } else {
+        g_job.current_group++;
+        g_job.phase=JOB_WAITING;
+        g_job.wait_until=time(NULL)+GROUP_PAUSE_SECONDS;
+        snprintf(g_job.message,sizeof(g_job.message),"Group %d verified. Waiting %d seconds before next group",
+            g_job.current_group,GROUP_PAUSE_SECONDS);
+        if(job_store()) {g_job.phase=JOB_FAILED;
+            snprintf(g_job.message,sizeof(g_job.message),"Cannot persist group barrier; no next group");}
+    }
 }
 
 int app_recovery_json(int usb, buf_t *out) {
@@ -3215,14 +3445,15 @@ int main(void) {
     /* SAFE PREVIEW: shortcut installation invokes AppInstallAll and writes
      * to PS5 DB even during discovery; never install it automatically. */
     batch_restore();
+    job_restore();
     safe_config_load();
     printf("\n======= " VERSION " session start =======\n");
-    printf("[safe] Phase 4L: upstream 0.4.0 read-only DLC/catalog/settings merged; individual CUSA06886 test only; bulk/groups/DLC install DISABLED; panel :8770\n");
+    printf("[safe] Phase 4M: MANUAL groups of 5, targeted per-CUSA only, DB barriers, 10s cooldown, fail-closed; DLC INSTALL and AppInstallAll DISABLED\n");
     g_web = web_listen();
     notify(g_web >= 0 ? VERSION " lendo jogos (somente leitura); painel :8770" : VERSION " lendo jogos (somente leitura); painel indisponivel");
     unlink(STATE_DIR "/stop");
     for (;;) {
-        if ((g_stop || exists(STATE_DIR "/stop")) && !batch_running()) {
+        if ((g_stop || exists(STATE_DIR "/stop")) && !app_batch_active()) {
             unlink(STATE_DIR "/stop");
             if (g_probe.active) {
                 char why[256];
@@ -3244,7 +3475,7 @@ int main(void) {
                 set_rw(m, 0);
             }
         }
-        if (time(NULL) >= g_next_scan && !g_deleting && !g_registration_busy && !batch_running() && !g_sync.active) {
+        if (time(NULL) >= g_next_scan && !g_deleting && !g_registration_busy && !app_batch_active() && !g_sync.active) {
             scan_all();
             g_next_scan = time(NULL) + SCAN_SECONDS;
         }
@@ -3252,7 +3483,8 @@ int main(void) {
         batch_autoboot_once();
         if (g_sync.active) sync_tick();
         if (batch_running()) batch_tick();
+        group_tick();
         process_queue();
-        pump_events(batch_running() ? 400 : 1000);
+        pump_events(app_batch_active() ? 400 : 1000);
     }
 }

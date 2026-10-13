@@ -14,6 +14,10 @@ assert '"/api/sync-status"' in w and 'app_sync_status_json(&b)' in w
 assert 'Sincronizar (somente leitura)' in ui
 assert "api('/api/sync-status')" in ui
 assert "api('/api/rescan', 'POST')" in ui
-assert 'batchpreview" hidden' in ui
+assert 'id="batchpreview" class="primary"' in ui
+assert 'id="groupprogress"' in ui
+assert 'id="grouplive"' in ui
+assert 'function batchRefresh()' in ui
+assert "api('/api/batch-start?limit='" in ui
 assert not any(x in m for x in ('sceAppInstUtilAppInstallAll(', 'AppInstallAll(NULL)', 'AppInstallAll(0)'))
 print('PASS: read-only incremental sync and safe web refresh, no auto-registration')
