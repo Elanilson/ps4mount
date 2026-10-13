@@ -9,6 +9,3 @@
 
 /* Read only: the system databases are written by the system alone. */
 int db_is_registered(const char *title_id);
-
-/* True only after a successful, recent read-only app.db query. */
-int db_snapshot_healthy(void);

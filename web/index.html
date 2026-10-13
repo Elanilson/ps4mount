@@ -45,7 +45,7 @@ form.settings .row{display:flex;gap:8px;justify-content:flex-end}
 #progress-wrap{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px 16px;margin-bottom:18px}
 #progress-wrap progress{display:block;width:100%;height:15px;accent-color:var(--accent);margin-top:6px}
 #progress-detail{color:var(--muted);font-size:13px;margin-top:3px}
-.b-inactive{background:#555}
+.b-inactive{background:#555}.b-blocked{background:#5c2c28}
 #toast{position:fixed;right:20px;bottom:20px;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px 16px;display:none;max-width:420px}
 </style>
 </head>
@@ -67,7 +67,7 @@ form.settings .row{display:flex;gap:8px;justify-content:flex-end}
   </section>
   <div class="summary" id="summary"></div>
   <div class="grid" id="grid"></div>
-  <div class="empty" id="empty" hidden>Nenhum jogo organizado encontrado. Clique em Buscar jogos para localizar PKGs nas subpastas.</div>
+  <div class="empty" id="empty" hidden>Nenhum jogo encontrado em um HD conectado. Clique em Buscar jogos no USB para localizar PKGs nas subpastas.</div>
 </main>
 <dialog id="setdlg"><h3>Configurações</h3>
 <form class="settings" id="setform">
@@ -87,7 +87,7 @@ form.settings .row{display:flex;gap:8px;justify-content:flex-end}
 <div id="toast"></div>
 <script>
 var games = [], busy = {};
-var labels = {ready: 'Montado', running: 'Em execução', removed: 'Removido anteriormente', internal: 'Instalado internamente', pending: 'Montagem pendente', duplicate: 'Outro HD', inactive: 'Não montado pelo PS4Mount'};
+var labels = {ready: 'Montado', running: 'Em execução', removed: 'Removido anteriormente', internal: 'Instalado internamente', pending: 'Montagem pendente', duplicate: 'Outro HD', blocked: 'Conflito de montagem', inactive: 'Não montado pelo PS4Mount'};
 
 function $(id) { return document.getElementById(id); }
 function esc(s) { return String(s).replace(/[&<>"']/g, function (c) { return '&#' + c.charCodeAt(0) + ';'; }); }
@@ -109,6 +109,7 @@ function render() {
     var act = '';
     if (['removed', 'inactive', 'pending'].indexOf(g.state) >= 0) act = '<button class="primary" data-a="mount" data-t="' + g.title_id + '">Montar</button>';
     else if (g.state === 'ready') act = '<button class="danger" data-a="unmount" data-t="' + g.title_id + '">Desmontar</button>';
+    else if (g.state === 'blocked') act = '<button disabled>Conflito: verifique o log</button>';
     else if (g.state === 'running') act = '<button disabled>Feche o jogo para desmontar</button>';
     if (busy[g.title_id]) act = '<button disabled>Processando…</button>';
     html += '<div class="card"><div class="art" style="background-image:url(/icon/' + g.title_id + ')">' +

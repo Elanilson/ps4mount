@@ -1,74 +1,16 @@
-# PS4Mount 0.4.4 — montagem manual e progresso da busca USB (experimental)
-
-> Fork de teste baseado na **0.4.1 do gasb07**, mantendo a busca recursiva da nossa
-> versão anterior. **Não é uma versão oficial do autor.** O ELF não foi executado no
-> PS5 neste ambiente. A compilação com o SDK real ocorre no GitHub Actions.
-
-## Como usar
-
-1. Compile no GitHub Actions (`git push` ou *Run workflow*); instale o payload como de costume.
-2. Inicie o ELF e abra **`http://IP_DO_PS5:8770`**. Não ocorre busca ou registro automático
-   de jogos novos. O atalho existente na aba Mídia pode continuar funcionando; o ELF
-   **não o reinstala automaticamente** para não chamar `AppInstallAll`.
-3. O ELF tenta **restaurar apenas montagens de jogos anteriormente registrados/ativos**
-   (marcador `.src` válido e não `.disabled`). O painel mostra barra de progresso;
-   há notificação no começo e no fim, se houver jogos a restaurar.
-4. Clique em **Buscar jogos no USB** para procurar PKGs em pastas e subpastas.
-   Enquanto a busca acontece, o painel mostra pastas percorridas, PKGs examinados,
-   arquivos organizados e a pasta atual, com barra animada (total ainda desconhecido).
-   **ATENÇÃO: esta descoberta organiza/move os PKGs no mesmo HD externo**, seguindo
-   o comportamento original: `ps4/<CUSA>/app.pkg`, `patch.pkg` e add-ons.
-   Buscar não registra nem monta jogos novos.
-5. Clique em **Montar** no cartão do jogo selecionado. Jogos já registrados
-   serão remontados mesmo se seus antigos marcadores estiverem ausentes ou
-   desatualizados; nesse caso, os arquivos auxiliares podem ser reconstruídos a
-   partir dos PKGs presentes no USB. Se ainda não estiver registrado, tenta o
-   registro individual `AppInstallTitleDir` **quando disponível**. Não há fallback global.
-6. **Desmontar** libera as montagens de app/patch identificadas como nossas,
-   interrompe sua recuperação nas próximas inicializações e **não desinstala** o
-   registro do PS5. As montagens de DLC compartilhadas não são forçadas a sair.
-   **Encerrar ELF** encerra o daemon (na recuperação, após concluir o título atual).
-
-## DLCs: limite importante
-
-Ao montar um título, o fluxo original pode preparar os arquivos auxiliares para sua
-atualização e DLCs encontradas. Quando existem várias DLCs, seu **preparo** ocorre
-em grupos configuráveis (padrão de 5), com cada grupo registrado no log. **Isso
-não garante que os registros das DLCs sejam efetivamente concluídos no banco do
-PS5 pela API individual do jogo.** Os PKGs continuam no HD externo. Não confunda
-"DLC preparada" com "DLC instalada"; precisamos confirmar esse comportamento
-com um teste real no PS5. O sistema possui limites de dispositivos de montagem.
-
-## Segurança e persistência
-
-- `/data/ps4mount/CUSAxxxxx.src`: marcador da origem do PKG. Na montagem manual
-  de um título já registrado, ele pode ser atualizado a partir do PKG escolhido,
-  sem exigir um marcador antigo válido. A recuperação automática ainda exige
-  uma fonte persistida e validação antes de montar.
-- `.active`: jogo incluído na recuperação automática; `.disabled`: exclusão
-  explícita dessa recuperação, sem desinstalar; `.attempt`: tentativa de registro
-  em andamento/interrompida. **Não apague `.attempt` sem analisar o log e o estado
-  do PS5**, pois isso pode permitir repetir uma operação parcialmente executada.
-- Recuperação nunca roda busca recursiva, reorganização ou registro automático;
-  falhas individuais ficam no log. Montagens desconhecidas não são desmontadas à
-  força. O banco `app.db` é somente consultado pela aplicação (o sistema faz o
-  registro). Jogar continua dependendo do ambiente de homebrew carregado.
-- **Use backup restaurável**. O projeto modifica metadados internos ao registrar
-  jogos. Não foi validado no console nesta compilação, especialmente com 150 jogos
-  e muitas DLCs. Comece com um jogo e avalie o log antes de ampliar.
-
-## Testes
-
-Execute `bash test/run.sh` em Linux com `xxd`, compilador C e Python 3 instalados.
-O script inclui os 125 testes originais, o teste recursivo e verificações estáticas
-adicionais do contrato manual. Sintaxe C/JavaScript também foi verificada no host.
-**Esses testes não substituem a compilação com SDK PS5 nem testes no console.**
-
----
-
-## Documentação original do PS4Mount
+> **ATENÇÃO: esta pasta é uma base experimental de melhorias manuais (v7-source), derivada do projeto original.** A interface foi recuperada do ELF v6 enviado pelo usuário. Consulte [MELHORIAS-V7.md](MELHORIAS-V7.md) para saber o que foi alterado, os riscos e os testes necessários. O texto abaixo descreve o comportamento **do projeto original**, que pode diferir deste fork. Não foi gerado ELF de PS5 neste ambiente.
 
 # PS4Mount
+
+> [!CAUTION]
+> **PS4Mount is a work in progress. Use it at your own risk.**
+>
+> On some consoles and firmwares it can still make the system report that its **database is
+> corrupted**. When that happens the console rebuilds its database on the next start, games added by
+> PS4Mount can disappear from the library until PS4Mount runs again, and you may have to restart the
+> console to get out of repeated error prompts. A forced restart can lose data that was not saved yet.
+> **Back up your save data** (PS Plus cloud storage or a USB drive) before using PS4Mount, and
+> [report any problem](#reporting-problems) with the log.
 
 Play PS4 fake PKGs on a jailbroken PS5 straight from a USB drive, without installing them.
 
@@ -91,8 +33,8 @@ The web panel, opened from the **Media** tab:
 
 ## Features
 
-- Detects PS4 fake PKGs (game, update and add-ons) in the root **and subfolders** of any connected USB drive, or in other
-  folders chosen in the settings. The scan includes nested folders automatically (up to 16 levels).
+- Detects PS4 fake PKGs (game, update and add-ons) in the root of any connected USB drive, or in other
+  folders chosen in the settings.
 - Adds the games to the home screen with their icon, name and update version.
 - Applies updates: put the update `.pkg` next to the game and it is picked up automatically.
 - Installs add-ons (DLC), with data or unlock-only. An add-on is matched to its game by title ID, or by
@@ -108,7 +50,11 @@ The web panel, opened from the **Media** tab:
 ## Requirements
 
 - A jailbroken PS5 with fake PKG support (for example etaHEN with kstuff).
-  Tested on firmware **13.20**. Other firmware versions are untested.
+  Any firmware with fake PKG support. From 6.00 the games are registered the usual way (reported
+  working on 6.50, tested on 13.20). Below 6.00 that made the console report a corrupted database
+  (5.50), so there PS4Mount registers each game on its own (confirmed working on 5.50), and does not
+  add games if the firmware lacks that function. The startup notification and the log say which one
+  is used.
 - An ELF loader listening on port **9021** to send the payload.
 - Access to the kernel log: either **klogsrv** running on port 3232, or no other payload reading
   `/dev/klog`. PS4Mount reads the system log to know when a game starts and when a delete is
@@ -121,7 +67,7 @@ The web panel, opened from the **Media** tab:
 Download `ps4mount.elf` from the [Releases](https://github.com/gasb07/ps4mount/releases) page
 (or [build it](#building)).
 
-1. Copy the PS4 game `.pkg` (and its update and add-on `.pkg` files, if you have them) to the **root or any subfolder**
+1. Copy the PS4 game `.pkg` (and its update and add-on `.pkg` files, if you have them) to the **root**
    of the USB drive. The file names do not matter.
 2. Plug the drive into the PS5.
 3. Send `ps4mount.elf` to the ELF loader (port 9021). Do this after every console boot, or add it to
@@ -145,7 +91,7 @@ A game is reported as ready only after its add-ons are installed too. An add-on 
 same drive stays where it is and waits: it is moved and installed as soon as its game is on the drive.
 The scan notification says how many add-ons are waiting.
 
-Keep this layout. To add more games later, copy their `.pkg` files anywhere in the drive folders. PS4Mount finds them recursively and moves them to its managed `ps4/<TITLE_ID>/` layout.
+Keep this layout. To add more games later, copy their `.pkg` files to the root of the drive again.
 
 ### Web panel
 
@@ -164,6 +110,8 @@ the same network. The panel shows every game found on the connected drives, with
 Buttons:
 
 - **Remove from library**: removes the game from the home screen. The `.pkg` stays on the drive.
+- **Move pkgs back**: removes the game from the library and moves its `.pkg` files back to where they
+  came from (see [Moving pkgs back](#moving-pkgs-back)).
 - **Add to library**: adds a removed game back.
 - **Scan for games**: checks the drives now and shows how many games were found on each one.
 - **Settings**: see below.
@@ -176,10 +124,12 @@ Buttons:
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
-| Folders to search for pkgs | `/` | Folders, relative to each drive, searched **recursively** for new `.pkg` files (one per line). `/` searches the entire drive. Existing `ps4/CUSAxxxxx/` game folders are skipped by package discovery because the original loader handles them separately. |
+| Folders to search for pkgs | `/` | Folders, relative to each drive, where new `.pkg` files are picked up (one per line). `/` is the root. The `ps4` folder cannot be used: it holds the games already moved. |
 | Add new games in groups | On | Adds many new games in groups instead of one after the other, which keeps the console stable when a drive has a lot of games. |
 | Games per group | 5 | Size of each group (1 to 50). |
 | Install add-ons (DLC) | On | Moves and installs add-on `.pkg` files. When off, add-ons are left where they are. |
+
+The settings also have **Move all games back** and **Pick up moved-back pkgs again** (see below).
 
 Settings are saved in `/data/ps4mount/config.txt`.
 
@@ -193,6 +143,25 @@ drive. A removed game comes back
 when you reconnect the drive or click **Add to library**.
 
 To delete the game for good, delete its `/ps4/CUSAxxxxx` folder from the drive on a computer.
+
+### Moving pkgs back
+
+PS4Mount records where every `.pkg` came from in `ps4/CUSAxxxxx/origin.txt` on the drive: the folder
+(any of the scan folders) and the original file name. **Move pkgs back** on a game, or **Move all games
+back** in the settings, undoes the move:
+
+- The game leaves the library (several games are handled in groups, like when adding).
+- The game, its update, older updates kept aside and its add-ons go back to their original folder with
+  their original name. A folder that no longer exists is created again, and an existing file is never
+  replaced: ` (1)` is added to the name.
+- `.pkg` files moved by versions before 0.5.0 have no record and go to the drive root as
+  `CUSAxxxxx - <game> - game.pkg`, `... - update.pkg` and `... - <add-on label>.pkg`.
+- The files PS4Mount created for the game are removed. Folders are only removed when empty, and no
+  `.pkg` is ever deleted.
+
+The `.pkg` files moved back stay where they are on the next scans (they are listed in
+`/data/ps4mount/restored.txt`). To add them again, use **Pick up moved-back pkgs again** in the
+settings. A `.pkg` you move, rename or replace yourself is picked up as usual.
 
 ## Good to know
 
@@ -208,7 +177,10 @@ To delete the game for good, delete its `/ps4/CUSAxxxxx` folder from the drive o
   of the game pkg (for example 01.00). The game runs with the update; the web panel shows its version.
 - Games already installed the normal way on the console are never touched, and their add-ons on the
   drive are not installed.
-- Rest mode powers the drive off. The games stay in the library and work again after waking up.
+- **Close PS4Mount games before putting the console in rest mode.** Rest mode powers the drive off, and a
+  game left open cannot read its files from the drive after waking up: it locks up, and closing it can
+  hang on the "Closing" screen, which needs a console restart. Games that were not open stay in the
+  library and work normally after waking up.
 - **Games with more than about 29 add-ons:** while a game runs, the console mounts each of its packages (the game,
   the update and every add-on) with two virtual devices: a PS4 package holds an outer filesystem with the
   real content as a second filesystem inside it. The console has 64 of these devices, so a running game
@@ -221,20 +193,20 @@ To delete the game for good, delete its `/ps4/CUSAxxxxx` folder from the drive o
 
 ## Reporting problems
 
-If something does not work, open an issue at
-[github.com/gasb07/ps4mount/issues](https://github.com/gasb07/ps4mount/issues) with:
+If something does not work, open an issue with the
+[bug report form](https://github.com/gasb07/ps4mount/issues/new?template=bug_report.yml). It asks for
+what is needed to find the cause:
 
 1. **PS4Mount version**: shown at the top of the web panel and in the startup notification.
-2. **PS5 firmware** and the **jailbreak / HEN** you use, with its version (for example etaHEN 2.x
-   with kstuff).
-3. **The game**: name and title ID (`CUSAxxxxx`), and whether it has an update (the version shown
-   in the panel).
-4. **What happened**: what you did, what you expected, and the exact message or error code shown on
+2. **PS5 firmware**, the **jailbreak / HEN** and every **payload** you load, with their versions.
+3. Whether **klogsrv** is running.
+4. **The game**: name and title ID (`CUSAxxxxx`), and whether it has an update and add-ons.
+5. **Your drives**: how many are connected, how they are formatted (exFAT) and whether a drive has
+   more than one partition.
+6. **What happened**: what you did, what you expected, and the exact message or error code shown on
    the console.
-5. **The log**: open the web panel, click **Log** and copy the text, or download
+7. **The log**: open the web panel, click **Log** and copy the text, or download
    `/data/ps4mount/log.txt` over FTP. Include the part from the moment the problem happened.
-6. **Your setup**: whether klogsrv is running, how the drive is formatted (exFAT) and other payloads
-   you load at the same time.
 
 Do not attach `.pkg` files or links to them.
 
@@ -334,15 +306,3 @@ LibOrbisPkg under the LGPL-3.0. SQLite is in the public domain.
 
 This project is not affiliated with or endorsed by Sony Interactive Entertainment. Only use it with
 games you own.
-
-### Folder scan adaptation (custom fork)
-
-This fork is based on upstream **PS4Mount 0.4.1**. Its only functional change is
-recursive `.pkg` discovery: for example `Games/Title/app.pkg`,
-`Games/Title/Updates/patch.pkg`, and `Games/Title/DLCs/*.pkg` can be
-found without being in the USB root. As in upstream, recognized packages
-**are moved on the same USB drive** to `ps4/<TITLE_ID>/` (or the matching add-on
-folder); this is not a read-only scan. It does not copy game PKGs to PS5 internal
-storage. Group registration, DLC install, automatic scans and web UI remain
-upstream behavior. Directory symlinks and other filesystem devices are not
-followed, and managed title folders are skipped during discovery.
