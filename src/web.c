@@ -150,6 +150,11 @@ void web_serve(int listen_fd) {
         app_games_json(&b);
         reply(fd, "200 OK", "application/json; charset=utf-8", b.data, b.len);
         buf_free(&b);
+    } else if (!strcmp(path, "/api/progress") && !post) {
+        buf_t b = {0};
+        app_progress_json(&b);
+        reply(fd, "200 OK", "application/json; charset=utf-8", b.data, b.len);
+        buf_free(&b);
     } else if (!strncmp(path, "/icon/", 6)) {
         buf_t b = {0};
         snprintf(tid, sizeof(tid), "%.9s", path + 6);
@@ -173,8 +178,8 @@ void web_serve(int listen_fd) {
             json_msg(fd, !rc, msg);
         }
     } else if (post && !strcmp(path, "/api/rescan")) {
-        app_rescan();
-        json_msg(fd, 1, "Scanning USB drives for games");
+        int rc = app_rescan();
+        json_msg(fd, !rc, rc ? "Busy: wait until current job finishes" : "Search queued; only manual discovery, no registration");
     } else if (!strcmp(path, "/api/config") && !post) {
         buf_t b = {0};
         app_config_json(&b);

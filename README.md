@@ -1,3 +1,68 @@
+# PS4Mount 0.4.2 — ativação manual e recuperação automática (experimental)
+
+> Fork de teste baseado na **0.4.1 do gasb07**, mantendo a busca recursiva da nossa
+> versão anterior. **Não é uma versão oficial do autor.** O ELF não foi executado no
+> PS5 neste ambiente. A compilação com o SDK real ocorre no GitHub Actions.
+
+## Como usar
+
+1. Compile no GitHub Actions (`git push` ou *Run workflow*); instale o payload como de costume.
+2. Inicie o ELF e abra **`http://IP_DO_PS5:8770`**. Não ocorre busca ou registro automático
+   de jogos novos. O atalho existente na aba Mídia pode continuar funcionando; o ELF
+   **não o reinstala automaticamente** para não chamar `AppInstallAll`.
+3. O ELF tenta **restaurar apenas montagens de jogos anteriormente registrados/ativos**
+   (marcador `.src` válido e não `.disabled`). O painel mostra barra de progresso;
+   há notificação no começo e no fim, se houver jogos a restaurar.
+4. Clique em **Buscar jogos no USB** para procurar PKGs em pastas e subpastas.
+   **ATENÇÃO: esta descoberta organiza/move os PKGs no mesmo HD externo**, seguindo
+   o comportamento original: `ps4/<CUSA>/app.pkg`, `patch.pkg` e add-ons.
+   Buscar não registra nem monta jogos novos.
+5. Clique em **Ativar jogo** em um cartão para registrar **somente aquele CUSA**.
+   Confirme o aviso; o painel exibe estado, contagem e eventuais falhas. Se já estiver
+   corretamente registrado, apenas remonta; caso contrário, usa a API individual
+   `AppInstallTitleDir` **quando disponível**. Não há fallback global.
+6. **Desativar jogo** libera as montagens de app/patch identificadas como nossas,
+   interrompe sua recuperação nas próximas inicializações e **não desinstala** o
+   registro do PS5. As montagens de DLC compartilhadas não são forçadas a sair.
+   **Encerrar ELF** encerra o daemon (na recuperação, após concluir o título atual).
+
+## DLCs: limite importante
+
+Ao ativar um título, o fluxo original prepara os arquivos auxiliares para sua
+atualização e DLCs encontradas. Quando existem várias DLCs, seu **preparo** ocorre
+em grupos configuráveis (padrão de 5), com cada grupo registrado no log. **Isso
+não garante que os registros das DLCs sejam efetivamente concluídos no banco do
+PS5 pela API individual do jogo.** Os PKGs continuam no HD externo. Não confunda
+"DLC preparada" com "DLC instalada"; precisamos confirmar esse comportamento
+com um teste real no PS5. O sistema possui limites de dispositivos de montagem.
+
+## Segurança e persistência
+
+- `/data/ps4mount/CUSAxxxxx.src`: marcador de origem já registrado; criado pelo
+  original, reutilizado somente após validação com `app.db`, arquivos e metadados.
+- `.active`: jogo incluído na recuperação automática; `.disabled`: exclusão
+  explícita dessa recuperação, sem desinstalar; `.attempt`: tentativa de registro
+  em andamento/interrompida. **Não apague `.attempt` sem analisar o log e o estado
+  do PS5**, pois isso pode permitir repetir uma operação parcialmente executada.
+- Recuperação nunca roda busca recursiva, reorganização ou registro automático;
+  falhas individuais ficam no log. Montagens desconhecidas não são desmontadas à
+  força. O banco `app.db` é somente consultado pela aplicação (o sistema faz o
+  registro). Jogar continua dependendo do ambiente de homebrew carregado.
+- **Use backup restaurável**. O projeto modifica metadados internos ao registrar
+  jogos. Não foi validado no console nesta compilação, especialmente com 150 jogos
+  e muitas DLCs. Comece com um jogo e avalie o log antes de ampliar.
+
+## Testes
+
+Execute `bash test/run.sh` em Linux com `xxd`, compilador C e Python 3 instalados.
+O script inclui os 125 testes originais, o teste recursivo e verificações estáticas
+adicionais do contrato manual. Sintaxe C/JavaScript também foi verificada no host.
+**Esses testes não substituem a compilação com SDK PS5 nem testes no console.**
+
+---
+
+## Documentação original do PS4Mount
+
 # PS4Mount
 
 Play PS4 fake PKGs on a jailbroken PS5 straight from a USB drive, without installing them.

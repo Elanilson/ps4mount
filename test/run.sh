@@ -13,3 +13,5 @@ build/test/unit
 
 ${CC:-cc} -O1 -g -Wall -Wextra -Werror -D_DEFAULT_SOURCE -Isrc -o build/test/scan_walk test/scan_walk.c src/scan_walk.c
 build/test/scan_walk
+
+python3 test/manual_contract.py
