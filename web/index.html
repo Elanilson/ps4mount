@@ -87,7 +87,7 @@ form.settings .row{display:flex;gap:8px;justify-content:flex-end}
 <div id="toast"></div>
 <script>
 var games = [], busy = {};
-var labels = {ready: 'Ativo', running: 'Em execução', removed: 'Removido anteriormente', internal: 'Instalado internamente', pending: 'Montagem pendente', duplicate: 'Outro HD', inactive: 'Desativado'};
+var labels = {ready: 'Montado', running: 'Em execução', removed: 'Removido anteriormente', internal: 'Instalado internamente', pending: 'Montagem pendente', duplicate: 'Outro HD', inactive: 'Não montado pelo PS4Mount'};
 
 function $(id) { return document.getElementById(id); }
 function esc(s) { return String(s).replace(/[&<>"']/g, function (c) { return '&#' + c.charCodeAt(0) + ';'; }); }
@@ -107,9 +107,9 @@ function render() {
     if (q && (g.name + ' ' + g.title_id).toLowerCase().indexOf(q) < 0) return;
     shown++;
     var act = '';
-    if (['removed', 'inactive', 'pending'].indexOf(g.state) >= 0) act = '<button class="primary" data-a="mount" data-t="' + g.title_id + '">Ativar jogo</button>';
-    else if (g.state === 'ready') act = '<button class="danger" data-a="unmount" data-t="' + g.title_id + '">Desativar jogo</button>';
-    else if (g.state === 'running') act = '<button disabled>Feche o jogo para desativar</button>';
+    if (['removed', 'inactive', 'pending'].indexOf(g.state) >= 0) act = '<button class="primary" data-a="mount" data-t="' + g.title_id + '">Montar</button>';
+    else if (g.state === 'ready') act = '<button class="danger" data-a="unmount" data-t="' + g.title_id + '">Desmontar</button>';
+    else if (g.state === 'running') act = '<button disabled>Feche o jogo para desmontar</button>';
     if (busy[g.title_id]) act = '<button disabled>Processando…</button>';
     html += '<div class="card"><div class="art" style="background-image:url(/icon/' + g.title_id + ')">' +
       '<span class="badge b-' + g.state + '">' + esc(labels[g.state] || g.state) + '</span></div>' +
@@ -136,8 +136,8 @@ $('grid').addEventListener('click', function (e) {
   var b = e.target.closest('button[data-a]');
   if (!b) return;
   var tid = b.getAttribute('data-t'), a = b.getAttribute('data-a');
-  if (a === 'unmount' && !confirm('Desativar ' + tid + '? O jogo continua registrado; apenas a recuperação automática será desativada.')) return;
-  if (a === 'mount' && !confirm('Ativar apenas ' + tid + '? Pode gravar metadados internos do PS5.')) return;
+  if (a === 'unmount' && !confirm('Desmontar ' + tid + '? O registro no PS5 será mantido; a restauração automática deste jogo será desativada.')) return;
+  if (a === 'mount' && !confirm('Montar ' + tid + '? Se necessário, o PS4Mount registrará o jogo ou reparará seus próprios metadados.')) return;
   busy[tid] = 1; render();
   api('/api/' + a + '?title_id=' + tid, 'POST').then(function (j) { toast(j.message); })
     .catch(function (err) { toast('Erro: ' + err.message); })

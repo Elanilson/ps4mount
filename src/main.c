@@ -41,7 +41,7 @@
 #include "web.h"
 #include "icon_data.h"
 
-#define VERSION "PS4Mount 0.4.2-manual-restore"
+#define VERSION "PS4Mount 0.4.3-mount-repair"
 #define LOCK_PORT 9032
 #define SCAN_SECONDS 10 /* legacy value; polling for PKGs is disabled */
 #define STATE_DIR "/data/ps4mount"
@@ -911,6 +911,24 @@ static int marker_matches(const char *tid, const char *expected) {
     return n > 0 && !strcmp(buf, expected);
 }
 
+/* Repair must never claim a foreign registration. A prior .src marker must
+ * explicitly name this SAME organized folder, even if its patch/DLC digest
+ * changed. Absent or different markers are not proof of PS4Mount ownership. */
+static int marker_owned_folder(const title_src_t *t) {
+    char path[64], line[PATH_MAX + 1];
+    snprintf(path, sizeof(path), STATE_DIR "/%s.src", t->app.title_id);
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    ssize_t n = read(fd, line, sizeof(line) - 1);
+    close(fd);
+    if (n <= 0) return 0;
+    line[n] = 0;
+    char *nl = strchr(line, '\n');
+    if (!nl) return 0;
+    *nl = 0;
+    return !strcmp(line, t->dir);
+}
+
 /* 1 = needs (re)registration, 0 = registered here, -1 = skip. */
 /* The title is served from another connected drive: the marker names another
  * folder whose game pkg is still there. The first drive keeps it, so the same game
@@ -1664,8 +1682,8 @@ void app_games_json(buf_t *out) {
         if (installed_internally(tid)) state = "internal";
         else if (removed(tid)) state = "removed";
         else if (m && m->running) state = "running";
-        else if (!active_status(tid)) state = "inactive";
         else if (mounted && db_is_registered(tid)) state = "ready";
+        else if (!active_status(tid)) state = "inactive";
         else state = "pending";
         buf_printf(out, "%s{\"title_id\":\"%s\",\"name\":", i ? "," : "", tid);
         json_str(out, t->name);
@@ -1726,7 +1744,7 @@ int app_add(const char *tid, char *msg, size_t cap) {
     }
     snprintf(g_activate_request, sizeof(g_activate_request), "%s", tid);
     progress_set("queued", "Preparing selected game");
-    snprintf(msg, cap, "Activation queued for %s (game + update + associated DLC metadata)", tid);
+    snprintf(msg, cap, "Mount queued for %s (game + update + associated DLC metadata)", tid);
     return 0;
 }
 
@@ -1791,7 +1809,7 @@ int app_remove(const char *tid, char *msg, size_t cap) {
     if (m) m->used = 0;
     printf("[manual] %s disabled; registration retained, DLC mounts not forced\n", tid);
     g_catalog_dirty = 1;
-    snprintf(msg, cap, "%s disabled (registration retained, automatic restore off)", tid);
+    snprintf(msg, cap, "%s unmounted (registration retained, automatic restore off)", tid);
     return 0;
 }
 
@@ -1848,9 +1866,27 @@ static int restore_one(const char *tid) {
     return rc;
 }
 
+/* A disconnected USB must not trigger any per-title validation or a wall of failures.
+ * This preflight only checks actual mounted external devices, never scans PKGs. */
+static int any_external_usb(void) {
+    char root[32];
+    for (int i = 0; i < 10; i++) {
+        if (i < 8) snprintf(root, sizeof(root), "/mnt/usb%d", i);
+        else snprintf(root, sizeof(root), "/mnt/ext%d", i - 8);
+        if (is_mountpoint(root)) return 1;
+    }
+    return 0;
+}
+
 /* Enumerate only persisted registrations, not PKGs in arbitrary subfolders.
  * Must be run by main AFTER the web socket exists, so the panel can show progress. */
 static int restore_active_games(void) {
+    if (!any_external_usb()) {
+        g_progress = (progress_t){"complete", 0, 0, 0, 0, "", "Connect an external USB drive, then restart PS4Mount"};
+        printf("[restore] SKIPPED: no mounted external USB; no title checks, no registration\n");
+        notify("PS4Mount: external USB not connected. No restoration attempted");
+        return -1; /* distinguish no USB from an empty saved library */
+    }
     char tids[MAX_TITLES][10];
     int n = 0;
     DIR *d = opendir(STATE_DIR);
@@ -1925,6 +1961,94 @@ static void discover_usb(void) {
     notify("PS4Mount: USB scan complete. %d PKG(s) organized; select a game to activate", moved);
 }
 
+/* Opt-in repair when the user explicitly clicks Mount on a previously
+ * PS4Mount-managed title. Never reinstall, uninstall or modify app.db.
+ * Use the SAME pkg folder recorded by the prior marker, reject foreign layers,
+ * and refresh only derived metadata/links from those verified source PKGs. */
+static int repair_owned_registration(title_src_t *t) {
+    const char *tid = t->app.title_id;
+    if (!db_snapshot_healthy() || !db_is_registered(tid)) {
+        printf("[manual][repair] %s: database absent or uncertain; repair not attempted\n", tid);
+        return -1;
+    }
+    if (!marker_owned_folder(t) || installed_internally(tid) ||
+        removed(tid) || served_elsewhere(t)) {
+        printf("[manual][repair] %s: registration ownership not proven; foreign data untouched\n", tid);
+        return -1;
+    }
+    if (target_mounts_safe(t)) {
+        printf("[manual][repair] %s: foreign/unreadable layer; repair not attempted\n", tid);
+        return -1;
+    }
+    /* A previous failed first install must not be reinterpreted as a safe
+     * metadata-only repair, even if the DB gained a partial row meanwhile. */
+    char attempt_guard[64];
+    snprintf(attempt_guard, sizeof(attempt_guard), STATE_DIR "/%s.attempt", tid);
+    if (exists(attempt_guard)) {
+        printf("[manual][repair] %s: interrupted registration marker present; no repair\n", tid);
+        return -1;
+    }
+    /* No-patch titles must not have a foreign patch mount hidden from the
+     * normal preflight: place_files may otherwise remove an old patch hold. */
+    if (!t->has_patch) {
+        char patch_target[64];
+        snprintf(patch_target, sizeof(patch_target), "/user/patch/%s", tid);
+        if (dead_layer(patch_target) || layers_on(patch_target)) {
+            printf("[manual][repair] %s: existing patch layer, no safe no-patch repair\n", tid);
+            return -1;
+        }
+    }
+    /* If a prior app.json is present, its base package digest must still match.
+     * Same CUSA and path are not enough if app.pkg was replaced in-place. */
+    char json_path[PATH_MAX];
+    snprintf(json_path, sizeof(json_path), HOLD_DIR "/app/%s/app.json", tid);
+    if (exists(json_path)) {
+        size_t json_len = 0;
+        uint8_t *old = read_all(json_path, &json_len);
+        char digest_key[96];
+        snprintf(digest_key, sizeof(digest_key), "\"packageDigest\":\"");
+        size_t pos = strlen(digest_key);
+        for (int i = 0; i < 32; i++) snprintf(digest_key + pos + 2 * i, 3, "%02X", t->app.digest[i]);
+        int matches = 0;
+        /* read_all does not NUL-terminate: use a bounded needle search. */
+        if (old) {
+            size_t len = strlen(digest_key);
+            for (size_t i = 0; i + len <= json_len; i++)
+                if (!memcmp(old + i, digest_key, len)) { matches = 1; break; }
+        }
+        free(old);
+        if (!matches) {
+            printf("[manual][repair] %s: stored base package digest mismatch/unreadable; no overwrite\n", tid);
+            return -1;
+        }
+    }
+    /* A failed/interrupted metadata write needs diagnosis, not blind retry. */
+    char guard[64];
+    snprintf(guard, sizeof(guard), STATE_DIR "/%s.repair", tid);
+    if (exists(guard)) {
+        printf("[manual][repair] %s: previous repair incomplete; refusing repeated writes\n", tid);
+        return -1;
+    }
+    if (write_file(guard, tid, strlen(tid), 0666)) {
+        printf("[manual][repair] %s: cannot persist repair guard; nothing changed\n", tid);
+        return -1;
+    }
+    printf("[manual][repair] %s: known PS4Mount registration; refreshing package metadata only\n", tid);
+    progress_set("activating", "Repairing metadata of the selected registered game");
+    int rc = place_files(t);
+    if (!rc) rc = mount_title(t);
+    if (!rc) rc = register_finish(t); /* Writes .src and verifies DB, not an installer. */
+    if (!rc) rc = save_active(tid);
+    if (!rc) {
+        unlink(guard);
+        manage(t);
+        printf("[manual][repair] %s: SUCCESS - existing registration kept, no DB re-registration\n", tid);
+        return 0;
+    }
+    printf("[manual][repair] %s: FAILED - repair guard retained; check log\n", tid);
+    return -1;
+}
+
 static void activate_queued(void) {
     if (!g_activate_request[0]) return;
     char tid[10], root[32];
@@ -1983,8 +2107,11 @@ static void activate_queued(void) {
                 }
             }
         }
+    } else if (state == 1 && db_ok && db_is_registered(tid)) {
+        printf("[manual][activate] %s: inconsistent existing record; examining ownership for targeted repair\n", tid);
+        rc = repair_owned_registration(&t);
     } else {
-        printf("[manual][activate] %s existing or foreign registration is inconsistent; refusing repair\n", tid);
+        printf("[manual][activate] %s: inconsistent or foreign registration; no unsafe overwrite\n", tid);
     }
     if (!rc)
         printf("[manual][activate] %s activated: game+update mounted; %d DLC source(s) staged (not independently DB-verified)\n",
@@ -1994,15 +2121,15 @@ static void activate_queued(void) {
     g_progress.ok = 1;
     g_progress.done = 1;
     g_catalog_dirty = 1;
-    progress_set("complete", "Game activated; DLC database installation not independently verified");
-    notify("PS4Mount: %s activated (DLC registration requires verification)", tid);
+    progress_set("complete", "Game mounted; DLC database installation not independently verified");
+    notify("PS4Mount: %s mounted (DLC registration requires verification)", tid);
     return;
 failed:
     g_progress.failed = 1;
     g_progress.done = 1;
-    progress_set("error", "Activation failed or title state uncertain. Inspect log; do not retry blindly");
+    progress_set("error", "Mount failed or title state uncertain. Inspect log before trying again");
     printf("[manual][activate] %s FAILED; no automatic retry\n", tid);
-    notify("PS4Mount: %s activation FAILED. Check the log", tid);
+    notify("PS4Mount: %s mount FAILED. Check the log", tid);
 }
 
 void app_progress_json(buf_t *out) {

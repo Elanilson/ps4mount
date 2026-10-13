@@ -27,3 +27,30 @@
 - **Sem compilação real com o SDK do PS5 e sem execução física no PS5.**
 - Fazer backup e testar ativação de **um jogo por vez**. Consultar
   `/data/ps4mount/log.txt` diante de qualquer estado incerto.
+
+## v0.4.3 — somente três ajustes solicitados
+
+1. **Montar/Desmontar no painel:** botões renomeados; painel dá prioridade ao
+   estado real de montagem ao exibir “Montado”, mesmo que haja um marcador de
+   desativação anterior. “Não montado pelo PS4Mount” não afirma que o jogo é
+   impossível de executar por outro mecanismo. Desmontar mantém o registro.
+2. **Pré-verificação USB:** sem um USB/ext realmente montado, a recuperação é
+   omitida imediatamente, sem validar individualmente os 46/150 títulos e sem
+   notificações de falha em massa. O usuário deve conectar o USB e executar o
+   ELF novamente.
+3. **Reparo direcionado ao clicar em Montar:** se o jogo já está em `app.db`,
+   está inconsistente e tem marcador `.src` do próprio PS4Mount apontando para
+   **exatamente a mesma pasta**, tenta reconstruir arquivos auxiliares e
+   montagens só daquele CUSA. Não desinstala/reinstala o jogo, não escreve no
+   `app.db`, não libera camadas desconhecidas. Um arquivo `.repair` impede
+   repetição cega caso uma tentativa seja interrompida. Se a origem do
+   registro não estiver comprovada, continua falhando em vez de sobrescrever
+   arquivos de outros aplicativos.
+
+**Risco:** regravar metadados internos de um título ainda pode apresentar
+problemas no PS5. Teste primeiro em um CUSA, com backup restaurável. Testes no
+host não substituem validação em console físico.
+
+Verificações extras no reparo: não prossegue se existir guarda `.attempt` de
+registro interrompido, se o digest base anterior divergir do pacote atual,
+ou se houver montagem de patch desconhecida em título sem atualização.
