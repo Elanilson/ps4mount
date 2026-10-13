@@ -100,6 +100,23 @@ int main(void) {
     assert(strstr(g_batch.message,"No automatic replay"));
     unlink(BATCH_FILE);
     puts("PASS: Phase 4H restores unfinished work as INTERRUPTED without any automatic replay");
+    /* Phase 4I: no batch before USB discovery; interrupted state blocks
+     * unattended writes permanently for the current ELF session. */
+    assert(AUTO_BOOT_BATCH_LIMIT == 5);
+    g_auto_boot_attempted = 0;
+    g_title_count = 0;
+    assert(batch_autoboot_gate() == 0);
+    g_title_count = 1;
+    assert(batch_autoboot_gate() == -1); /* crash state blocks */
+    g_batch.phase = BATCH_IDLE;
+    assert(batch_autoboot_gate() == 1); /* eligible to inspect */
+    g_auto_boot_attempted = 1;
+    assert(batch_autoboot_gate() == 0); /* one-shot */
+    g_auto_boot_attempted = 0;
+    g_managed[0].used = 1;
+    g_managed[0].running = 1;
+    assert(batch_autoboot_gate() == -2); /* active game */
+    puts("PASS: Phase 4I auto-boot waits for USB, blocks crash state, never retries");
     assert(rmdir(target) == 0);
     assert(rmdir(root) == 0);
     puts("PASS: foreign mounts left untouched and unreadable running-state blocks mutations");

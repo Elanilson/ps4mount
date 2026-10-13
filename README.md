@@ -1,3 +1,29 @@
+## 0.5.10 Phase 4I — auto-boot (ate 5 jogos)
+
+**Esta distribuicao e a variante com auto-boot ATIVO.** Assim que o ELF for
+executado e terminar a primeira varredura de um USB com jogos, ele inicia
+**automaticamente UM lote de ate CINCO jogos elegiveis**. Nao e necessario abrir
+o navegador, conferir uma previa ou clicar em Iniciar. A pagina /api/batch-status
+mostra o andamento em modo somente leitura. **Somente um lote automatico por
+execucao do ELF**, sem encadear os 147 jogos.
+
+Requisitos antes de executar: backup verificavel do banco de dados do PS5 e dos
+PKGs em outro dispositivo, nenhum jogo em execucao, USB estavel, e aceitacao
+consciente de que a API individual escreve metadados internos. **Nao execute
+esta variante para apenas navegar ou examinar arquivos**: iniciar o ELF e
+autorizar implicitamente um lote com escritas. Para desativar em um build
+personalizado, mude `#define AUTO_BOOT_BATCH_LIMIT 5` para `0` em `src/main.c`.
+
+Criterios: apenas CUSAs nao registrados e sem conflitos; por CUSA, preserva as
+mesmas fases da 0.5.9 (organizacao, re-scan, preflight, montagem RO, liberacao,
+registro individual, verificacao). Nenhum AppInstallAll, fallback SQLite,
+registro de DLCs ou retomada automatica apos falha/interrupcao.
+Ao fim de ate cinco, PARA; para outro lote sera necessario iniciar o ELF
+novamente em nova sessao, depois de conferir que os jogos aparecem/abrem.
+Se houve falha/interrupcao na sessao anterior, bloqueia auto-boot ate a
+inspecao e recuperacao manual. Se iniciar sem USB, espera catalogacao, mas
+nao executa duas vezes na mesma sessao.
+
 # PS4Mount 0.5.9 — Fila automatica no ELF (Phase 4H)
 
 **Base:** PS4Mount 0.5.8, mantendo o mesmo `app_plan_json` / `app_organize` / `app_probe_mount` / `app_probe_release` / `app_register_one`, com registro INDIVIDUAL por `sceAppInstUtilAppInstallTitleDir`. Nenhuma API global foi reativada.

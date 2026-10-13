@@ -49,7 +49,7 @@ pre{white-space:pre-wrap;font-size:12px;max-height:60vh;overflow:auto;background
   <h1>PS4Mount <small id="ver"></small></h1>
   <div class="bar">
     <input id="q" type="search" placeholder="Search game or CUSA">
-    <button id="batchpreview" class="primary">Automatizar jogos (ELF)</button>
+    <button id="batchpreview" class="primary">Consultar lote automatico (ELF)</button>
     <button id="rescan" class="primary">Scan for games</button>
     <button id="recoverbtn">USB recovery</button>
     <button id="logbtn">Log</button>
@@ -173,7 +173,7 @@ function render() {
   });
   $('grid').innerHTML = html;
   $('empty').hidden = games.length > 0;
-  var s = '<span>PHASE 4H · daemon-managed batch (3 or 5) · per-CUSA registration only</span><span>' + games.length + ' game(s)</span>';
+  var s = '<span>PHASE 4I · auto-boot: ate 5 jogos por ELF · apenas registro individual</span><span>' + games.length + ' game(s)</span>';
   for (var k in counts) s += '<span>' + esc(labels[k] || k) + ': ' + counts[k] + '</span>';
   $('summary').innerHTML = s;
 }
@@ -354,7 +354,8 @@ function batchLog(line) {
 }
 function batchDisplay(s) {
   batchBusy = !!s.running;
-  var result = 'Estado: ' + s.phase + '\nRegistrados neste lote: ' + s.registered +
+  var result = (s.autoboot ? 'Modo: AUTO-BOOT, ate ' + s.autoboot_limit + ' jogos por execucao do ELF\n' : '') +
+    'Estado: ' + s.phase + '\nRegistrados neste lote: ' + s.registered +
     ' / ' + s.count + '\nProcessados: ' + s.processed + ' / ' + s.count +
     '\nCUSA atual: ' + (s.current || '-') + '\n' + (s.message || '');
   $('batchstatus').textContent = result;
@@ -362,7 +363,7 @@ function batchDisplay(s) {
   $('batchbackup').disabled = batchBusy;
   $('batchlimit').disabled = batchBusy;
   $('batchpreview').disabled = false;
-  // Closing the browser/dialog does NOT stop an active ELF queue.
+  // Closing the browser/dialog does NOT stop an active ELF queue. Auto-boot is daemon-only.
   $('batchclose').disabled = false;
 }
 function batchRefresh() {

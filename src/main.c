@@ -4,8 +4,10 @@
 /* Safety-preview design:
  * - Discovery only READS USB PKGs; explicit per-title USB relocation requires
  *   a fresh preview nonce and journal, NEVER automatic registration.
- * - Only explicitly confirmed per-CUSA registration and daemon-owned bounded batches
- *   can write metadata. No background auto-start, bulk API or SQLite fallback.
+ * - Only targeted per-CUSA registration and daemon-owned bounded batches
+ *   can write metadata. This opt-in auto-boot build starts ONE batch of up
+ *   to five at first USB discovery; never auto-chains a second batch.
+ * - No bulk API or SQLite fallback.
  * - No direct SQLite fallback.
  * - DLCs (ac) are ignored; existing games and system DB are never bulk-updated.
  * - Any unconfirmed registration blocks further requests until restart.
@@ -39,7 +41,7 @@
 #include "organize.h"
 #include "icon_data.h"
 
-#define VERSION "PS4Mount 0.5.9-phase4h-daemon-batch"
+#define VERSION "PS4Mount 0.5.10-phase4i-autoboot5"
 #define LOCK_PORT 9032
 #define SCAN_SECONDS 10
 #define STATE_DIR "/data/ps4mount"
@@ -2148,6 +2150,10 @@ int app_organize(const char *tid, const char *nonce, char *msg, size_t cap) {
  * AppInstallAll or replays. Work advances one phase per daemon event-loop turn.
  * Crash recovery is fail-closed: incomplete batches NEVER resume automatically. */
 #define BATCH_MAX 5
+/* This distribution is the explicitly opted-in auto-boot edition.
+ * ONE batch per ELF process, at most 5 titles. No endless background batches.
+ * Set to 0 before building if auto-registration is NOT wanted. */
+#define AUTO_BOOT_BATCH_LIMIT 5
 #ifndef BATCH_FILE
 #define BATCH_FILE STATE_DIR "/batch-v1.state"
 #endif
@@ -2163,6 +2169,7 @@ typedef struct {
     char message[256];
 } batch_state_t;
 static batch_state_t g_batch;
+static int g_auto_boot_attempted;
 static struct {
     char token[33];
     char titles[BATCH_MAX][10];
@@ -2307,6 +2314,7 @@ int app_batch_preview_json(int limit, buf_t *out) {
     json_str(out,allowed?(g_batch_auth.count?"Confirm backup before starting backend batch":"No eligible unregistered games"):
         "Another operation, unresolved batch or registration fault blocks automatic writes");
     buf_printf(out,"}");
+    return 0;
 }
 int app_batch_start(int limit,const char *token,char *msg,size_t cap) {
     int count=g_batch_auth.count;
@@ -2338,10 +2346,64 @@ int app_batch_start(int limit,const char *token,char *msg,size_t cap) {
     snprintf(msg,cap,"Backend queue accepted (%d games). You may leave/reopen panel, but keep ELF/PS5/USB powered",count);
     return 0;
 }
+/* Phase 4I: one-shot daemon auto-boot: NO browser actions and NO repeated
+ * registrations. It invokes the SAME reviewed preview/start path as the panel,
+ * with a per-CUSA non-replayable token and a durable fail-closed batch state.
+ * The limit is hard-coded to FIVE for this opt-in build. It never auto-chains. */
+/* Pure preflight gate: 0=wait/attempted, -1=unresolved state,
+ * -2=another game running or writable, 1=may inspect eligible titles. */
+static int batch_autoboot_gate(void) {
+    if (g_auto_boot_attempted || g_title_count <= 0) return 0;
+    if (batch_running() || g_batch.phase == BATCH_FAILED ||
+        g_batch.phase == BATCH_INTERRUPTED || g_probe.active || g_probe.attempted ||
+        g_registration_busy || g_registration_fault || g_deleting || g_queued_tid[0])
+        return -1;
+    for (int i = 0; i < MAX_TITLES; i++)
+        if (g_managed[i].used && (g_managed[i].running || g_managed[i].rw))
+            return -2;
+    return 1;
+}
+static void batch_autoboot_once(void) {
+#if AUTO_BOOT_BATCH_LIMIT > 0
+    int gate = batch_autoboot_gate();
+    if (gate == 0) return; /* await USB scan; or already attempted */
+    g_auto_boot_attempted = 1; /* never repeat in this ELF session */
+    if (gate < 0) {
+        printf("[safe][autoboot] BLOCKED: %s; no writes\n",
+               gate == -2 ? "game running/writable" : "unresolved state/registration or mount");
+        return;
+    }
+    if (!one_title_install_api()) {
+        printf("[safe][autoboot] BLOCKED: no targeted registration API; no writes\n");
+        return;
+    }
+    /* Internally obtain a short-lived queue token; no HTTP/JS or direct DB path. */
+    buf_t preview = {0};
+    app_batch_preview_json(AUTO_BOOT_BATCH_LIMIT, &preview);
+    buf_free(&preview);
+    if (!g_batch_auth.issued || g_batch_auth.count <= 0 ||
+        !g_batch_auth.token[0]) {
+        printf("[safe][autoboot] NO ELIGIBLE TITLES or blocked; idle, no writes\n");
+        return;
+    }
+    char token[33], msg[256];
+    snprintf(token, sizeof(token), "%s", g_batch_auth.token);
+    const int count = g_batch_auth.count;
+    if (app_batch_start(AUTO_BOOT_BATCH_LIMIT, token, msg, sizeof(msg))) {
+        printf("[safe][autoboot] REFUSED: %s (no retry)\n", msg);
+        return;
+    }
+    printf("[safe][autoboot] AUTO START accepted count=%d max=%d, once per ELF session\n",
+           count, AUTO_BOOT_BATCH_LIMIT);
+#else
+    (void)g_auto_boot_attempted;
+#endif
+}
 void app_batch_status_json(buf_t *out) {
     buf_printf(out,"{\"ok\":true,\"phase\":"); json_str(out,batch_phase_name(g_batch.phase));
-    buf_printf(out,",\"running\":%s,\"count\":%d,\"processed\":%d,\"registered\":%d,\"current\":",
-      batch_running()?"true":"false",g_batch.count,g_batch.index,g_batch.registered);
+    buf_printf(out,",\"running\":%s,\"autoboot\":%s,\"autoboot_limit\":%d,\"autoboot_attempted\":%s,\"count\":%d,\"processed\":%d,\"registered\":%d,\"current\":",
+      batch_running()?"true":"false",AUTO_BOOT_BATCH_LIMIT>0?"true":"false",AUTO_BOOT_BATCH_LIMIT,
+      g_auto_boot_attempted?"true":"false",g_batch.count,g_batch.index,g_batch.registered);
     json_str(out,(g_batch.index<g_batch.count)?g_batch.titles[g_batch.index]:"");
     buf_printf(out,",\"titles\":[");
     for(int i=0;i<g_batch.count;i++){if(i) buf_printf(out,",");json_str(out,g_batch.titles[i]);}
@@ -2737,9 +2799,9 @@ int main(void) {
      * to PS5 DB even during discovery; never install it automatically. */
     batch_restore();
     printf("\n======= " VERSION " session start =======\n");
-    printf("[safe] shortcut install DISABLED; bulk registration DISABLED; targeted one-title test opt-in; open http://<PS5 IP>:8770\n");
+    printf("[safe] shortcut install DISABLED; bulk registration DISABLED; auto-boot opt-in max %d titles/ELF; open http://<PS5 IP>:8770\n", AUTO_BOOT_BATCH_LIMIT);
     g_web = web_listen();
-    notify(g_web >= 0 ? VERSION " running. ONE-title mount + optional targeted registration; NO bulk fallback; panel :8770" : VERSION " panel unavailable");
+    notify(g_web >= 0 ? VERSION " running. AUTO BOOT 5 max, targeted only; panel :8770" : VERSION " AUTO BOOT 5 max; panel unavailable");
     unlink(STATE_DIR "/stop");
     for (;;) {
         if ((g_stop || exists(STATE_DIR "/stop")) && !batch_running()) {
@@ -2768,6 +2830,7 @@ int main(void) {
             scan_all();
             g_next_scan = time(NULL) + SCAN_SECONDS;
         }
+        batch_autoboot_once(); /* Waits for first indexed USB; one batch per process. */
         if (batch_running()) batch_tick();
         process_queue();
         pump_events(batch_running() ? 400 : 1000);
