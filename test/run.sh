@@ -20,3 +20,11 @@ python3 test/manual_contract.py
 if command -v node >/dev/null 2>&1; then
     node test/panel_ui.cjs
 fi
+
+# Read-only addcont.db schema probing (synthetic host database).
+${CC:-cc} -O0 -D_DEFAULT_SOURCE -DSQLITE_THREADSAFE=0 \
+  '-DADDCONT_DB="build/test/addcont-fixture.db"' \
+  -Isrc -Ithird_party/sqlite -o build/test/dlc_registry \
+  test/dlc_registry.c src/db.c third_party/sqlite/sqlite3.c -lm -ldl -lpthread
+build/test/dlc_registry
+python3 test/dlc_bundle_contract.py

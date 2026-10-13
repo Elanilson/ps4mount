@@ -1,3 +1,18 @@
+## Mudanças na 0.4.7 (bundle de DLCs)
+
+- **Montar** trata jogo base, atualização disponível e todas as pastas externas de DLC como um conjunto. Em caso de falha, desmonta somente as novas camadas criadas pela tentativa atual.
+- **Desmontar**, no painel, libera as camadas de DLC sob controle do PS4Mount, depois atualização e base, mantendo os registros dos jogos e arquivos do USB. Se outro jogo ainda estiver usando uma mesma camada de DLC, ela é preservada para esse outro jogo.
+- Desmontagem encontra IDs dos DLCs pelas pastas e pelo cache de jogos ativos, **sem abrir ou ler todos os PKGs**.
+- O limite de identificação de pastas distintas de DLC foi ampliado de 8 para 64.
+- A preparação de DLCs apresenta andamento por DLC no próprio card.
+- Na montagem, o log inclui `[manual][dlc-db]`: total de DLCs, IDs com registro localizado no banco `addcont.db`, IDs sem registro localizado e situações indeterminadas. Essa consulta é **somente leitura**, não modifica o banco do PS5.
+
+**Limitação relevante:** preparar e montar `ac.pkg` **não significa** registrar os DLCs no serviço de entitlements do PS5. O código continua registrando o jogo base individualmente com `AppInstallTitleDir`. Não foi introduzida uma chamada de registro individual de DLC sem API/ABI validada, nem foi ativado `AppInstallAll`, que tinha histórico de falha grave. Uma linha `database_registered` confirma apenas a presença de um registro no banco, não prova que o DLC foi aceito pelo jogo. É necessário testar o reconhecimento dos DLCs no console.
+
+**Testes locais:** os testes existentes, checagens de contrato da operação em grupo, sintaxe do backend com cabeçalhos PS5 simulados e uma consulta SQLite em banco de teste passaram. A compilação real com o SDK e o teste no console continuam pendentes.
+
+---
+
 > **Código-fonte PS4Mount 0.4.6, evoluído a partir da versão manual 0.4.5 (base 0.4.4).**
 > Para o comparativo, mudanças e limitações, consulte [MELHORIAS-BASE-CORRETA.md](MELHORIAS-BASE-CORRETA.md). **Não é um ELF pronto para PS5.**
 

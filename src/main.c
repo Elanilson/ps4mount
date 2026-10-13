@@ -41,7 +41,7 @@
 #include "web.h"
 #include "icon_data.h"
 
-#define VERSION "PS4Mount 0.4.6-manual-ui-progress"
+#define VERSION "PS4Mount 0.4.7-bundle-dlc-check"
 #define LOCK_PORT 9032
 #define SCAN_SECONDS 10 /* legacy value; polling for PKGs is disabled */
 #define STATE_DIR "/data/ps4mount"
@@ -53,7 +53,7 @@
 #define MAX_TITLES 256
 #define MAX_DLC 64
 #define BATCH_QUIET 10 /* seconds without writes to the system databases between groups */
-#define MAX_DLC_TIDS 8
+#define MAX_DLC_TIDS MAX_DLC
 
 #define MAX_SCAN_PATHS 8
 #define CONFIG_PATH STATE_DIR "/config.txt"
@@ -558,15 +558,20 @@ static int place_dlc(dlc_src_t *a) {
 
 /* The ac.pkg link of every add-on exists and reaches its pkg. */
 static int dlc_ready(const title_src_t *t) {
-    char p[PATH_MAX];
+    char p[PATH_MAX], actual[PATH_MAX];
     for (int i = 0; i < t->ndlc; i++) {
         snprintf(p, sizeof(p), HOLD_DIR "/addcont/%s/%s/ac.pkg", t->dlc[i].pkg.title_id,
                  t->dlc[i].pkg.content_id + 20);
-        if (!exists(p))
-            return 0;
+        ssize_t n = readlink(p, actual, sizeof(actual) - 1);
+        if (n <= 0) return 0;
+        actual[n] = 0;
+        if (strcmp(actual, t->dlc[i].path) || !exists(p)) return 0;
     }
     return 1;
 }
+
+static void progress_set(const char *phase, const char *detail);
+static void pump_events(int ms);
 
 static int place_files(title_src_t *t) {
     pkg_t *app = &t->app, *pat = t->has_patch ? &t->patch : NULL;
@@ -599,7 +604,11 @@ static int place_files(title_src_t *t) {
         if (i % group_size == 0)
             printf("[manual][dlc] %s preparing group %d/%d (%d DLC total)\n", tid,
                    i / group_size + 1, (t->ndlc + group_size - 1) / group_size, t->ndlc);
+        char detail[96];
+        snprintf(detail, sizeof(detail), "Preparando DLC %d/%d", i + 1, t->ndlc);
+        progress_set("activating", detail);
         rc |= place_dlc(&t->dlc[i]);
+        pump_events(1);
     }
 
     size_t pl = 0, ppl = 0;
@@ -788,7 +797,8 @@ static int title_running(const char *tid) {
     return 0;
 }
 
-/* A disabled title or deletion screen may release ONLY our top layer.
+/* The console's delete-screen handler releases only app/patch here; the
+ * explicit Desmontar button uses release_title_bundle to also release DLCs.
  * Never force-remove unknown layers, especially after a USB disconnect. */
 static void unmount_title(const char *tid, char (*dtids)[10], int ndtids) {
     char target[64], hold[PATH_MAX];
@@ -854,27 +864,41 @@ static int addcont_installed(const char *dtid) {
 
 /* /user/app/<TID> always, /user/patch/<TID> only with an update and
  * /user/addcont/<ADD-ON TID> for each add-on title. */
+/* Mount one complete title group: app, patch and all external DLC directories.
+ * New layers only are rolled back on failure. Existing layers are never removed
+ * by this rollback, and normal internal add-on installations stay untouched. */
 static int mount_paths(const char *tid, int has_patch, char (*dtids)[10], int ndtids) {
-    char target[64], hold[PATH_MAX];
-    snprintf(target, sizeof(target), "/user/app/%s", tid);
-    hold_path(hold, sizeof(hold), "app", tid);
-    if (mount_dir(hold, target))
-        return -1;
-    snprintf(target, sizeof(target), "/user/patch/%s", tid);
-    hold_path(hold, sizeof(hold), "patch", tid);
-    if (has_patch && mount_dir(hold, target))
-        return -1;
-    for (int i = 0; i < ndtids; i++) {
-        if (addcont_installed(dtids[i])) {
-            printf("[mount] /user/addcont/%s holds add-ons installed the normal way, not mounted\n", dtids[i]);
+    struct { char target[64]; char hold[128]; int added; } acquired[2 + MAX_DLC_TIDS];
+    int used = 0;
+    for (int i = 0; i < 2 + ndtids; ++i) {
+        const char *kind = i == 0 ? "app" : (i == 1 ? "patch" : "addcont");
+        if (i == 1 && !has_patch) continue;
+        const char *id = i < 2 ? tid : dtids[i - 2];
+        if (i >= 2 && addcont_installed(id)) {
+            printf("[bundle][mount] %s: /user/addcont/%s already holds internal add-ons; preserving\n", tid, id);
             continue;
         }
-        snprintf(target, sizeof(target), "/user/addcont/%s", dtids[i]);
-        hold_path(hold, sizeof(hold), "addcont", dtids[i]);
-        if (mount_dir(hold, target))
-            return -1;
+        if (used >= (int)(sizeof(acquired) / sizeof(acquired[0]))) return -1;
+        snprintf(acquired[used].target, sizeof(acquired[used].target), "/user/%s/%s", kind, id);
+        hold_path(acquired[used].hold, sizeof(acquired[used].hold), kind, id);
+        int before = owned_layer_count(acquired[used].target, acquired[used].hold);
+        if (before < 0 || mount_dir(acquired[used].hold, acquired[used].target)) goto rollback;
+        acquired[used].added = before == 0;
+        used++;
     }
+    printf("[bundle][mount] %s: app%s, %d add-on title folder(s) checked\n", tid,
+           has_patch ? "+patch" : "", ndtids);
     return 0;
+rollback:
+    printf("[bundle][mount] %s: group incomplete, rolling back newly mounted layers\n", tid);
+    for (int j = used - 1; j >= 0; --j) {
+        if (!acquired[j].added) continue;
+        if (top_layer(acquired[j].target, acquired[j].hold) == 1 &&
+            owned_layer_count(acquired[j].target, acquired[j].hold) == 1 &&
+            unmount(acquired[j].target, 0))
+            printf("[bundle][mount] rollback %s failed: %s\n", acquired[j].target, strerror(errno));
+    }
+    return -1;
 }
 
 static int mount_title(title_src_t *t) {
@@ -1886,6 +1910,85 @@ static int release_owned_layer(const char *tid, const char *kind) {
     return owned_layer_count(target, hold) == 0 ? 0 : -1;
 }
 
+/* Existing games can intentionally share an add-on title folder. Do not take
+ * it away from a second active game when this one is disabled. */
+static int other_active_title_uses_dlc(const char *tid, const char *dtid) {
+    for (int i = 0; i < MAX_TITLES; ++i) {
+        const managed_t *m = &g_managed[i];
+        if (!m->used || !strcmp(m->tid, tid)) continue;
+        for (int j = 0; j < m->ndlc_tids; ++j) {
+            if (strcmp(m->dlc_tids[j], dtid)) continue;
+            char target[64], hold[PATH_MAX];
+            snprintf(target, sizeof(target), "/user/app/%s", m->tid);
+            hold_path(hold, sizeof(hold), "app", m->tid);
+            if (top_layer(target, hold) == 1 || title_running(m->tid)) return 1;
+        }
+    }
+    return 0;
+}
+
+/* Unmount must not require parsing every PKG again. Directories plus the active
+ * manager cache identify the bundle even when a DLC file became unreadable. */
+static void collect_bundle_mount_ids(const char *tid, const char *root, title_src_t *t) {
+    snprintf(t->app.title_id, sizeof(t->app.title_id), "%s", tid);
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/ps4/%s/addcont", root, tid);
+    DIR *d = opendir(path);
+    struct dirent *e;
+    if (d) {
+        while ((e = readdir(d)) && t->ndlc_tids < MAX_DLC_TIDS) {
+            if (strlen(e->d_name) != 9 || strncmp(e->d_name, "CUSA", 4)) continue;
+            int valid = 1;
+            for (int k = 4; k < 9; ++k)
+                valid &= e->d_name[k] >= '0' && e->d_name[k] <= '9';
+            if (!valid) continue;
+            snprintf(t->dlc_tids[t->ndlc_tids++], 10, "%s", e->d_name);
+        }
+        closedir(d);
+    }
+    const managed_t *m = managed_by(tid, NULL);
+    for (int i = 0; m && i < m->ndlc_tids; ++i) {
+        int found = 0;
+        for (int j = 0; j < t->ndlc_tids; ++j)
+            if (!strcmp(t->dlc_tids[j], m->dlc_tids[i])) found = 1;
+        if (!found && t->ndlc_tids < MAX_DLC_TIDS)
+            snprintf(t->dlc_tids[t->ndlc_tids++], 10, "%s", m->dlc_tids[i]);
+    }
+}
+
+/* Release external DLCs, patch and base as one manually controlled operation.
+ * No DB registrations or install metadata are deleted. */
+static int release_title_bundle(const title_src_t *t) {
+    const char *tid = t->app.title_id;
+    char target[64], hold[PATH_MAX];
+    /* Complete preflight first: never knowingly leave a partial group because
+     * a foreign or unreadable layer was discovered after unmounting the app. */
+    for (int i = 0; i < t->ndlc_tids + 2; ++i) {
+        const char *kind = i < t->ndlc_tids ? "addcont" :
+                           (i == t->ndlc_tids ? "patch" : "app");
+        const char *id = i < t->ndlc_tids ? t->dlc_tids[i] : tid;
+        if (!strcmp(kind, "addcont") && other_active_title_uses_dlc(tid, id)) continue;
+        snprintf(target, sizeof(target), "/user/%s/%s", kind, id);
+        hold_path(hold, sizeof(hold), kind, id);
+        if (dead_layer(target) || owned_layer_count(target, hold) < 0 ||
+            top_layer(target, hold) < 0) {
+            printf("[bundle][unmount] %s: unsafe/unreadable target %s; group unchanged\n", tid, target);
+            return -1;
+        }
+    }
+    for (int i = 0; i < t->ndlc_tids; ++i) {
+        const char *id = t->dlc_tids[i];
+        if (other_active_title_uses_dlc(tid, id)) {
+            printf("[bundle][unmount] %s: add-on %s still required by another mounted game\n", tid, id);
+            continue;
+        }
+        if (release_owned_layer(id, "addcont")) return -1;
+    }
+    if (release_owned_layer(tid, "patch") || release_owned_layer(tid, "app")) return -1;
+    printf("[bundle][unmount] %s: app, patch and %d add-on folder(s) handled\n", tid, t->ndlc_tids);
+    return 0;
+}
+
 int app_remove(const char *tid, char *msg, size_t cap) {
     if (g_restore_running || g_activate_request[0] || g_discover_requested ||
         !strcmp(g_progress.phase, "activating") || !strcmp(g_progress.phase, "searching")) {
@@ -1901,17 +2004,8 @@ int app_remove(const char *tid, char *msg, size_t cap) {
         snprintf(msg, cap, "%s not found on connected USB", tid);
         return -1;
     }
-    /* Validate first, then release known app/patch layers without force. */
-    char target[64], hold[PATH_MAX];
-    for (int i = 0; i < 2; i++) {
-        const char *kind = i ? "patch" : "app";
-        snprintf(target, sizeof(target), "/user/%s/%s", kind, tid);
-        hold_path(hold, sizeof(hold), kind, tid);
-        if (dead_layer(target) || owned_layer_count(target, hold) < 0 || top_layer(target, hold) < 0) {
-            snprintf(msg, cap, "Foreign/unreadable %s mount: no change to %s", kind, tid);
-            return -1;
-        }
-    }
+    title_src_t t = {0};
+    collect_bundle_mount_ids(tid, root, &t);
     /* Persist disabled intent BEFORE releasing mounts. An I/O error must not
      * leave the game unexpectedly active again after the next reboot. */
     char path[64];
@@ -1920,17 +2014,16 @@ int app_remove(const char *tid, char *msg, size_t cap) {
         snprintf(msg, cap, "Could not persist disabled status for %s", tid);
         return -1;
     }
-    if (release_owned_layer(tid, "patch") || release_owned_layer(tid, "app")) {
-        snprintf(msg, cap, "Could not safely release %s; auto restore disabled, inspect mounts", tid);
+    if (release_title_bundle(&t)) {
+        snprintf(msg, cap, "Could not safely release %s bundle; restore disabled, inspect mounts", tid);
         return -1;
     }
-    /* Keep DLC layer on shared /user/addcont/<TID> untouched, as it can be used
-     * by other active games. Disable means no re-mount on the next boot. */
+    /* Release all title-owned external DLC mounts unless another active game needs them. */
     snprintf(path, sizeof(path), STATE_DIR "/%s.active", tid);
     unlink(path);
     managed_t *m = managed_by(tid, NULL);
     if (m) m->used = 0;
-    printf("[manual] %s disabled; registration retained, DLC mounts not forced\n", tid);
+    printf("[manual] %s disabled; game+patch+DLC bundle released, system registration retained\n", tid);
     g_catalog_dirty = 1;
     snprintf(msg, cap, "%s unmounted (registration retained, automatic restore off)", tid);
     return 0;
@@ -2111,6 +2204,30 @@ static int hold_link_is(const char *kind, const char *tid, const char *name, con
     return !strcmp(actual, expected);
 }
 
+/* Reports database evidence only.  Mounting ac.pkg is not equivalent to a
+ * registered entitlement; do not call AppInstallAll or install packages to
+ * internal storage as a hidden side effect of the Mount button. */
+static void report_dlc_registration(const title_src_t *t) {
+    if (!t->ndlc) return;
+    const char *ids[MAX_DLC];
+    int states[MAX_DLC], registered = 0, missing = 0, unknown = 0;
+    for (int i = 0; i < t->ndlc; ++i) ids[i] = t->dlc[i].pkg.content_id;
+    db_dlc_registration(ids, t->ndlc, states);
+    for (int i = 0; i < t->ndlc; ++i) {
+        if (states[i] == 1) registered++;
+        else if (states[i] == 0) {
+            missing++;
+            printf("[manual][dlc-db] %s: NO DATABASE RECORD FOUND for %s\n", t->app.title_id, ids[i]);
+        } else unknown++;
+    }
+    printf("[manual][dlc-db] %s: sources=%d database_registered=%d missing=%d unknown=%d; mounted files alone do not prove DLC entitlement\n",
+           t->app.title_id, t->ndlc, registered, missing, unknown);
+    if (missing)
+        printf("[manual][dlc-db] %s: DLC registration NOT confirmed; targeted base registration does not prove add-on registration\n", t->app.title_id);
+    if (unknown)
+        printf("[manual][dlc-db] %s: addcont.db unreadable or schema not recognized; no registration claim\n", t->app.title_id);
+}
+
 static int mount_registered_title(title_src_t *t) {
     const char *tid = t->app.title_id;
     char root[32];
@@ -2139,7 +2256,7 @@ static int mount_registered_title(title_src_t *t) {
     } else {
         printf("[manual][mount] %s: existing DB registration, prepared files reusable\n", tid);
     }
-    progress_set("activating", "Mounting registered game and update");
+    progress_set("activating", "Montando jogo base, atualizacao e DLCs");
     if (mount_title(t) || !title_layers_mounted(t)) {
         printf("[manual][mount] %s: incomplete/failed filesystem mount\n", tid);
         return -1;
@@ -2218,16 +2335,18 @@ static void activate_queued(void) {
     } else {
         printf("[manual][activate] %s: database unreadable; mount postponed\n", tid);
     }
-    if (!rc)
-        printf("[manual][activate] %s activated: game+update mounted; %d DLC source(s) staged (not independently DB-verified)\n",
+    if (!rc) {
+        printf("[manual][activate] %s activated: game+update+DLC mounts checked; %d DLC source(s) staged\n",
                tid, t.ndlc);
+        report_dlc_registration(&t);
+    }
     src_close(&t);
     if (rc) goto failed;
     g_progress.ok = 1;
     g_progress.done = 1;
     g_catalog_dirty = 1;
-    progress_set("complete", "Game mounted; DLC database installation not independently verified");
-    notify("PS4Mount: %s mounted (DLC registration requires verification)", tid);
+    progress_set("complete", "Jogo base, atualizacao e DLCs montados; consultar log de registro DLC");
+    notify("PS4Mount: %s mounted (DLC status in log)", tid);
     return;
 failed:
     g_progress.failed = 1;
