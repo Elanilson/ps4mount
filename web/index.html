@@ -29,6 +29,11 @@ main{padding:20px;max-width:1400px;margin:0 auto}
 .info{padding:12px 14px;display:flex;flex-direction:column;gap:4px;flex:1}
 .name{font-weight:600;font-size:16px}
 .meta{color:var(--muted);font-size:13px;word-break:break-all}
+/* Progress is local to the card being processed, not a permanent global status. */
+.card-progress{padding:0 14px 12px;display:flex;flex-direction:column;gap:6px}
+.card-progress span{font-size:13px;color:var(--muted);overflow-wrap:anywhere}
+.card-progress progress{display:block;width:100%;height:9px;accent-color:var(--accent)}
+[hidden]{display:none!important}
 .actions{display:flex;gap:8px;padding:0 14px 14px;flex-wrap:wrap}
 .empty{color:var(--muted);text-align:center;padding:60px 0}
 .warn{color:#f0c060;font-size:13px;background:#3a2e12;border:1px solid #5c4818;border-radius:8px;padding:6px 8px;margin-top:4px}
@@ -61,9 +66,9 @@ form.settings .row{display:flex;gap:8px;justify-content:flex-end}
   </div>
 </header>
 <main>
-  <section id="progress-wrap" aria-live="polite"><strong id="progress-title">Aguardando…</strong>
-    <progress id="progress-bar" value="0" max="1"></progress>
-    <div id="progress-detail">Nenhuma varredura ou registro começa ao abrir a página.</div>
+  <section id="progress-wrap" aria-live="polite" hidden><strong id="progress-title"></strong>
+    <progress id="progress-bar" max="1"></progress>
+    <div id="progress-detail"></div>
   </section>
   <div class="summary" id="summary"></div>
   <div class="grid" id="grid"></div>
@@ -86,7 +91,22 @@ form.settings .row{display:flex;gap:8px;justify-content:flex-end}
 <dialog id="logdlg"><h3>Log</h3><pre id="log"></pre><form method="dialog"><button>Fechar</button></form></dialog>
 <div id="toast"></div>
 <script>
-var games = [], busy = {};
+var games = [], busy = {}, lastPhase = '', serverMount = '';
+var stageLabels = {
+  'Preparing selected game': 'Preparando jogo…',
+  'Checking selected title': 'Verificando arquivos e registro…',
+  'Refreshing metadata and USB links of registered game': 'Atualizando metadados e arquivos USB…',
+  'Mounting registered game and update': 'Montando jogo e atualização…',
+  'Preparing game, update, and DLC files': 'Preparando arquivos do jogo, atualização e DLCs…',
+  'Requesting targeted registration': 'Registrando jogo no PS5…'
+};
+function stageText(detail, fallback) { return stageLabels[detail] || detail || fallback; }
+function sortGames(items) {
+  return items.slice().sort(function (a, b) {
+    return (a.name || '').localeCompare(b.name || '', 'pt-BR', {sensitivity:'base', numeric:true}) ||
+      a.title_id.localeCompare(b.title_id);
+  });
+}
 var labels = {ready: 'Montado', running: 'Em execução', removed: 'Removido anteriormente', internal: 'Instalado internamente', pending: 'Montagem pendente', duplicate: 'Outro HD', inactive: 'Não montado pelo PS4Mount'};
 
 function $(id) { return document.getElementById(id); }
@@ -110,7 +130,8 @@ function render() {
     if (['removed', 'inactive', 'pending'].indexOf(g.state) >= 0) act = '<button class="primary" data-a="mount" data-t="' + g.title_id + '">Montar</button>';
     else if (g.state === 'ready') act = '<button class="danger" data-a="unmount" data-t="' + g.title_id + '">Desmontar</button>';
     else if (g.state === 'running') act = '<button disabled>Feche o jogo para desmontar</button>';
-    if (busy[g.title_id]) act = '<button disabled>Processando…</button>';
+    var job = busy[g.title_id];
+    if (job) act = '<button disabled>' + (job.action === 'unmount' ? 'Desmontando…' : 'Montando…') + '</button>';
     html += '<div class="card"><div class="art" style="background-image:url(/icon/' + g.title_id + ')">' +
       '<span class="badge b-' + g.state + '">' + esc(labels[g.state] || g.state) + '</span></div>' +
       '<div class="info"><div class="name">' + esc(g.name) + '</div>' +
@@ -118,6 +139,8 @@ function render() {
         (g.dlc ? ' · ' + g.dlc + ' DLC(s)' : '') + ' · ' + gb(g.size) + '</div>' +
       '<div class="meta">' + esc(g.source) + (g.mount ? ' · montagem ' + g.mount : '') + '</div>' +
       (g.update_issue ? '<div class="warn">' + esc(g.update_issue) + '</div>' : '') + '</div>' +
+      (job ? '<div class="card-progress" role="status" aria-live="polite">' +
+        '<span>' + esc(job.detail) + '</span><progress aria-label="Processamento de ' + esc(g.name) + '"></progress></div>' : '') +
       '<div class="actions">' + act + '</div></div>';
   });
   $('grid').innerHTML = html;
@@ -128,7 +151,7 @@ function render() {
 }
 
 function load() {
-  api('/api/games').then(function (j) { games = j.games; $('ver').textContent = j.version; render(); })
+  api('/api/games').then(function (j) { games = sortGames(j.games); $('ver').textContent = j.version; render(); })
     .catch(function (e) { toast('Não foi possível ler os jogos: ' + e.message); });
 }
 
@@ -136,15 +159,31 @@ $('grid').addEventListener('click', function (e) {
   var b = e.target.closest('button[data-a]');
   if (!b) return;
   var tid = b.getAttribute('data-t'), a = b.getAttribute('data-a');
+  if (busy[tid]) return;
   if (a === 'unmount' && !confirm('Desmontar ' + tid + '? O registro no PS5 será mantido; a restauração automática deste jogo será desativada.')) return;
-  if (a === 'mount' && !confirm('Montar ' + tid + '? Jogos já registrados serão montados sem reinstalação; os arquivos auxiliares podem ser atualizados.')) return;
-  busy[tid] = 1; render();
-  api('/api/' + a + '?title_id=' + tid, 'POST').then(function (j) { toast(j.message); })
-    .catch(function (err) { toast('Erro: ' + err.message); })
-    .then(function () { delete busy[tid]; load(); });
+  // Mount is a single click. Unmount retains its safety confirmation.
+  busy[tid] = {action: a, detail: a === 'mount' ? 'Solicitando montagem…' : 'Desmontando jogo…'};
+  render();
+  api('/api/' + a + '?title_id=' + tid, 'POST').then(function () {
+    if (a === 'mount') {
+      // POST means queued, NOT completed: retain card progress until /api/progress says so.
+      if (busy[tid] && busy[tid].detail === 'Solicitando montagem…') {
+        busy[tid].detail = 'Montagem na fila…';
+        render();
+      }
+      loadProgress();
+    } else {
+      delete busy[tid];
+      load();
+    }
+  }).catch(function (err) {
+    delete busy[tid];
+    toast('Erro ao ' + (a === 'mount' ? 'montar' : 'desmontar') + ' ' + tid + ': ' + err.message);
+    load();
+  });
 });
 $('q').addEventListener('input', render);
-$('rescan').onclick = function () { if (!confirm('Buscar PKGs em subpastas e organizá-los dentro do mesmo HD? Nenhum jogo será registrado nessa etapa.')) return; $('progress-title').textContent = 'Solicitando busca no USB…'; api('/api/rescan', 'POST').then(function (j) { toast(j.message); loadProgress(); }).catch(function (e) { toast('Erro: ' + e.message); loadProgress(); }); };
+$('rescan').onclick = function () { if (!confirm('Buscar PKGs em subpastas e organizá-los dentro do mesmo HD? Nenhum jogo será registrado nessa etapa.')) return; $('progress-wrap').hidden = false; $('progress-title').textContent = 'Solicitando busca no USB…'; $('progress-bar').removeAttribute('value'); $('progress-detail').textContent = 'Aguardando início da busca'; api('/api/rescan', 'POST').then(function () { loadProgress(); }).catch(function (e) { toast('Erro: ' + e.message); loadProgress(); }); };
 $('logbtn').onclick = function () { api('/api/log').then(function (j) { $('log').textContent = j.log; $('logdlg').showModal(); }); };
 $('settingsbtn').onclick = function () {
   api('/api/config').then(function (c) {
@@ -171,25 +210,53 @@ $('stop').onclick = function () {
   if (!confirm('Encerrar o PS4Mount? Os jogos podem ficar indisponíveis até executar o ELF novamente.')) return;
   api('/api/stop', 'POST').then(function (j) { toast(j.message); });
 };
-var lastPhase = '';
 function loadProgress() {
   api('/api/progress').then(function (p) {
     var active = ['restoring','searching','activating','queued'].indexOf(p.phase) >= 0;
     $('rescan').disabled = active;
-    $('progress-bar').max = Math.max(p.total, 1);
-    if (p.phase === 'searching') $('progress-bar').removeAttribute('value'); // total unknown: animated indeterminate progress
-    else $('progress-bar').value = p.done;
-    var phases = {idle: 'Aguardando comando', queued: 'Preparando ativação', restoring: 'Restaurando jogos ativos', searching: 'Buscando PKGs no USB', activating: 'Ativando jogo', complete: 'Operação concluída', error: 'Operação com erro'};
-    if (p.phase === 'searching') {
-      $('progress-title').textContent = 'Buscando jogos no USB… · ' + p.scan_folders + ' pastas · ' + p.scan_pkgs + ' PKGs examinados · ' + p.scan_organized + ' organizados';
-      $('progress-detail').textContent = (p.scan_path || p.detail || 'Iniciando busca');
-    } else {
-      $('progress-title').textContent = (phases[p.phase] || p.phase) + ' — ' + p.done + '/' + p.total + ' · OK: ' + p.ok + ' · Falhas: ' + p.failed;
-      $('progress-detail').textContent = (p.current ? p.current + ' · ' : '') + p.detail;
+    // Only scanning/restoring uses the global progress. Mount/unmount uses its game card.
+    var globalProgress = p.phase === 'searching' || p.phase === 'restoring';
+    $('progress-wrap').hidden = !globalProgress;
+    if (globalProgress) {
+      $('progress-bar').max = Math.max(p.total, 1);
+      if (p.phase === 'searching') {
+        $('progress-bar').removeAttribute('value'); // total not known
+        $('progress-title').textContent = 'Buscando jogos no USB… · ' + p.scan_folders + ' pastas · ' + p.scan_pkgs + ' PKGs examinados · ' + p.scan_organized + ' organizados';
+        $('progress-detail').textContent = p.scan_path || p.detail || 'Iniciando busca';
+      } else {
+        $('progress-bar').value = p.done;
+        $('progress-title').textContent = 'Restaurando jogos ativos — ' + p.done + '/' + p.total;
+        $('progress-detail').textContent = (p.current ? p.current + ' · ' : '') + p.detail;
+      }
     }
-    if (lastPhase && ['restoring','searching','activating'].indexOf(lastPhase) >= 0 && ['complete','error'].indexOf(p.phase) >= 0) load();
+    var mounting = (p.phase === 'queued' || p.phase === 'activating') && p.current;
+    var changed = false;
+    if (mounting) {
+      // A reload of the panel can reconnect to an ongoing game operation.
+      if (serverMount && serverMount !== p.current && busy[serverMount] && busy[serverMount].action === 'mount') {
+        delete busy[serverMount]; changed = true;
+      }
+      serverMount = p.current;
+      var detail = stageText(p.detail, 'Montando jogo…');
+      if (!busy[p.current] || busy[p.current].detail !== detail) {
+        busy[p.current] = {action:'mount', detail:detail}; changed = true;
+      }
+    } else if (['complete','error','idle'].indexOf(p.phase) >= 0) {
+      // A very fast mount may finish before the first poll: use p.current too.
+      var finishedTitle = serverMount || (p.phase !== 'idle' ? p.current : '');
+      if (finishedTitle && busy[finishedTitle] && busy[finishedTitle].action === 'mount') {
+        delete busy[finishedTitle]; changed = true;
+        if (p.phase === 'error') toast('Falha ao montar ' + finishedTitle + '. Consulte o log.');
+        load();
+      }
+      serverMount = '';
+    }
+    if (lastPhase && ['restoring','searching'].indexOf(lastPhase) >= 0 && ['complete','error'].indexOf(p.phase) >= 0) load();
     lastPhase = p.phase;
-  }).catch(function () { $('progress-detail').textContent = 'Painel desconectado; confira o log ao reconectar.'; });
+    if (changed) render();
+  }).catch(function () {
+    if (!$('progress-wrap').hidden) $('progress-detail').textContent = 'Painel desconectado; confira o log ao reconectar.';
+  });
 }
 load();
 loadProgress();

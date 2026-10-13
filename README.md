@@ -1,4 +1,4 @@
-> **Código-fonte PS4Mount 0.4.5, baseado diretamente na versão manual 0.4.4.**
+> **Código-fonte PS4Mount 0.4.6, evoluído a partir da versão manual 0.4.5 (base 0.4.4).**
 > Para o comparativo, mudanças e limitações, consulte [MELHORIAS-BASE-CORRETA.md](MELHORIAS-BASE-CORRETA.md). **Não é um ELF pronto para PS5.**
 
 # PS4Mount 0.4.4 — montagem manual e progresso da busca USB (experimental)

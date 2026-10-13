@@ -15,3 +15,8 @@ ${CC:-cc} -O1 -g -Wall -Wextra -Werror -D_DEFAULT_SOURCE -Isrc -o build/test/sca
 build/test/scan_walk
 
 python3 test/manual_contract.py
+
+# Validate browser panel interactions without requiring a browser or PS5.
+if command -v node >/dev/null 2>&1; then
+    node test/panel_ui.cjs
+fi

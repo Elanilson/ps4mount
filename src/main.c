@@ -41,7 +41,7 @@
 #include "web.h"
 #include "icon_data.h"
 
-#define VERSION "PS4Mount 0.4.5-manual-usb-stability"
+#define VERSION "PS4Mount 0.4.6-manual-ui-progress"
 #define LOCK_PORT 9032
 #define SCAN_SECONDS 10 /* legacy value; polling for PKGs is disabled */
 #define STATE_DIR "/data/ps4mount"
@@ -1851,6 +1851,9 @@ int app_add(const char *tid, char *msg, size_t cap) {
         return -1;
     }
     snprintf(g_activate_request, sizeof(g_activate_request), "%s", tid);
+    g_progress.total = 1;
+    g_progress.done = g_progress.ok = g_progress.failed = 0;
+    snprintf(g_progress.current, sizeof(g_progress.current), "%s", tid);
     progress_set("queued", "Preparing selected game");
     snprintf(msg, cap, "Mount queued for %s (game + update + associated DLC metadata)", tid);
     return 0;
