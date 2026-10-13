@@ -43,12 +43,15 @@ static int is_library(const char *path, const struct stat *dir, const char *libr
 
 static int walk(const char *dir, const char *library, dev_t device,
                 pkg_dir_visitor visit, void *context, int stop_on_first, int depth,
-                pkg_dir_progress progress, void *progress_context) {
+                pkg_dir_progress progress, void *progress_context,
+                pkg_scan_cancel cancel, void *cancel_context) {
+    if (cancel && cancel(cancel_context)) return 0;
     struct stat here;
     /* lstat prevents links to other folders (including parent loops). */
     if (lstat(dir, &here) || !S_ISDIR(here.st_mode) || here.st_dev != device)
         return 0;
     if (progress) progress(dir, progress_context);
+    if (cancel && cancel(cancel_context)) return 0;
     DIR *d = opendir(dir);
     if (!d)
         return 0;
@@ -67,7 +70,7 @@ static int walk(const char *dir, const char *library, dev_t device,
             break;
         }
     }
-    if (found_pkg) {
+    if (found_pkg && !(cancel && cancel(cancel_context))) {
         int n = visit(dir, context);
         if (n > 0)
             result += n;
@@ -81,6 +84,7 @@ static int walk(const char *dir, const char *library, dev_t device,
         int in_library = is_library(dir, &here, library);
         rewinddir(d);
         while ((e = readdir(d))) {
+            if (cancel && cancel(cancel_context)) break;
             if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, ".."))
                 continue;
             /* Directories created by Windows, not game packages. */
@@ -98,7 +102,7 @@ static int walk(const char *dir, const char *library, dev_t device,
             if (lstat(path, &child) || !S_ISDIR(child.st_mode) || child.st_dev != device)
                 continue;
             result += walk(path, library, device, visit, context, stop_on_first, depth + 1,
-                           progress, progress_context);
+                           progress, progress_context, cancel, cancel_context);
             if (stop_on_first && result)
                 break;
         }
@@ -107,14 +111,22 @@ static int walk(const char *dir, const char *library, dev_t device,
     return result;
 }
 
-int walk_pkg_dirs_progress(const char *start, const char *library, pkg_dir_visitor visit,
-                           void *context, int stop_on_first,
-                           pkg_dir_progress progress, void *progress_context) {
+int walk_pkg_dirs_progress_cancel(const char *start, const char *library, pkg_dir_visitor visit,
+                                  void *context, int stop_on_first,
+                                  pkg_dir_progress progress, void *progress_context,
+                                  pkg_scan_cancel cancel, void *cancel_context) {
     struct stat st;
     if (!visit || lstat(start, &st) || !S_ISDIR(st.st_mode))
         return 0;
     return walk(start, library, st.st_dev, visit, context, stop_on_first, 0,
-                progress, progress_context);
+                progress, progress_context, cancel, cancel_context);
+}
+
+int walk_pkg_dirs_progress(const char *start, const char *library, pkg_dir_visitor visit,
+                           void *context, int stop_on_first,
+                           pkg_dir_progress progress, void *progress_context) {
+    return walk_pkg_dirs_progress_cancel(start, library, visit, context, stop_on_first,
+                                         progress, progress_context, NULL, NULL);
 }
 
 int walk_pkg_dirs(const char *start, const char *library, pkg_dir_visitor visit,

@@ -18,7 +18,7 @@ checks={
  'already-registered game mounts without old ownership proof': 'mount_registered_title(&t)' in main and 'marker_owned_folder(t)' not in main,
  'registered game can refresh USB metadata without an installer': 'existing DB registration, rebuilding USB metadata (no installer)' in main and 'place_files(t)' in main,
  'manual search emits live folder and package counters': 'g_scan_folders++' in main and 'g_scan_examined++' in main and 'g_scan_organized++' in main,
- 'manual search can return live progress during traversal': 'walk_pkg_dirs_progress(' in main and 'pump_events(1)' in main,
+ 'manual search can return live progress during traversal': ('walk_pkg_dirs_progress(' in main or 'walk_pkg_dirs_progress_cancel(' in main) and 'pump_events(1)' in main,
  'indeterminate panel progress while search total unknown': "removeAttribute('value')" in page and 'p.scan_folders' in page,
  'mount/unmount button wording': '>Montar</button>' in page and '>Desmontar</button>' in page,
  'mounted state wins over inactive marker': main.index('else if (mounted && db_is_registered(tid)) state') < main.index('else if (removed(tid)) state') < main.index('else if (!active_status(tid)) state'),

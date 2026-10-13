@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
  * Copyright (C) 2026 gasb07
- * PS4Mount daemon: scans USB drives, registers PS4 fpkgs without installing them, follows klog and serves the web panel. */
+ * PS4Mount: manual discovery/activation, persisted mount restoration, web panel. */
 /* ps4mount: run PS4 fpkgs from external storage without installing them.
  *
  * Every scan:
@@ -34,19 +34,16 @@
 #include <ps5/kernel.h>
 
 #include "build.h"
-#include "mount_policy.h"
 #include "crypto.h"
 #include "db.h"
-#include "origin.h"
 #include "pkg.h"
+#include "scan_walk.h"
 #include "web.h"
 #include "icon_data.h"
 
-#define VERSION "PS4Mount v7-source (manual USB)"
+#define VERSION "PS4Mount 0.4.5-manual-usb-stability"
 #define LOCK_PORT 9032
-#define SCAN_SECONDS 10
-#define MAX_WALK_DEPTH 8
-#define MAX_WALK_DIRS 20000
+#define SCAN_SECONDS 10 /* legacy value; polling for PKGs is disabled */
 #define STATE_DIR "/data/ps4mount"
 /* Internal folders mounted over /user/app/<TID> and /user/patch/<TID>: the files an
  * install leaves there plus app.pkg/patch.pkg as symlinks to the pkgs on the drive.
@@ -60,7 +57,6 @@
 
 #define MAX_SCAN_PATHS 8
 #define CONFIG_PATH STATE_DIR "/config.txt"
-#define RESTORED_LIST STATE_DIR "/restored.txt" /* pkgs moved back: not picked up again */
 
 /* Settings, kept in CONFIG_PATH and edited in the panel. */
 typedef struct {
@@ -76,8 +72,18 @@ static config_t g_cfg = {1, 5, 1, {""}, 1};
 typedef struct { char useless[45]; char message[3075]; } notify_request_t;
 int sceUserServiceInitialize(void *);
 int sceAppInstUtilInitialize(void);
-int sceAppInstUtilAppInstallAll(void *);
+int sceAppInstUtilAppUnInstall(const char *);
 int sceKernelSendNotificationRequest(int, notify_request_t *, size_t, int);
+/* Targeted registration only. No fallback to global AppInstallAll: a prior full-library
+ * attempt caused a console panic. Resolve BEFORE writing any title metadata. */
+typedef int (*app_install_title_dir_fn)(const char *, const char *, void *);
+static app_install_title_dir_fn one_title_install_api(void) {
+    uint32_t handle = 0;
+    if (kernel_dynlib_handle(-1, "libSceAppInstUtil.sprx", &handle))
+        return NULL;
+    return (app_install_title_dir_fn)kernel_dynlib_resolve(-1, handle, "Wudg3Xe3heE");
+}
+
 
 static void notify(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 static void notify(const char *fmt, ...) {
@@ -161,9 +167,8 @@ static int dead_layer(const char *path) {
     return statfs(path, &sf) && layers_on(path) > 0;
 }
 
-/* Only accept a real storage mount, not an empty /mnt/usbN directory.
- * A live mount-table entry and an accessible root are necessary; no PKG is read here.
- * Do not use a cached drive list as proof that a drive is still connected. */
+/* Do not interpret an empty /mnt/usbN folder as a connected drive.
+ * Check the live mount table and filesystem identity; no game package is read. */
 static int is_mountpoint(const char *path) {
     struct statfs sf;
     struct stat st;
@@ -171,51 +176,17 @@ static int is_mountpoint(const char *path) {
         !strcmp(sf.f_fstypename, "nullfs") || stat(path, &st) || !S_ISDIR(st.st_mode))
         return 0;
     int n = getfsstat(NULL, 0, MNT_NOWAIT);
-    if (n <= 0)
-        return 0;
+    if (n <= 0) return 0;
     struct statfs *list = calloc((size_t)n + 16, sizeof(*list));
-    if (!list)
-        return 0;
-    n = getfsstat(list, (long)(sizeof(*list) * ((size_t)n + 16)), MNT_NOWAIT);
+    if (!list) return 0;
+    n = getfsstat(list, (long)((size_t)(n + 16) * sizeof(*list)), MNT_NOWAIT);
     int found = 0;
     for (int i = 0; i < n; i++)
-        if (!strcmp(list[i].f_mntonname, path) && !strcmp(list[i].f_mntfromname, sf.f_mntfromname) &&
-            !strcmp(list[i].f_fstypename, sf.f_fstypename)) { found = 1; break; }
+        if (!strcmp(list[i].f_mntonname, path) &&
+            !strcmp(list[i].f_fstypename, sf.f_fstypename) &&
+            !strcmp(list[i].f_mntfromname, sf.f_mntfromname)) { found = 1; break; }
     free(list);
     return found;
-}
-
-static int title_id_valid(const char *tid) {
-    if (!tid || strlen(tid) != 9 || strncmp(tid, "CUSA", 4)) return 0;
-    for (int i = 4; i < 9; i++) if (tid[i] < '0' || tid[i] > '9') return 0;
-    return 1;
-}
-
-static void title_state_path(char *out, size_t n, const char *tid, const char *suffix) {
-    snprintf(out, n, STATE_DIR "/%s.%s", tid, suffix);
-}
-static int title_is_active(const char *tid) {
-    char p[96];
-    title_state_path(p, sizeof(p), tid, "disabled");
-    if (exists(p)) return 0; /* v6 compatibility */
-    title_state_path(p, sizeof(p), tid, "active");
-    return exists(p);
-}
-
-/* Atomic marker publication: an interrupted write never leaves a partial .active. */
-static int set_title_active(const char *tid, int active) {
-    char active_path[96], disabled_path[96], tmp[128];
-    title_state_path(active_path, sizeof(active_path), tid, "active");
-    title_state_path(disabled_path, sizeof(disabled_path), tid, "disabled");
-    const char *dst = active ? active_path : disabled_path;
-    snprintf(tmp, sizeof(tmp), "%s.tmp", dst);
-    if (write_file(tmp, tid, strlen(tid), 0666) || rename(tmp, dst)) {
-        printf("[state] could not persist %s: %s\n", dst, strerror(errno));
-        unlink(tmp);
-        return -1;
-    }
-    unlink(active ? disabled_path : active_path);
-    return 0;
 }
 
 /* --- appmeta entries copied verbatim from the pkg --- */
@@ -361,7 +332,6 @@ static int src_open(title_src_t *t, const char *root, const char *tid) {
     snprintf(t->patch_path, sizeof(t->patch_path), "%s/patch.pkg", t->dir);
     if (pkg_open(&t->app, t->app_path) || read_sfo(&t->app, &t->app_sfo)) {
         printf("[scan] %s: unreadable app pkg\n", t->app_path);
-        if (t->app.fd >= 0) pkg_close(&t->app);
         return -1;
     }
     if (exists(t->patch_path)) {
@@ -587,6 +557,17 @@ static int place_dlc(dlc_src_t *a) {
 }
 
 /* The ac.pkg link of every add-on exists and reaches its pkg. */
+static int dlc_ready(const title_src_t *t) {
+    char p[PATH_MAX];
+    for (int i = 0; i < t->ndlc; i++) {
+        snprintf(p, sizeof(p), HOLD_DIR "/addcont/%s/%s/ac.pkg", t->dlc[i].pkg.title_id,
+                 t->dlc[i].pkg.content_id + 20);
+        if (!exists(p))
+            return 0;
+    }
+    return 1;
+}
+
 static int place_files(title_src_t *t) {
     pkg_t *app = &t->app, *pat = t->has_patch ? &t->patch : NULL;
     const char *tid = app->title_id, *cid = app->content_id;
@@ -612,8 +593,14 @@ static int place_files(title_src_t *t) {
 
     if (place_license(app))
         return -1;
-    for (int i = 0; i < t->ndlc; i++)
+    int group_size = g_cfg.batch ? g_cfg.batch_size : t->ndlc;
+    if (group_size < 1) group_size = 5;
+    for (int i = 0; i < t->ndlc; i++) {
+        if (i % group_size == 0)
+            printf("[manual][dlc] %s preparing group %d/%d (%d DLC total)\n", tid,
+                   i / group_size + 1, (t->ndlc + group_size - 1) / group_size, t->ndlc);
         rc |= place_dlc(&t->dlc[i]);
+    }
 
     size_t pl = 0, ppl = 0;
     uint8_t *pg = pkg_entry(app, 0x1001, &pl), *ppg = pat ? pkg_entry(pat, 0x1001, &ppl) : NULL;
@@ -705,7 +692,6 @@ typedef struct {
 } managed_t;
 
 static managed_t g_managed[MAX_TITLES];
-static int g_manual_scan; /* "Scan for games" in the panel */
 static int g_deleting; /* a delete screen is open: game folders are unmounted */
 static time_t g_deleting_since;
 static time_t g_deleting_close_at; /* set when the uninstall finished */
@@ -724,6 +710,29 @@ static int top_layer(const char *target, const char *dir) {
     if (statfs(target, &sf) || strcmp(sf.f_mntonname, target))
         return 0;
     return strcmp(sf.f_fstypename, "nullfs") || strcmp(sf.f_mntfromname, dir) ? -1 : 1;
+}
+
+/* Reject hidden foreign mount layers, not just the currently visible top layer.
+ * All layers on a target must originate from the same expected PS4Mount directory. */
+static int owned_layer_count(const char *target, const char *hold) {
+    int n = getfsstat(NULL, 0, MNT_NOWAIT);
+    if (n <= 0) return -1;
+    struct statfs *list = calloc((size_t)n + 16, sizeof(*list));
+    if (!list) return -1;
+    n = getfsstat(list, (long)((size_t)(n + 16) * sizeof(*list)), MNT_NOWAIT);
+    if (n < 0) { free(list); return -1; }
+    int count = 0;
+    for (int i = 0; i < n; i++) {
+        if (strcmp(list[i].f_mntonname, target)) continue;
+        if (strcmp(list[i].f_fstypename, "nullfs") ||
+            strcmp(list[i].f_mntfromname, hold)) {
+            free(list);
+            return -1;
+        }
+        count++;
+    }
+    free(list);
+    return count;
 }
 
 static int nullfs_mount(const char *dir, const char *target) {
@@ -779,100 +788,51 @@ static int title_running(const char *tid) {
     return 0;
 }
 
-/* The source of each layer comes from the mount table, which still reports
- * dead USB layers when statfs(target) itself fails. No foreign layer is removed. */
-static int owned_layers(const char *target, const char *expected, int *count) {
-    *count = 0;
-    int n = getfsstat(NULL, 0, MNT_NOWAIT);
-    if (n < 0) return -1;
-    if (!n) return 0;
-    struct statfs *list = calloc((size_t)n + 16, sizeof(*list));
-    if (!list) return -1;
-    n = getfsstat(list, (long)(sizeof(*list) * ((size_t)n + 16)), MNT_NOWAIT);
-    if (n < 0) { free(list); return -1; }
-    int foreign = 0;
-    for (int i = 0; i < n; i++) {
-        if (strcmp(list[i].f_mntonname, target)) continue;
-        (*count)++;
-        if (!mount_layer_is_owned(list[i].f_fstypename, list[i].f_mntfromname, expected))
-            foreign = 1;
-    }
-    free(list);
-    return foreign ? -1 : 0;
-}
-
-/* Explicitly limited to the PS4Mount hold folder. When the table is unreadable,
- * fail closed: it is worse to remove another program's mount than to reject a click. */
-static int unmount_owned(const char *target, const char *expected) {
-    int count = 0;
-    if (owned_layers(target, expected, &count)) {
-        printf("[mount] %s: foreign/unreadable layer, refusing unmount\n", target);
-        return -1;
-    }
-    for (int i = 0; i < count && i < 8; i++) {
-        /* Non-forced first; forced removal only for a verified owned, dead layer. */
-        int force = dead_layer(target) ? MNT_FORCE : 0;
-        if (unmount(target, force)) {
-            printf("[mount] unmount %s: %s\n", target, strerror(errno));
-            return -1;
+/* A disabled title or deletion screen may release ONLY our top layer.
+ * Never force-remove unknown layers, especially after a USB disconnect. */
+static void unmount_title(const char *tid, char (*dtids)[10], int ndtids) {
+    char target[64], hold[PATH_MAX];
+    for (int i = 0; i < 2; i++) {
+        const char *kind = i ? "patch" : "app";
+        snprintf(target, sizeof(target), "/user/%s/%s", kind, tid);
+        hold_path(hold, sizeof(hold), kind, tid);
+        if (dead_layer(target)) {
+            printf("[mount] %s unreadable; no forced release\n", target);
+            continue;
         }
-        int remaining = 0;
-        if (owned_layers(target, expected, &remaining)) return -1;
-        if (remaining == 0) return 0;
+        if (top_layer(target, hold) == 1 && unmount(target, 0))
+            printf("[mount] %s release failed: %s\n", target, strerror(errno));
     }
-    return count < 8 ? 0 : -1;
+    /* These may be shared by another game's DLCs: leave them in place.
+     * They will be safely reused or refused on the next mount attempt. */
+    (void)dtids;
+    (void)ndtids;
 }
 
 static int mount_dir(const char *dir, const char *target) {
-    if (!exists(dir)) {
-        printf("[mount] %s: prepared source does not exist\n", dir);
-        return -1;
-    }
     char parent[64];
     snprintf(parent, sizeof(parent), "%s", target);
     char *slash = strrchr(parent, '/');
-    if (slash && slash != parent) { *slash = 0; mkdir(parent, 0770); }
-    mkdir(target, 0777);
-    int count = 0;
-    if (owned_layers(target, dir, &count)) {
-        printf("[mount] %s: a foreign mount is present, refusing replacement\n", target);
+    if (slash && slash != parent) {
+        *slash = 0;
+        if (mkdir(parent, 0770) == 0)
+            printf("[mount] created %s\n", parent);
+    }
+    if (dead_layer(target)) {
+        printf("[manual][mount] %s unreadable; leaving layer untouched\n", target);
         return -1;
     }
-    if (count) {
-        if (!dead_layer(target) && top_layer(target, dir) == 1)
-            return 0;
-        if (unmount_owned(target, dir)) return -1;
+    int count = owned_layer_count(target, dir);
+    if (count < 0) return -1;
+    int top = top_layer(target, dir);
+    if (top == 1 && count > 0) return 0;
+    if (top != 0 || count > 0) {
+        printf("[manual][mount] %s occupied by foreign layer; refusing\n", target);
+        return -1;
     }
+    mkdir(target, 0777);
     if (nullfs_mount(dir, target)) return -1;
     return top_layer(target, dir) == 1 ? 0 : -1;
-}
-
-/* Check all title layers before changing any of them: partial foreign conflicts
- * must not trigger removal of the remaining valid game layers. */
-static int title_mounts_owned(const char *tid, char (*dtids)[10], int ndtids) {
-    char target[64], hold[PATH_MAX];
-    for (int i = -2; i < ndtids; i++) {
-        const char *kind = i == -2 ? "app" : i == -1 ? "patch" : "addcont";
-        const char *id = i < 0 ? tid : dtids[i];
-        snprintf(target, sizeof(target), "/user/%s/%s", kind, id);
-        hold_path(hold, sizeof(hold), kind, id);
-        int count = 0;
-        if (owned_layers(target, hold, &count)) return -1;
-    }
-    return 0;
-}
-
-static int unmount_title(const char *tid, char (*dtids)[10], int ndtids) {
-    char target[64], hold[PATH_MAX];
-    if (title_mounts_owned(tid, dtids, ndtids)) return -1;
-    for (int i = -2; i < ndtids; i++) {
-        const char *kind = i == -2 ? "app" : i == -1 ? "patch" : "addcont";
-        const char *id = i < 0 ? tid : dtids[i];
-        snprintf(target, sizeof(target), "/user/%s/%s", kind, id);
-        hold_path(hold, sizeof(hold), kind, id);
-        if (unmount_owned(target, hold)) return -1;
-    }
-    return 0;
 }
 
 /* Add-ons installed the normal way: their folder is never covered by a mount. */
@@ -896,17 +856,13 @@ static int addcont_installed(const char *dtid) {
  * /user/addcont/<ADD-ON TID> for each add-on title. */
 static int mount_paths(const char *tid, int has_patch, char (*dtids)[10], int ndtids) {
     char target[64], hold[PATH_MAX];
-    if (title_mounts_owned(tid, dtids, ndtids)) {
-        printf("[mount] %s: foreign layer, no changes made\n", tid);
-        return -1;
-    }
     snprintf(target, sizeof(target), "/user/app/%s", tid);
     hold_path(hold, sizeof(hold), "app", tid);
     if (mount_dir(hold, target))
         return -1;
     snprintf(target, sizeof(target), "/user/patch/%s", tid);
     hold_path(hold, sizeof(hold), "patch", tid);
-    if (has_patch ? mount_dir(hold, target) : unmount_owned(target, hold))
+    if (has_patch && mount_dir(hold, target))
         return -1;
     for (int i = 0; i < ndtids; i++) {
         if (addcont_installed(dtids[i])) {
@@ -925,27 +881,41 @@ static int mount_title(title_src_t *t) {
     return mount_paths(t->app.title_id, t->has_patch, t->dlc_tids, t->ndlc_tids);
 }
 
-/* A successful call alone is not evidence of a complete game mount. Verify
- * the base, update (when present) and each owned add-on layer against statfs. */
-static int all_layers_mounted(const title_src_t *t) {
+/* Confirm base, update and expected owned DLC mounts, not only syscall success. */
+static int title_layers_mounted(const title_src_t *t) {
+    char target[64], hold[PATH_MAX];
     const char *tid = t->app.title_id;
-    char path[64], hold[PATH_MAX];
-    snprintf(path, sizeof(path), "/user/app/%s", tid);
-    hold_path(hold, sizeof(hold), "app", tid);
-    if (top_layer(path, hold) != 1) return 0;
-    if (t->has_patch) {
-        snprintf(path, sizeof(path), "/user/patch/%s", tid);
-        hold_path(hold, sizeof(hold), "patch", tid);
-        if (top_layer(path, hold) != 1) return 0;
-    }
-    for (int i = 0; i < t->ndlc_tids; i++) {
-        const char *id = t->dlc_tids[i];
-        if (addcont_installed(id)) continue; /* normal installed DLC is not ours */
-        snprintf(path, sizeof(path), "/user/addcont/%s", id);
-        hold_path(hold, sizeof(hold), "addcont", id);
-        if (top_layer(path, hold) != 1) return 0;
+    for (int i = 0; i < 2 + t->ndlc_tids; i++) {
+        const char *kind = i == 0 ? "app" : (i == 1 ? "patch" : "addcont");
+        if (i == 1 && !t->has_patch) continue;
+        const char *id = i < 2 ? tid : t->dlc_tids[i - 2];
+        if (i >= 2 && addcont_installed(id)) continue;
+        snprintf(target, sizeof(target), "/user/%s/%s", kind, id);
+        hold_path(hold, sizeof(hold), kind, id);
+        if (owned_layer_count(target, hold) < 1 || top_layer(target, hold) != 1)
+            return 0;
     }
     return 1;
+}
+
+/* Check ALL target paths before writing metadata. Fail closed if any mount is
+ * unreadable or belongs to another program; do not unmount it. */
+static int target_mounts_safe(const title_src_t *t) {
+    char target[64], hold[PATH_MAX];
+    for (int i = 0; i < 2 + t->ndlc_tids; i++) {
+        const char *kind = i == 0 ? "app" : (i == 1 ? "patch" : "addcont");
+        if (i == 1 && !t->has_patch) continue;
+        const char *tid = i < 2 ? t->app.title_id : t->dlc_tids[i - 2];
+        if (i >= 2 && addcont_installed(tid)) continue;
+        snprintf(target, sizeof(target), "/user/%s/%s", kind, tid);
+        hold_path(hold, sizeof(hold), kind, tid);
+        if (dead_layer(target) || owned_layer_count(target, hold) < 0 ||
+            top_layer(target, hold) < 0) {
+            printf("[manual][preflight] foreign or unreadable mount %s; no metadata written\n", target);
+            return -1;
+        }
+    }
+    return 0;
 }
 
 static void manage(const title_src_t *t) {
@@ -973,6 +943,12 @@ static void manage(const title_src_t *t) {
     snprintf(m->dir, sizeof(m->dir), "%s", t->dir);
 }
 
+
+static int removed(const char *tid) {
+    char p[64];
+    snprintf(p, sizeof(p), STATE_DIR "/%s.removed", tid);
+    return exists(p);
+}
 
 /* Real installs keep app.pkg on the internal drive; never touch those. */
 static int installed_internally(const char *tid) {
@@ -1016,6 +992,23 @@ static int served_elsewhere(const title_src_t *t) {
     return exists(pkg);
 }
 
+static int title_state(title_src_t *t) {
+    const char *tid = t->app.title_id;
+    if (installed_internally(tid) || removed(tid))
+        return -1;
+    if (served_elsewhere(t)) {
+        if (first_time(t->app_path))
+            printf("[scan] %s: %s is already served from another drive, this copy is not used\n", t->dir, tid);
+        return -1;
+    }
+    char pdb[PATH_MAX];
+    snprintf(pdb, sizeof(pdb), "/user/playgo/app/%s/00/d0.pdb", t->app.content_id);
+    /* folders set up by 0.3.1 and older lack the internal folder: registered again */
+    return !db_is_registered(tid) || !exists(pdb) || !marker_matches(tid, t->marker) ||
+           !hold_ready("app", tid, "app.pkg") || (t->has_patch && !hold_ready("patch", tid, "patch.pkg")) ||
+           !dlc_ready(t);
+}
+
 static void pump_events(int ms);
 
 /* The launch check compares /system_data/priv/appmeta/<TID>/param.sfo with the
@@ -1043,106 +1036,14 @@ static void enforce_patch_sfo(title_src_t *t) {
     free(sfo);
 }
 
-/* How titles are registered by the system, chosen from the firmware at startup:
- *   REG_ALL      sceAppInstUtilAppInstallAll: the system registers every new title under
- *                /user/app. Used from 6.00 on (works on 6.50 and 13.20).
- *   REG_TITLEDIR sceAppInstUtilAppInstallTitleDir, one title at a time (works on 5.50). On
- *                5.50 InstallAll made the system check its whole app database and flag it
- *                as corrupted; below 6.00 the per-title call is used when the firmware has
- *                it (it was removed in newer firmwares: not present on 13.20).
- *   REG_NONE     neither is safe or available: no games are added. */
-#ifndef MIN_FW_INSTALL_ALL
-#define MIN_FW_INSTALL_ALL 6
-#endif
-
-enum { REG_ALL, REG_TITLEDIR, REG_NONE };
-
-typedef int (*title_dir_fn)(const char *title_id, const char *dir, void *reserved);
-
-static int g_reg_mode = REG_ALL;
-static title_dir_fn g_title_dir;
-static char g_fw_text[16] = "unknown";
-
-static const char *reg_mode_name(void) {
-    return g_reg_mode == REG_ALL ? "AppInstallAll" : g_reg_mode == REG_TITLEDIR ? "AppInstallTitleDir" : "none";
-}
-
-static void check_firmware(void) {
-    uint32_t fw = kernel_get_fw_version();
-    unsigned major = ((fw >> 28) & 0xf) * 10 + ((fw >> 24) & 0xf), minor = ((fw >> 20) & 0xf) * 10 + ((fw >> 16) & 0xf);
-    snprintf(g_fw_text, sizeof(g_fw_text), "%u.%02u", major, minor);
-    /* looked up at runtime: linking it would stop the payload from loading where it is gone */
-    uint32_t h = 0;
-    if (!kernel_dynlib_handle(getpid(), "libSceAppInstUtil.sprx", &h))
-        g_title_dir = (title_dir_fn)kernel_dynlib_dlsym(getpid(), h, "sceAppInstUtilAppInstallTitleDir");
-    if (major >= MIN_FW_INSTALL_ALL)
-        g_reg_mode = REG_ALL;
-    else
-        g_reg_mode = g_title_dir ? REG_TITLEDIR : REG_NONE;
-    printf("[main] firmware %s (0x%08x), AppInstallTitleDir %s, registration: %s\n", g_fw_text, fw,
-           g_title_dir ? "present" : "missing", reg_mode_name());
-}
-
-/* The system registration runs in its own thread: after rest mode InstallAll was seen to
- * block for good, which froze the whole daemon (panel, klog, stop request). A call still
- * running is never doubled; titles keep being checked in the database. */
-static volatile int g_install_busy, g_install_rc;
-static char g_install_tids[MAX_TITLES][10];
-static int g_install_n;
-
-static int register_call(const char *tid) {
-    if (g_reg_mode == REG_TITLEDIR) {
-        int rc = g_title_dir(tid, "/user/app/", NULL);
-        printf("[reg] %s: AppInstallTitleDir=0x%08x\n", tid, rc);
-        return rc == (int)0x80990002 ? 0 : rc; /* 0x80990002: already known, restored */
-    }
-    return sceAppInstUtilAppInstallAll(NULL);
-}
-
-static void *install_thread(void *arg) {
-    (void)arg;
-    int rc = 0;
-    if (g_reg_mode == REG_TITLEDIR) {
-        for (int i = 0; i < g_install_n; i++) {
-            int r = register_call(g_install_tids[i]);
-            if (r)
-                rc = r;
-        }
-    } else {
-        rc = register_call(NULL);
-    }
-    g_install_rc = rc;
-    g_install_busy = 0;
-    return NULL;
-}
-
-/* Registers the titles of tids that are not registered yet. */
-static int install_all_start(char (*tids)[10], int n) {
-    if (g_reg_mode == REG_NONE)
-        return -1; /* never where it corrupts the database */
-    if (g_install_busy) {
-        printf("[reg] registration still running from an earlier call\n");
+/* Stage one selected game. No global registration path exists. */
+static int register_prepare(title_src_t *t) {
+    if (place_files(t) || mount_title(t))
         return -1;
-    }
-    g_install_n = 0;
-    for (int i = 0; i < n && g_install_n < MAX_TITLES; i++)
-        if (!db_is_registered(tids[i]))
-            snprintf(g_install_tids[g_install_n++], 10, "%s", tids[i]);
-    g_install_busy = 1;
-    pthread_t th;
-    if (pthread_create(&th, NULL, install_thread, NULL)) {
-        install_thread(NULL); /* no thread: call it here */
-        return 0;
-    }
-    pthread_detach(th);
+    manage(t);
     return 0;
 }
 
-/* Registration runs in three steps so a group of games costs the system one
- * AppInstallAll and no write to its databases while it is still busy:
- *   1. register_prepare: files and mounts of each game of the group;
- *   2. one sceAppInstUtilAppInstallAll, then wait until ShellCore has the rows;
- *   3. register_finish: checks the title is registered, writes the marker. */
 /* Max mtime of the system databases (and their journals): ShellCore is busy while it changes. */
 static time_t db_mtime(void) {
     static const char *files[] = {"/system_data/priv/mms/app.db", "/system_data/priv/mms/app.db-journal",
@@ -1167,28 +1068,6 @@ static void wait_db_quiet(int quiet, int limit) {
             changed = time(NULL);
         }
     }
-}
-
-/* ShellCore registers every new title under /user/app itself; this also refreshes the
- * home screen and fetches the PSN concept. Waits while titles keep arriving. */
-static void install_all(char (*tids)[10], int n) {
-    int need = 0;
-    for (int i = 0; i < n; i++)
-        need += !db_is_registered(tids[i]);
-    if (!need)
-        return;
-    install_all_start(tids, n);
-    int done = n - need, idle = 0;
-    while (done < n && idle < 30) {
-        pump_events(1000);
-        int now = 0;
-        for (int i = 0; i < n; i++)
-            now += db_is_registered(tids[i]);
-        idle = now > done ? 0 : idle + 1;
-        done = now;
-    }
-    printf("[reg] %s=%s0x%08x: %d of %d title(s) registered\n", reg_mode_name(), g_install_busy ? "(still running) " : "",
-           g_install_rc, done, n);
 }
 
 /* The system databases are only ever written by the system: ShellCore keeps them
@@ -1352,17 +1231,12 @@ static void waiting_drop(const char *path) {
 }
 
 /* Add-ons of root still waiting for their game. */
-static const char *drive_rel(const char *root, const char *path) {
-    size_t n = strlen(root);
-    return !strncmp(path, root, n) && path[n] == '/' ? path + n + 1 : path;
-}
-
-/* Records where a pkg moved into <root>/ps4/<TID>/<rel> came from. */
-static void record_origin(const char *root, const char *tid, const char *rel, const char *from) {
-    char game[PATH_MAX];
-    snprintf(game, sizeof(game), "%s/ps4/%s", root, tid);
-    if (origin_add(game, rel, drive_rel(root, from)))
-        printf("[scan] %s: could not record where %s came from\n", game, rel);
+static int waiting_count(const char *root) {
+    size_t l = strlen(root);
+    int n = 0;
+    for (size_t i = 0; i < g_nwaiting; i++)
+        n += !strncmp(g_waiting[i].path, root, l) && g_waiting[i].path[l] == '/' && exists(g_waiting[i].path);
+    return n;
 }
 
 /* Moves an add-on pkg (ac) into <root>/ps4/<GAME>/addcont/<ADD-ON TID>/<LABEL>/ac.pkg. */
@@ -1394,15 +1268,30 @@ static int adopt_dlc(const char *root, const char *name, const char *path, pkg_t
         return 0;
     }
     printf("[scan] moved %s -> %s\n", path, dst);
-    char rel[64];
-    snprintf(rel, sizeof(rel), "addcont/%s/%s/ac.pkg", pkg->title_id, pkg->content_id + 20);
-    record_origin(root, game, rel, path);
     return 1;
 }
 
 /* Moves PS4 game (gd) and update (gp) pkgs found in dir (the drive root or a scan
  * folder) into <root>/ps4/<TID>/app.pkg and patch.pkg, then add-ons (ac) next to
  * their game. */
+/* Progress of explicit recursive search. Counts are observed, not guessed:
+ * total directory/file count is unknown until the USB traversal completes. */
+static int g_scan_folders, g_scan_examined, g_scan_organized;
+static int g_scan_abort;
+static int g_stop;
+static char g_scan_location[PATH_MAX];
+static void scan_progress_folder(const char *path, void *ctx) {
+    const char *root = ctx;
+    g_scan_folders++;
+    snprintf(g_scan_location, sizeof(g_scan_location), "%s", path);
+    if (g_stop || ((g_scan_folders % 8) == 1 && !is_mountpoint(root))) {
+        g_scan_abort = 1;
+        return;
+    }
+    /* Serve /api/progress even inside long, deeply nested USB traversals. */
+    if (!(g_scan_folders % 8)) pump_events(1);
+}
+
 static int adopt_dir_pkgs(const char *root, const char *dir) {
     int moved = 0;
     DIR *d = opendir(dir);
@@ -1410,29 +1299,28 @@ static int adopt_dir_pkgs(const char *root, const char *dir) {
         return 0;
     struct dirent *e;
     char path[PATH_MAX], dst[PATH_MAX];
-    for (int pass = 0; pass < 2; pass++, rewinddir(d)) {
+    for (int pass = 0; pass < 2 && !g_scan_abort; pass++, rewinddir(d)) {
     if (pass == 1)
         g_lib_sig = lib_signature(root); /* games moved in pass 0 count */
     while ((e = readdir(d))) {
+        if (g_scan_abort || g_stop || (g_scan_examined && !(g_scan_examined % 16) && !is_mountpoint(root))) {
+            g_scan_abort = 1;
+            break;
+        }
         size_t n = strlen(e->d_name);
         if (n < 5 || strcasecmp(e->d_name + n - 4, ".pkg"))
             continue;
         snprintf(path, sizeof(path), "%s/%s", dir, e->d_name);
-        struct stat rs;
-        if (!stat(path, &rs) && restored_has(RESTORED_LIST, drive_rel(root, path), (uint64_t)rs.st_size)) {
-            if (first_time(path))
-                printf("[scan] skip %s (moved back from ps4/ on request)\n", path);
-            continue;
+        if (pass == 0) {
+            g_scan_examined++;
+            pump_events(1);
         }
         waiting_t *w = waiting_find(path);
         if (w && w->sig == g_lib_sig)
             continue; /* waiting add-on, and no new game since the last check */
         pkg_t pkg;
-        if (pkg_open(&pkg, path)) {
-            if (pass == 0 && first_time(path))
-                printf("[scan] skip %s (cannot read the pkg header: not a PS4 pkg, or unreadable)\n", path);
+        if (pkg_open(&pkg, path))
             continue;
-        }
         sfo_t sfo;
         const sfo_item_t *cat = NULL;
         if (!read_sfo(&pkg, &sfo))
@@ -1441,16 +1329,15 @@ static int adopt_dir_pkgs(const char *root, const char *dir) {
         int is_dlc = cat && !strcmp(cat->sval, "ac");
         if (is_dlc || pass == 1) {
             /* add-ons go in the second pass: their game may be in this folder too */
-            if (pass == 1 && is_dlc && strncmp(pkg.title_id, "CUSA", 4)) {
-                if (first_time(path))
-                    printf("[scan] skip %s (add-on %s is not for a PS4 title)\n", path, pkg.content_id);
-            } else if (pass == 1 && is_dlc) {
+            if (pass == 1 && is_dlc && !strncmp(pkg.title_id, "CUSA", 4)) {
                 if (!g_cfg.dlc) {
                     if (first_time(path))
                         printf("[scan] skip %s (add-ons are turned off)\n", path);
-                } else if (pkg_fake_key(&pkg))
-                    moved += adopt_dlc(root, e->d_name, path, &pkg);
-                else if (first_time(path))
+                } else if (pkg_fake_key(&pkg)) {
+                    int count = adopt_dlc(root, e->d_name, path, &pkg);
+                    moved += count;
+                    g_scan_organized += count;
+                } else if (first_time(path))
                     printf("[scan] skip %s (not a fake add-on pkg)\n", path);
             }
             pkg_close(&pkg);
@@ -1500,19 +1387,14 @@ static int adopt_dir_pkgs(const char *root, const char *dir) {
                 printf("[scan] keep %s aside: %s\n", dst, strerror(errno));
                 continue;
             }
-            /* the update kept aside keeps its original name */
-            char game[PATH_MAX], was[PATH_MAX];
-            snprintf(game, sizeof(game), "%s/ps4/%s", root, tid);
-            if (!origin_find(game, "patch.pkg", was, sizeof(was)))
-                origin_add(game, old + strlen(game) + 1, was);
             notify("New update for %s (v%s): the previous one was moved to ps4/%s/replaced", tid, ver, tid);
         }
         if (rename(path, dst)) {
             printf("[scan] move %s: %s\n", path, strerror(errno));
         } else {
             printf("[scan] moved %s -> %s\n", path, dst);
-            record_origin(root, tid, is_app ? "app.pkg" : "patch.pkg", path);
             moved++;
+            g_scan_organized++;
         }
     }
     }
@@ -1520,172 +1402,75 @@ static int adopt_dir_pkgs(const char *root, const char *dir) {
     return moved;
 }
 
-/* Configured folders, relative to the selected mounted USB root. */
+typedef struct {
+    char tid[10], name[128];
+    int state, ndlc, has_patch;
+} title_t;
+
+/* A ps4/ folder or a .pkg anywhere inside a configured search folder.
+ * Other partitions (like Ventoy boot partitions) are skipped if empty. */
 static void scan_dir(char *out, size_t n, const char *root, int i) {
-    if (g_cfg.paths[i][0]) snprintf(out, n, "%s/%s", root, g_cfg.paths[i]);
-    else snprintf(out, n, "%s", root);
+    if (g_cfg.paths[i][0])
+        snprintf(out, n, "%s/%s", root, g_cfg.paths[i]);
+    else
+        snprintf(out, n, "%s", root);
 }
 
-/* Independent progress state for the panel. Updated only on the main daemon
- * thread, even while we pump HTTP events during a long USB search. */
-static struct {
-    const char *phase;
-    char current[16], detail[256], scan_path[256];
-    int total, done, ok, failed, folders, pkgs, organized;
-} g_progress = {.phase = "idle"};
-static int g_operation_busy;
-static char g_mount_requested[10];
-static int g_seen_usb[10];
-static int g_any_usb;
-static int g_scan_abort;
-
-static void progress_start(const char *phase, const char *detail) {
-    g_progress.phase = phase;
-    g_progress.total = g_progress.done = g_progress.ok = g_progress.failed = 0;
-    g_progress.folders = g_progress.pkgs = g_progress.organized = 0;
-    g_progress.current[0] = g_progress.scan_path[0] = 0;
-    snprintf(g_progress.detail, sizeof(g_progress.detail), "%s", detail);
+/* Walk subfolders for packages; the visitor leaves every original pkg untouched. */
+static int scan_should_stop(void *context) {
+    const char *root = context;
+    if (!g_scan_abort && (g_stop || ((g_scan_folders % 8) == 1 && !is_mountpoint(root))))
+        g_scan_abort = 1;
+    return g_scan_abort;
 }
 
-/* A single recursive search per explicit click, with bounded depth and no symlinks
- * or other filesystems: searching must never recurse into the system disk. */
-static int walk_pkgs(const char *root, const char *folder, int depth, dev_t dev) {
-    if (g_scan_abort) return 0;
-    if (depth > MAX_WALK_DEPTH || g_progress.folders >= MAX_WALK_DIRS) {
-        g_scan_abort = 1;
-        return 0;
-    }
-    struct stat st;
-    if (lstat(folder, &st) || !S_ISDIR(st.st_mode) || st.st_dev != dev) return 0;
-    g_progress.folders++;
-    if ((g_progress.folders % 16) == 1 && !is_mountpoint(root)) {
-        g_scan_abort = 1;
-        return 0;
-    }
-    snprintf(g_progress.scan_path, sizeof(g_progress.scan_path), "%s", folder);
-    int moved = adopt_dir_pkgs(root, folder);
-    g_progress.organized += moved;
-    g_progress.pkgs += moved; /* successfully examined; the total is indeterminate */
-    pump_events(1);
-    DIR *d = opendir(folder);
-    if (!d) return moved;
-    struct dirent *e;
-    while ((e = readdir(d))) {
-        if (e->d_name[0] == '.') continue;
-        if (!strcmp(folder, root) && !strcmp(e->d_name, "ps4")) continue;
-        char sub[PATH_MAX];
-        int n = snprintf(sub, sizeof(sub), "%s/%s", folder, e->d_name);
-        if (n < 0 || (size_t)n >= sizeof(sub)) continue;
-        if (lstat(sub, &st)) continue;
-        if (S_ISREG(st.st_mode)) {
-            size_t len = strlen(e->d_name);
-            if (len > 4 && !strcasecmp(e->d_name + len - 4, ".pkg")) g_progress.pkgs++;
-        } else if (S_ISDIR(st.st_mode) && st.st_dev == dev) {
-            moved += walk_pkgs(root, sub, depth + 1, dev);
-        }
-        if (g_progress.folders >= MAX_WALK_DIRS) break;
-    }
-    closedir(d);
+static int adopt_pkg_dir(const char *dir, void *context) {
+    if (scan_should_stop(context)) return 0;
+    int moved = adopt_dir_pkgs((const char *)context, dir);
+    pump_events(1); /* publish per-folder results, not only per drive */
     return moved;
 }
 
-static void discover_on_drive(const char *root) {
-    struct stat st;
-    if (!is_mountpoint(root) || stat(root, &st)) return;
+
+static int adopt_root_pkgs(const char *root) {
+    char dir[PATH_MAX], lib[PATH_MAX];
+    int moved = 0;
+    g_dlc_orphans = g_dlc_dupes = 0;
     g_lib_sig = lib_signature(root);
-    for (int i = 0; i < g_cfg.npaths && !g_scan_abort; i++) {
-        char dir[PATH_MAX];
+    snprintf(lib, sizeof(lib), "%s/ps4", root);
+    for (int i = 0; i < g_cfg.npaths; i++) {
         scan_dir(dir, sizeof(dir), root, i);
-        /* Reject configured paths escaping the selected drive via a symlink.
-         * lstat on every segment below enforces this for recursive traversal;
-         * realpath additionally validates the user-supplied initial directory. */
-        char resolved[PATH_MAX];
-        size_t base = strlen(root);
-        if (!realpath(dir, resolved) || strncmp(resolved, root, base) ||
-            (resolved[base] && resolved[base] != '/')) continue;
-        walk_pkgs(root, dir, 0, st.st_dev);
+        if (g_scan_abort) break;
+        moved += walk_pkg_dirs_progress_cancel(dir, lib, adopt_pkg_dir, (void *)root, 0,
+                                              scan_progress_folder, (void *)root,
+                                              scan_should_stop, (void *)root);
     }
+    if (g_dlc_orphans)
+        notify("%s: %d add-on(s) wait for their game, which is not on this drive (see the log)", root + 5,
+               waiting_count(root));
+    if (g_dlc_dupes)
+        notify("%s: %d add-on copy(ies) were left in place because the game already has them", root + 5, g_dlc_dupes);
+    return moved;
 }
 
-/* Reconnect restores only titles explicitly activated previously. No recursive
- * PKG search, rename, or registration takes place on a passive USB poll. */
-static void restore_known(const char *root) {
+/* Add-ons deleted on the console come back with their game: drive reconnected or
+ * "Add to library" in the panel. */
+static void clear_removed_dlc(void) {
     DIR *d = opendir(STATE_DIR);
-    if (!d || !is_mountpoint(root)) { if (d) closedir(d); return; }
+    if (!d)
+        return;
     struct dirent *e;
-    while ((e = readdir(d))) {
-        size_t n = strlen(e->d_name);
-        if (n != 16 || strcmp(e->d_name + 9, ".active")) continue;
-        char tid[10];
-        snprintf(tid, sizeof(tid), "%.9s", e->d_name);
-        if (!title_id_valid(tid) || !title_is_active(tid)) continue;
-        char candidate[PATH_MAX];
-        snprintf(candidate, sizeof(candidate), "%s/ps4/%s/app.pkg", root, tid);
-        if (!exists(candidate)) continue;
-        if (!db_is_registered(tid) || title_running(tid)) continue;
-        title_src_t src = {0};
-        if (src_open(&src, root, tid)) { if (src.app.fd >= 0) src_close(&src); continue; }
-        /* An equally named game on another HD is not necessarily the same PKG. */
-        if (!marker_matches(tid, src.marker) || !hold_ready("app", tid, "app.pkg") ||
-            (src.has_patch && !hold_ready("patch", tid, "patch.pkg"))) {
-            src_close(&src); continue;
+    char p[PATH_MAX];
+    while ((e = readdir(d)))
+        if (strlen(e->d_name) == 36 + 8 && !strcmp(e->d_name + 36, ".removed")) {
+            snprintf(p, sizeof(p), STATE_DIR "/%s", e->d_name);
+            unlink(p);
         }
-        if (title_mounts_owned(tid, src.dlc_tids, src.ndlc_tids) == 0 &&
-            !mount_title(&src) && all_layers_mounted(&src)) {
-            manage(&src);
-            printf("[usb] restored %s on %s\n", tid, root);
-        } else printf("[usb] restore %s failed or foreign layer present\n", tid);
-        src_close(&src);
-        pump_events(1);
-    }
     closedir(d);
 }
 
-/* Polling checks only mount metadata. Intensive disk traversal is user-initiated. */
-static void scan_all(void) {
-    char root[32];
-    int count = 0;
-    for (int i = 0; i < 10; i++) {
-        if (i < 8) snprintf(root, sizeof(root), "/mnt/usb%d", i);
-        else snprintf(root, sizeof(root), "/mnt/ext%d", i - 8);
-        int present = is_mountpoint(root);
-        count += present;
-        if (present && !g_seen_usb[i]) {
-            printf("[usb] detected: %s\n", root);
-            restore_known(root);
-        } else if (!present && g_seen_usb[i]) {
-            printf("[usb] disconnected: %s (saved registrations preserved)\n", root);
-        }
-        g_seen_usb[i] = present;
-    }
-    g_any_usb = count;
-    if (!g_manual_scan) return;
-    g_manual_scan = 0;
-    if (!count) {
-        progress_start("error", "Nenhum HD USB montado. Busca cancelada.");
-        notify("Nenhum HD USB montado; busca nao executada");
-        return;
-    }
-    g_operation_busy = 1;
-    g_scan_abort = 0;
-    progress_start("searching", "Buscando PKGs nas unidades USB montadas");
-    for (int i = 0; i < 10; i++) {
-        if (!g_seen_usb[i]) continue;
-        if (i < 8) snprintf(root, sizeof(root), "/mnt/usb%d", i);
-        else snprintf(root, sizeof(root), "/mnt/ext%d", i - 8);
-        discover_on_drive(root);
-        if (!is_mountpoint(root)) g_scan_abort = 1;
-        if (g_scan_abort) break;
-    }
-    g_progress.phase = g_scan_abort ? "error" : "complete";
-    g_progress.done = g_progress.total = g_progress.ok = g_progress.organized;
-    g_progress.failed = g_scan_abort ? 1 : 0;
-    snprintf(g_progress.detail, sizeof(g_progress.detail),
-             g_scan_abort ? "Busca interrompida: HD indisponivel ou limite de pastas" :
-                            "%d pasta(s), %d PKG(s), %d organizado(s)",
-             g_progress.folders, g_progress.pkgs, g_progress.organized);
-    g_operation_busy = 0;
-}
+/* The upstream automatic scan_root/scan_all/registration loop is deliberately
+ * removed. Manual discovery only calls adopt_root_pkgs() on explicit POST. */
 
 /* --- klog events --- */
 
@@ -1715,7 +1500,7 @@ static void end_delete_window(void) {
     g_deleting = 0;
     g_deleting_close_at = 0;
     for (int i = 0; i < MAX_TITLES; i++)
-        if (g_managed[i].used && title_is_active(g_managed[i].tid))
+        if (g_managed[i].used)
             mount_paths(g_managed[i].tid, g_managed[i].has_patch, g_managed[i].dlc_tids, g_managed[i].ndlc_tids);
     printf("[delete] window closed, game folders mounted again\n");
 }
@@ -1849,49 +1634,42 @@ static void handle_klog_line(const char *line) {
 
 /* --- web panel --- */
 
-static time_t g_next_scan;
-static int g_stop;
+/* Jobs are accepted by POST and executed by the main loop, never from GET. */
+static int g_discover_requested;
+static char g_activate_request[10];
+static int g_restore_running;
+typedef struct {
+    const char *phase;
+    int total, done, ok, failed;
+    char current[10];
+    char detail[192];
+} progress_t;
+static progress_t g_progress = {"idle", 0, 0, 0, 0, "", "Waiting for action"};
 
-static void json_str(buf_t *b, const char *s);
+static void progress_set(const char *phase, const char *detail) {
+    g_progress.phase = phase;
+    snprintf(g_progress.detail, sizeof(g_progress.detail), "%s", detail);
+}
 
-int app_rescan(char *msg, size_t cap) {
-    if (g_operation_busy || g_mount_requested[0] || g_manual_scan) {
-        snprintf(msg, cap, "Ja existe uma operacao em andamento");
+static int any_external_usb(void);
+
+int app_rescan(void) {
+    if (g_discover_requested || g_restore_running || g_activate_request[0] ||
+        !strcmp(g_progress.phase, "searching") || !strcmp(g_progress.phase, "activating"))
+        return -1;
+    if (!any_external_usb()) {
+        g_progress = (progress_t){"error", 0, 0, 0, 0, "", "No external USB mounted; search not started"};
+        printf("[manual][scan] rejected: no real USB mount\n");
         return -1;
     }
-    /* Refresh presence synchronously: a newly plugged drive can be requested
-     * before the next 10-second background check. */
-    int any = 0;
-    for (int i = 0; i < 10; i++) {
-        char root[32];
-        if (i < 8) snprintf(root, sizeof(root), "/mnt/usb%d", i);
-        else snprintf(root, sizeof(root), "/mnt/ext%d", i - 8);
-        any += is_mountpoint(root);
-    }
-    if (!any) {
-        progress_start("error", "Nenhum HD externo montado");
-        snprintf(msg, cap, "Nenhum HD USB montado; a busca nao foi iniciada");
-        return -1;
-    }
-    g_manual_scan = 1;
-    g_next_scan = 0;
-    progress_start("queued", "Busca USB solicitada pelo painel");
-    snprintf(msg, cap, "Busca USB agendada");
+    g_discover_requested = 1;
+    g_scan_folders = g_scan_examined = g_scan_organized = 0;
+    g_scan_location[0] = 0;
+    progress_set("searching", "Search queued; waiting for USB discovery to start");
+    printf("[manual] USB discovery requested from panel\n");
     return 0;
 }
 
-void app_progress_json(buf_t *out) {
-    buf_printf(out, "{\"phase\":"); json_str(out, g_progress.phase);
-    buf_printf(out, ",\"current\":"); json_str(out, g_progress.current);
-    buf_printf(out, ",\"detail\":"); json_str(out, g_progress.detail);
-    buf_printf(out, ",\"done\":%d,\"total\":%d,\"ok\":%d,\"failed\":%d",
-               g_progress.done, g_progress.total, g_progress.ok, g_progress.failed);
-    buf_printf(out, ",\"scan_folders\":%d,\"scan_pkgs\":%d,\"scan_organized\":%d,\"scan_path\":",
-               g_progress.folders, g_progress.pkgs, g_progress.organized);
-    json_str(out, g_progress.scan_path);
-    buf_printf(out, ",\"usb_connected\":%d,\"busy\":%s}", g_any_usb,
-               g_operation_busy || g_mount_requested[0] || g_manual_scan ? "true" : "false");
-}
 void app_stop(void) { g_stop = 1; }
 
 static void json_str(buf_t *b, const char *s) {
@@ -1922,68 +1700,108 @@ static int find_root(const char *tid, char *root, size_t n) {
     return -1;
 }
 
-void app_games_json(buf_t *out) {
-    buf_printf(out, "{\"version\":");
-    json_str(out, VERSION);
-    buf_printf(out, ",\"games\":[");
-    int first = 1;
-    for (int i = 0; i < 10; i++) {
+/* Cache immutable package metadata; the panel polls state/progress but must not
+ * re-open hundreds of PKGs or traverse the whole drive every few seconds. */
+#define CATALOG_MAX (MAX_TITLES * 2)
+typedef struct {
+    char tid[10], name[128], ver[8], dir[PATH_MAX], issue[256];
+    uint64_t size;
+    int patch, dlc;
+} catalog_item_t;
+static catalog_item_t g_catalog[CATALOG_MAX];
+static int g_catalog_count, g_catalog_dirty = 1;
+static int active_status(const char *tid);
+
+static void catalog_refresh(void) {
+    if (!g_catalog_dirty || g_restore_running) return;
+    g_catalog_count = 0;
+    for (int i = 0; i < 10; ++i) {
         char root[32], lib[PATH_MAX];
-        if (i < 8)
-            snprintf(root, sizeof(root), "/mnt/usb%d", i);
-        else
-            snprintf(root, sizeof(root), "/mnt/ext%d", i - 8);
-        if (!is_mountpoint(root))
-            continue;
+        if (i < 8) snprintf(root, sizeof(root), "/mnt/usb%d", i);
+        else snprintf(root, sizeof(root), "/mnt/ext%d", i - 8);
+        if (!is_mountpoint(root)) continue;
         snprintf(lib, sizeof(lib), "%s/ps4", root);
         DIR *d = opendir(lib);
-        if (!d)
-            continue;
+        if (!d) continue;
         struct dirent *e;
-        while ((e = readdir(d))) {
-            if (strlen(e->d_name) != 9 || strncmp(e->d_name, "CUSA", 4))
-                continue;
-            title_src_t t;
+        while ((e = readdir(d)) && g_catalog_count < CATALOG_MAX) {
+            if (strlen(e->d_name) != 9 || strncmp(e->d_name, "CUSA", 4)) continue;
             char pkg_path[PATH_MAX];
             snprintf(pkg_path, sizeof(pkg_path), "%s/%s/app.pkg", lib, e->d_name);
-            if (!exists(pkg_path) || src_open(&t, root, e->d_name))
+            if (!exists(pkg_path)) continue;
+            int duplicate = 0;
+            for (int j = 0; j < g_catalog_count; j++)
+                duplicate |= !strcmp(g_catalog[j].tid, e->d_name);
+            if (duplicate) {
+                printf("[manual][catalog] duplicate %s on %s, using first USB library\n", e->d_name, root);
                 continue;
-            const char *tid = e->d_name, *state, *mount = "";
-            char target[64], from[PATH_MAX];
-            snprintf(target, sizeof(target), "/user/app/%s", tid);
-            int mounted = mounted_from(target, from, sizeof(from));
-            if (mounted) {
-                struct statfs sf;
-                statfs(target, &sf);
-                mount = sf.f_flags & MNT_RDONLY ? "ro" : "rw";
             }
-            managed_t *m = managed_by(tid, NULL);
-            char hold[PATH_MAX];
-            int layers = 0;
-            hold_path(hold, sizeof(hold), "app", tid);
-            int foreign = owned_layers(target, hold, &layers);
-            if (installed_internally(tid)) state = "internal";
-            else if (served_elsewhere(&t)) state = "duplicate";
-            else if ((m && m->running) || title_running(tid)) state = "running";
-            else if (foreign) state = "blocked";
-            else if (layers && mounted && all_layers_mounted(&t) && db_is_registered(tid)) state = "ready";
-            else if (!title_is_active(tid)) state = "inactive";
-            else state = "pending";
-            buf_printf(out, "%s{\"title_id\":\"%s\",\"name\":", first ? "" : ",", tid);
-            json_str(out, t.name);
-            buf_printf(out, ",\"version\":");
-            json_str(out, t.ver);
-            buf_printf(out, ",\"has_patch\":%s,\"size\":%llu,\"state\":\"%s\",\"mount\":\"%s\",\"source\":",
-                       t.has_patch ? "true" : "false",
-                       (unsigned long long)(t.app.pkg_size + (t.has_patch ? t.patch.pkg_size : 0)), state, mount);
-            json_str(out, t.dir);
-            buf_printf(out, ",\"dlc\":%d,\"update_issue\":", t.ndlc);
-            json_str(out, t.update_issue);
-            buf_printf(out, "}");
-            first = 0;
+            title_src_t t = {0};
+            if (src_open(&t, root, e->d_name)) continue;
+            catalog_item_t *item = &g_catalog[g_catalog_count++];
+            memset(item, 0, sizeof(*item));
+            snprintf(item->tid, sizeof(item->tid), "%s", e->d_name);
+            snprintf(item->name, sizeof(item->name), "%s", t.name);
+            snprintf(item->ver, sizeof(item->ver), "%s", t.ver);
+            snprintf(item->dir, sizeof(item->dir), "%s", t.dir);
+            snprintf(item->issue, sizeof(item->issue), "%s", t.update_issue);
+            item->patch = t.has_patch;
+            item->dlc = t.ndlc;
+            item->size = t.app.pkg_size + (t.has_patch ? t.patch.pkg_size : 0);
             src_close(&t);
         }
         closedir(d);
+    }
+    g_catalog_dirty = 0;
+    printf("[manual][catalog] cached %d organized game(s) (no recursive discovery)\n", g_catalog_count);
+}
+
+void app_games_json(buf_t *out) {
+    catalog_refresh();
+    buf_printf(out, "{\"version\":");
+    json_str(out, VERSION);
+    buf_printf(out, ",\"games\":[");
+    for (int i = 0; i < g_catalog_count; i++) {
+        const catalog_item_t *t = &g_catalog[i];
+        const char *tid = t->tid, *state, *mount = "";
+        char target[64], from[PATH_MAX];
+        snprintf(target, sizeof(target), "/user/app/%s", tid);
+        int mounted = mounted_from(target, from, sizeof(from));
+        if (mounted) {
+            char hold[PATH_MAX];
+            hold_path(hold, sizeof(hold), "app", tid);
+            if (top_layer(target, hold) != 1 || owned_layer_count(target, hold) < 1)
+                mounted = 0;
+            if (mounted && t->patch) {
+                char patch_target[64], patch_hold[PATH_MAX];
+                snprintf(patch_target, sizeof(patch_target), "/user/patch/%s", tid);
+                hold_path(patch_hold, sizeof(patch_hold), "patch", tid);
+                if (top_layer(patch_target, patch_hold) != 1 ||
+                    owned_layer_count(patch_target, patch_hold) < 1)
+                    mounted = 0;
+            }
+            if (mounted) {
+                struct statfs sf;
+                if (!statfs(target, &sf))
+                    mount = (sf.f_flags & MNT_RDONLY) ? "ro" : "rw";
+            }
+        }
+        managed_t *m = managed_by(tid, NULL);
+        if (installed_internally(tid)) state = "internal";
+        else if (m && m->running) state = "running";
+        else if (mounted && db_is_registered(tid)) state = "ready";
+        else if (removed(tid)) state = "removed";
+        else if (!active_status(tid)) state = "inactive";
+        else state = "pending";
+        buf_printf(out, "%s{\"title_id\":\"%s\",\"name\":", i ? "," : "", tid);
+        json_str(out, t->name);
+        buf_printf(out, ",\"version\":"); json_str(out, t->ver);
+        buf_printf(out, ",\"has_patch\":%s,\"size\":%llu,\"state\":\"%s\",\"mount\":\"%s\",\"source\":",
+                   t->patch ? "true" : "false", (unsigned long long)t->size, state, mount);
+        json_str(out, t->dir);
+        buf_printf(out, ",\"dlc\":%d,\"update_issue\":", t->dlc);
+        json_str(out, t->issue);
+        buf_printf(out, "}");
     }
     buf_printf(out, "]}");
 }
@@ -2016,182 +1834,416 @@ int app_icon(const char *tid, buf_t *out) {
     return 0;
 }
 
-/* Mount and installation are executed on the daemon thread, never inside the
- * HTTP accept callback. The callback only validates and queues one title. */
+/* Only the selected CUSA is registered; the callback merely queues a request. */
 int app_add(const char *tid, char *msg, size_t cap) {
     char root[32];
-    if (!title_id_valid(tid) || find_root(tid, root, sizeof(root))) {
-        snprintf(msg, cap, "Jogo nao encontrado em um HD USB conectado");
+    if (g_restore_running || g_discover_requested || g_activate_request[0] ||
+        !strcmp(g_progress.phase, "activating") || !strcmp(g_progress.phase, "searching")) {
+        snprintf(msg, cap, "Busy restoring, searching, or activating another game");
         return -1;
     }
-    if (installed_internally(tid)) {
-        snprintf(msg, cap, "Jogo instalado internamente: operacao bloqueada");
+    if (find_root(tid, root, sizeof(root))) {
+        snprintf(msg, cap, "%s not found in the organized USB library; search first", tid);
         return -1;
     }
-    if (g_operation_busy || g_mount_requested[0] || g_manual_scan) {
-        snprintf(msg, cap, "Outra operacao ainda esta em andamento");
+    if (installed_internally(tid) || title_running(tid)) {
+        snprintf(msg, cap, "%s is installed internally or currently running", tid);
         return -1;
     }
-    if (title_running(tid)) {
-        snprintf(msg, cap, "Jogo em execucao; feche antes de montar");
-        return -1;
-    }
-    snprintf(g_mount_requested, sizeof(g_mount_requested), "%s", tid);
-    progress_start("queued", "Montagem solicitada pelo painel");
-    snprintf(g_progress.current, sizeof(g_progress.current), "%s", tid);
-    snprintf(msg, cap, "Montagem de %s agendada", tid);
+    snprintf(g_activate_request, sizeof(g_activate_request), "%s", tid);
+    progress_set("queued", "Preparing selected game");
+    snprintf(msg, cap, "Mount queued for %s (game + update + associated DLC metadata)", tid);
     return 0;
 }
 
-static void perform_mount(const char *tid) {
-    char root[32];
-    g_operation_busy = 1;
-    progress_start("activating", "Validando USB e arquivos do jogo");
-    snprintf(g_progress.current, sizeof(g_progress.current), "%s", tid);
-    g_progress.total = 4;
-    title_src_t src = {0};
-    int opened = 0, mounted = 0;
-    if (find_root(tid, root, sizeof(root)) || !is_mountpoint(root)) {
-        snprintf(g_progress.detail, sizeof(g_progress.detail), "HD USB desconectado");
-        goto fail;
+/* Never unmount unknown/foreign layers and never uninstall via Disable. */
+static int write_state_atomic(const char *path, const char *tid) {
+    char tmp[128];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    if (write_file(tmp, tid, strlen(tid), 0666) || rename(tmp, path)) {
+        printf("[state] %s: failed to save marker: %s\n", path, strerror(errno));
+        unlink(tmp);
+        return -1;
     }
-    if (installed_internally(tid) || title_running(tid)) {
-        snprintf(g_progress.detail, sizeof(g_progress.detail), "Instalacao interna ou jogo em execucao");
-        goto fail;
-    }
-    if (src_open(&src, root, tid)) {
-        if (src.app.fd >= 0) src_close(&src);
-        snprintf(g_progress.detail, sizeof(g_progress.detail), "PKG inacessivel ou invalido");
-        goto fail;
-    }
-    opened = 1;
-    if (title_mounts_owned(tid, src.dlc_tids, src.ndlc_tids)) {
-        snprintf(g_progress.detail, sizeof(g_progress.detail), "Montagem de outro aplicativo no destino");
-        goto fail;
-    }
-    g_progress.done = 1;
-    snprintf(g_progress.detail, sizeof(g_progress.detail), "Preparando arquivos auxiliares");
-    pump_events(1);
-    if (place_files(&src)) {
-        snprintf(g_progress.detail, sizeof(g_progress.detail), "Falha preparando arquivos auxiliares");
-        goto fail;
-    }
-    g_progress.done = 2;
-    snprintf(g_progress.detail, sizeof(g_progress.detail), "Montando camadas do jogo");
-    pump_events(1);
-    if (!is_mountpoint(root) || mount_title(&src) || !all_layers_mounted(&src)) {
-        snprintf(g_progress.detail, sizeof(g_progress.detail), "Falha na montagem; confira o log");
-        goto fail;
-    }
-    mounted = 1;
-    g_progress.done = 3;
-    snprintf(g_progress.detail, sizeof(g_progress.detail), "Verificando registro do jogo");
-    pump_events(1);
-    if (!db_is_registered(tid)) {
-        if (g_install_busy) {
-            snprintf(g_progress.detail, sizeof(g_progress.detail), "Registro anterior ainda em andamento");
-            goto fail;
-        }
-        if (g_reg_mode == REG_NONE) {
-            snprintf(g_progress.detail, sizeof(g_progress.detail), "API de registro indisponivel");
-            goto fail;
-        }
-        char ids[1][10];
-        snprintf(ids[0], 10, "%s", tid);
-        install_all(ids, 1);
-        wait_db_quiet(3, 30);
-    }
-    if (!db_is_registered(tid) || register_finish(&src)) {
-        snprintf(g_progress.detail, sizeof(g_progress.detail), "Registro nao confirmado no banco do sistema");
-        goto fail;
-    }
-    if (set_title_active(tid, 1)) {
-        snprintf(g_progress.detail, sizeof(g_progress.detail), "Montado, mas falha ao salvar estado; verifique o log");
-        goto fail;
-    }
-    g_progress.done = g_progress.total;
-    g_progress.ok = 1;
-    g_progress.phase = "complete";
-    snprintf(g_progress.detail, sizeof(g_progress.detail), "%s montado e confirmado", tid);
-    notify("PS4Mount: %s montado", tid);
-    goto done;
-fail:
-    g_progress.failed = 1;
-    g_progress.phase = "error";
-    printf("[manual][mount] %s: %s\n", tid, g_progress.detail);
-    /* Do not delete an existing registration, marker, or unknown layer on failure.
-     * A previously prepared owned layer can be reconciled by the next click. */
-    if (mounted && !db_is_registered(tid) && !g_install_busy) {
-        if (!unmount_title(tid, src.dlc_tids, src.ndlc_tids))
-            printf("[manual][mount] %s: rollback of unregistered mounted layers OK\n", tid);
-        else printf("[manual][mount] %s: unable to roll back owned layers safely\n", tid);
-    } else if (mounted) {
-        printf("[manual][mount] %s: prepared layer remains; operation incomplete\n", tid);
-    }
-    notify("PS4Mount: nao foi possivel montar %s; veja o log", tid);
-done:
-    if (opened) src_close(&src);
-    g_operation_busy = 0;
+    return 0;
 }
 
-/* Desmontar NEVER calls AppUnInstall: the library registration is retained. */
+static int release_owned_layer(const char *tid, const char *kind) {
+    char target[64], hold[PATH_MAX];
+    snprintf(target, sizeof(target), "/user/%s/%s", kind, tid);
+    hold_path(hold, sizeof(hold), kind, tid);
+    if (dead_layer(target)) return -1; /* no force on a stale layer */
+    int count = owned_layer_count(target, hold);
+    if (count < 0 || count > 16) return -1;
+    for (int i = 0; i < count; ++i) {
+        if (top_layer(target, hold) != 1 || unmount(target, 0)) return -1;
+        int remaining = owned_layer_count(target, hold);
+        if (remaining < 0 || remaining >= count - i) return -1;
+    }
+    return owned_layer_count(target, hold) == 0 ? 0 : -1;
+}
+
 int app_remove(const char *tid, char *msg, size_t cap) {
-    if (!title_id_valid(tid) || g_operation_busy || g_mount_requested[0] || g_manual_scan) {
-        snprintf(msg, cap, "ID invalido ou outra operacao em andamento");
+    if (g_restore_running || g_activate_request[0] || g_discover_requested ||
+        !strcmp(g_progress.phase, "activating") || !strcmp(g_progress.phase, "searching")) {
+        snprintf(msg, cap, "Wait until the current operation ends");
         return -1;
     }
     if (title_running(tid)) {
-        snprintf(msg, cap, "Feche o jogo antes de desmontar");
+        snprintf(msg, cap, "Close the game before disabling it");
         return -1;
     }
     char root[32];
     if (find_root(tid, root, sizeof(root))) {
-        snprintf(msg, cap, "HD do jogo desconectado; registro preservado");
+        snprintf(msg, cap, "%s not found on connected USB", tid);
         return -1;
     }
-    title_src_t src = {0};
-    if (src_open(&src, root, tid)) {
-        if (src.app.fd >= 0) src_close(&src);
-        snprintf(msg, cap, "Nao foi possivel ler os metadados do jogo");
+    /* Validate first, then release known app/patch layers without force. */
+    char target[64], hold[PATH_MAX];
+    for (int i = 0; i < 2; i++) {
+        const char *kind = i ? "patch" : "app";
+        snprintf(target, sizeof(target), "/user/%s/%s", kind, tid);
+        hold_path(hold, sizeof(hold), kind, tid);
+        if (dead_layer(target) || owned_layer_count(target, hold) < 0 || top_layer(target, hold) < 0) {
+            snprintf(msg, cap, "Foreign/unreadable %s mount: no change to %s", kind, tid);
+            return -1;
+        }
+    }
+    /* Persist disabled intent BEFORE releasing mounts. An I/O error must not
+     * leave the game unexpectedly active again after the next reboot. */
+    char path[64];
+    snprintf(path, sizeof(path), STATE_DIR "/%s.disabled", tid);
+    if (write_state_atomic(path, tid)) {
+        snprintf(msg, cap, "Could not persist disabled status for %s", tid);
         return -1;
     }
-    g_operation_busy = 1;
-    progress_start("activating", "Desmontando camadas controladas pelo PS4Mount");
-    snprintf(g_progress.current, sizeof(g_progress.current), "%s", tid);
-    g_progress.total = 2;
-    int rc = title_mounts_owned(tid, src.dlc_tids, src.ndlc_tids) ||
-             unmount_title(tid, src.dlc_tids, src.ndlc_tids);
-    g_progress.done = 1;
-    if (!rc) rc = set_title_active(tid, 0);
-    src_close(&src);
-    if (rc) {
-        snprintf(msg, cap, "Montagem externa/conflitante ou falha de desmontagem; nada foi desinstalado");
-        g_progress.phase = "error";
-        g_progress.failed = 1;
-        snprintf(g_progress.detail, sizeof(g_progress.detail), "%s", msg);
-        printf("[manual][unmount] %s: %s\n", tid, msg);
-    } else {
-        snprintf(msg, cap, "%s desmontado; registro na biblioteca preservado", tid);
-        g_progress.done = 2;
-        g_progress.ok = 1;
-        g_progress.phase = "complete";
-        snprintf(g_progress.detail, sizeof(g_progress.detail), "%s", msg);
+    if (release_owned_layer(tid, "patch") || release_owned_layer(tid, "app")) {
+        snprintf(msg, cap, "Could not safely release %s; auto restore disabled, inspect mounts", tid);
+        return -1;
     }
-    g_operation_busy = 0;
-    return rc ? -1 : 0;
+    /* Keep DLC layer on shared /user/addcont/<TID> untouched, as it can be used
+     * by other active games. Disable means no re-mount on the next boot. */
+    snprintf(path, sizeof(path), STATE_DIR "/%s.active", tid);
+    unlink(path);
+    managed_t *m = managed_by(tid, NULL);
+    if (m) m->used = 0;
+    printf("[manual] %s disabled; registration retained, DLC mounts not forced\n", tid);
+    g_catalog_dirty = 1;
+    snprintf(msg, cap, "%s unmounted (registration retained, automatic restore off)", tid);
+    return 0;
 }
 
-/* Manual mounting deliberately excludes the old PKG restore/uninstall workflow.
- * The original restore action called app_remove(), which now only unmounts and
- * therefore would leave installed DB rows pointing at moved-away packages. */
-int app_restore(const char *tid, char *msg, size_t cap) {
-    (void)tid;
-    snprintf(msg, cap, "Restaurar PKGs desativado na base manual: o fluxo original desinstalava o jogo");
-    return -1;
+static int active_status(const char *tid) {
+    char path[64];
+    snprintf(path, sizeof(path), STATE_DIR "/%s.disabled", tid);
+    if (exists(path)) return 0;
+    snprintf(path, sizeof(path), STATE_DIR "/%s.active", tid);
+    if (exists(path)) return 1;
+    /* Existing upstream 0.4.1 source markers are migrated implicitly if they
+     * are STILL valid and registered: the restore itself verifies this. */
+    snprintf(path, sizeof(path), STATE_DIR "/%s.src", tid);
+    return exists(path);
 }
-int app_restored_forget(char *msg, size_t cap) {
-    snprintf(msg, cap, "Restaurar PKGs desativado na base manual");
-    return -1;
+
+static int save_active(const char *tid) {
+    char path[64];
+    snprintf(path, sizeof(path), STATE_DIR "/%s.active", tid);
+    if (write_state_atomic(path, tid)) return -1;
+    snprintf(path, sizeof(path), STATE_DIR "/%s.disabled", tid);
+    unlink(path);
+    return 0;
+}
+
+/* Persisted source marker is a strict path, not a discovery instruction.
+ * Recover only the exact previously registered title. */
+static int restore_one(const char *tid) {
+    char root[32], disabled[64];
+    snprintf(disabled, sizeof(disabled), STATE_DIR "/%s.disabled", tid);
+    if (exists(disabled)) return -1;
+    if (find_root(tid, root, sizeof(root))) {
+        printf("[restore] %s: original USB absent\n", tid);
+        return -1;
+    }
+    title_src_t t = {0};
+    if (src_open(&t, root, tid)) {
+        printf("[restore] %s: missing/unreadable source\n", tid);
+        return -1;
+    }
+    /* No re-register, no metadata write, no search. */
+    int rc = -1;
+    if (!db_snapshot_healthy() || title_state(&t) != 0) {
+        printf("[restore] %s: database/marker/files incomplete. No automatic repair\n", tid);
+    } else if (mount_title(&t) || !title_layers_mounted(&t)) {
+        printf("[restore] %s: mount failed or foreign layer; stopped for this title\n", tid);
+    } else {
+        manage(&t);
+        if (save_active(tid))
+            printf("[restore] %s mounted, but could not save active flag\n", tid);
+        else
+            rc = 0;
+    }
+    src_close(&t);
+    return rc;
+}
+
+/* A disconnected USB must not trigger any per-title validation or a wall of failures.
+ * This preflight only checks actual mounted external devices, never scans PKGs. */
+static int any_external_usb(void) {
+    char root[32];
+    for (int i = 0; i < 10; i++) {
+        if (i < 8) snprintf(root, sizeof(root), "/mnt/usb%d", i);
+        else snprintf(root, sizeof(root), "/mnt/ext%d", i - 8);
+        if (is_mountpoint(root)) return 1;
+    }
+    return 0;
+}
+
+/* Enumerate only persisted registrations, not PKGs in arbitrary subfolders.
+ * Must be run by main AFTER the web socket exists, so the panel can show progress. */
+static int restore_active_games(void) {
+    if (!any_external_usb()) {
+        g_progress = (progress_t){"complete", 0, 0, 0, 0, "", "Connect an external USB drive, then restart PS4Mount"};
+        printf("[restore] SKIPPED: no mounted external USB; no title checks, no registration\n");
+        notify("PS4Mount: external USB not connected. No restoration attempted");
+        return -1; /* distinguish no USB from an empty saved library */
+    }
+    char tids[MAX_TITLES][10];
+    int n = 0;
+    DIR *d = opendir(STATE_DIR);
+    if (d) {
+        struct dirent *e;
+        while ((e = readdir(d)) && n < MAX_TITLES) {
+            size_t len = strlen(e->d_name);
+            if (len != 13 || strcmp(e->d_name + 9, ".src") || strncmp(e->d_name, "CUSA", 4))
+                continue;
+            char tid[10];
+            snprintf(tid, sizeof(tid), "%.9s", e->d_name);
+            int valid = 1;
+            for (int k = 4; k < 9; k++) valid &= tid[k] >= '0' && tid[k] <= '9';
+            if (!valid || !active_status(tid)) continue;
+            snprintf(tids[n++], sizeof(tids[0]), "%s", tid);
+        }
+        closedir(d);
+    }
+    g_progress = (progress_t){"restoring", n, 0, 0, 0, "", "Checking previously active games"};
+    g_restore_running = 1;
+    printf("[restore] BEGIN %d previously registered title(s), no discovery/no registration\n", n);
+    if (n) notify("PS4Mount: restoring %d previously active games...", n);
+    for (int i = 0; i < n; i++) {
+        if (g_stop) {
+            printf("[restore] STOP requested; safe stop between games\n");
+            break;
+        }
+        snprintf(g_progress.current, sizeof(g_progress.current), "%s", tids[i]);
+        progress_set("restoring", "Restoring known mounts; no registration");
+        int rc = restore_one(tids[i]);
+        g_progress.done++;
+        if (rc) g_progress.failed++;
+        else g_progress.ok++;
+        pump_events(1); /* service the progress panel while restoring */
+    }
+    g_restore_running = 0;
+    g_progress.current[0] = 0;
+    progress_set(g_stop ? "error" : "complete", g_stop ? "Restore stopped by user" :
+                 (g_progress.failed ? "Completed with mount failures; see log" : "Previously active games restored"));
+    printf("[restore] FINISHED %d/%d ok=%d failed=%d; NO RE-REGISTRATION\n", g_progress.done,
+           g_progress.total, g_progress.ok, g_progress.failed);
+    if (n) notify("PS4Mount: restore complete: %d/%d OK, %d failure(s)", g_progress.ok, n, g_progress.failed);
+    return n;
+}
+
+static void discover_usb(void) {
+    g_discover_requested = 0;
+    g_scan_abort = 0;
+    if (g_restore_running || g_activate_request[0]) {
+        printf("[manual][scan] busy, search ignored\n");
+        return;
+    }
+    g_progress = (progress_t){"searching", 10, 0, 0, 0, "", "Walking USB subfolders (unknown total)"};
+    printf("[manual][scan] START explicit USB discovery (PKGs may be renamed on same USB)\n");
+    int moved = 0;
+    for (int i = 0; i < 10; ++i) {
+        if (g_scan_abort || g_stop) break;
+        char root[32];
+        if (i < 8) snprintf(root, sizeof(root), "/mnt/usb%d", i);
+        else snprintf(root, sizeof(root), "/mnt/ext%d", i - 8);
+        if (is_mountpoint(root)) {
+            snprintf(g_progress.detail, sizeof(g_progress.detail), "Scanning %s", root);
+            int count = adopt_root_pkgs(root); /* DISCOVERY ONLY, never registers */
+            if (count < 0) g_progress.failed++;
+            else { moved += count; g_progress.ok++; }
+        }
+        g_progress.done++;
+        pump_events(1);
+    }
+    g_progress.total = g_progress.done;
+    g_catalog_dirty = 1;
+    snprintf(g_progress.detail, sizeof(g_progress.detail),
+             "Search finished: %d folders, %d PKGs checked, %d organized",
+             g_scan_folders, g_scan_examined, g_scan_organized);
+    g_progress.phase = (g_scan_abort || g_stop) ? "error" : "complete";
+    if (g_scan_abort || g_stop)
+        snprintf(g_progress.detail, sizeof(g_progress.detail),
+                 "USB disconnected or search interrupted: %d folders, %d PKGs checked", g_scan_folders, g_scan_examined);
+    printf("[manual][scan] %s moved=%d (same USB), NO registration\n",
+           g_scan_abort ? "ABORT" : "DONE", moved);
+    if (g_scan_abort || g_stop)
+        notify("PS4Mount: USB search interrupted; %d PKG(s) organized before interruption", moved);
+    else
+        notify("PS4Mount: USB scan complete. %d PKG(s) organized; select a game to activate", moved);
+}
+
+/* A PS5 title already registered by the system does NOT need another
+ * installer call merely because a former PS4Mount marker is missing/stale.
+ * An explicit Mount may recreate only this title's USB-derived files/links.
+ * Never perform a global registration, a DB write or force an occupied mount. */
+static int hold_link_is(const char *kind, const char *tid, const char *name, const char *expected) {
+    char link[PATH_MAX], actual[PATH_MAX];
+    hold_path(link, sizeof(link), kind, tid);
+    size_t n = strlen(link);
+    snprintf(link + n, sizeof(link) - n, "/%s", name);
+    ssize_t r = readlink(link, actual, sizeof(actual) - 1);
+    if (r <= 0) return 0;
+    actual[r] = 0;
+    return !strcmp(actual, expected);
+}
+
+static int mount_registered_title(title_src_t *t) {
+    const char *tid = t->app.title_id;
+    char root[32];
+    if (find_root(tid, root, sizeof(root)) || strncmp(t->dir, root, strlen(root)) ||
+        t->dir[strlen(root)] != '/') {
+        printf("[manual][mount] %s: disconnected or changed USB source\n", tid);
+        return -1;
+    }
+    if (target_mounts_safe(t)) {
+        printf("[manual][mount] %s: occupied/unreadable mount target; cannot replace another layer\n", tid);
+        return -1;
+    }
+    char pdb[PATH_MAX];
+    snprintf(pdb, sizeof(pdb), "/user/playgo/app/%s/00/d0.pdb", t->app.content_id);
+    int refresh = !marker_matches(tid, t->marker) || !exists(pdb) ||
+                  !hold_link_is("app", tid, "app.pkg", t->app_path) ||
+                  (t->has_patch && !hold_link_is("patch", tid, "patch.pkg", t->patch_path)) ||
+                  !dlc_ready(t);
+    if (refresh) {
+        printf("[manual][mount] %s: existing DB registration, rebuilding USB metadata (no installer)\n", tid);
+        progress_set("activating", "Refreshing metadata and USB links of registered game");
+        if (place_files(t)) {
+            printf("[manual][mount] %s: preparing metadata FAILED\n", tid);
+            return -1;
+        }
+    } else {
+        printf("[manual][mount] %s: existing DB registration, prepared files reusable\n", tid);
+    }
+    progress_set("activating", "Mounting registered game and update");
+    if (mount_title(t) || !title_layers_mounted(t)) {
+        printf("[manual][mount] %s: incomplete/failed filesystem mount\n", tid);
+        return -1;
+    }
+    if (refresh && register_finish(t)) {
+        printf("[manual][mount] %s: saving refreshed title marker FAILED\n", tid);
+        return -1;
+    }
+    if (save_active(tid)) {
+        printf("[manual][mount] %s: saving active state FAILED\n", tid);
+        return -1;
+    }
+    manage(t);
+    printf("[manual][mount] %s: mounted using existing PS5 registration, no ownership marker required\n", tid);
+    return 0;
+}
+
+static void activate_queued(void) {
+    if (!g_activate_request[0]) return;
+    char tid[10], root[32];
+    snprintf(tid, sizeof(tid), "%s", g_activate_request);
+    g_activate_request[0] = 0;
+    g_progress = (progress_t){"activating", 1, 0, 0, 0, "", "Checking selected title"};
+    snprintf(g_progress.current, sizeof(g_progress.current), "%s", tid);
+    printf("[manual][activate] %s START (single-title, no AppInstallAll)\n", tid);
+    /* Resolve targeted call before any staging. */
+    app_install_title_dir_fn single = one_title_install_api();
+    if (find_root(tid, root, sizeof(root))) goto failed;
+    title_src_t t = {0};
+    if (src_open(&t, root, tid)) goto failed;
+    /* An explicit click may re-enable a title removed in an earlier upstream release. */
+    char removed_path[64];
+    snprintf(removed_path, sizeof(removed_path), STATE_DIR "/%s.removed", tid);
+    if (removed(tid)) {
+        printf("[manual][activate] %s explicitly selected; clearing old removed flag\n", tid);
+        unlink(removed_path);
+    }
+    int db_ok = db_snapshot_healthy();
+    int registered = db_ok && db_is_registered(tid);
+    int rc = -1;
+    if (!db_ok) printf("[manual][activate] app.db unreadable/uncertain; NO metadata staged\n");
+    char attempt[64];
+    snprintf(attempt, sizeof(attempt), STATE_DIR "/%s.attempt", tid);
+    if (registered) {
+        /* Any individually selected, already-registered USB game can be mounted,
+         * including titles from 0.4.1 or previously unmounted in this panel. */
+        rc = mount_registered_title(&t);
+    } else if (db_ok && !registered) {
+        if (!single) {
+            printf("[manual][activate] targeted registration API unavailable, no staging\n");
+        } else if (exists(attempt)) {
+            printf("[manual][activate] %s prior interrupted/failed attempt; inspect before retry\n", tid);
+        } else if (!is_mountpoint(root)) {
+            printf("[manual][activate] %s USB source disappeared; NOTHING staged\n", tid);
+        } else if (target_mounts_safe(&t)) {
+            printf("[manual][activate] %s targets not safe; NOTHING staged\n", tid);
+        } else if (write_file(attempt, tid, strlen(tid), 0666)) {
+            printf("[manual][activate] %s cannot persist attempt guard; nothing staged\n", tid);
+        } else {
+            progress_set("activating", "Preparing game, update, and DLC files");
+            if (!register_prepare(&t) && title_layers_mounted(&t)) {
+                progress_set("activating", "Requesting targeted registration");
+                int api_rc = single(tid, "/user/app/", NULL);
+                printf("[manual][activate] %s AppInstallTitleDir rc=0x%08x\n", tid, api_rc);
+                if (api_rc == 0 || (uint32_t)api_rc == 0x80990002u) {
+                    /* Wait for ShellCore, do not write app.db ourselves. */
+                    for (int i = 0; i < 12 && !db_is_registered(tid); i++) pump_events(400);
+                    wait_db_quiet(3, 30);
+                    if (db_snapshot_healthy() && !register_finish(&t) && !save_active(tid)) {
+                        unlink(attempt);
+                        rc = 0;
+                    }
+                }
+            }
+        }
+    } else {
+        printf("[manual][activate] %s: database unreadable; mount postponed\n", tid);
+    }
+    if (!rc)
+        printf("[manual][activate] %s activated: game+update mounted; %d DLC source(s) staged (not independently DB-verified)\n",
+               tid, t.ndlc);
+    src_close(&t);
+    if (rc) goto failed;
+    g_progress.ok = 1;
+    g_progress.done = 1;
+    g_catalog_dirty = 1;
+    progress_set("complete", "Game mounted; DLC database installation not independently verified");
+    notify("PS4Mount: %s mounted (DLC registration requires verification)", tid);
+    return;
+failed:
+    g_progress.failed = 1;
+    g_progress.done = 1;
+    progress_set("error", "Mount failed or title state uncertain. Inspect log before trying again");
+    printf("[manual][activate] %s FAILED; no automatic retry\n", tid);
+    notify("PS4Mount: %s mount FAILED. Check the log", tid);
+}
+
+void app_progress_json(buf_t *out) {
+    buf_printf(out, "{\"phase\":"); json_str(out, g_progress.phase);
+    buf_printf(out, ",\"total\":%d,\"done\":%d,\"ok\":%d,\"failed\":%d,\"current\":",
+               g_progress.total, g_progress.done, g_progress.ok, g_progress.failed);
+    json_str(out, g_progress.current);
+    buf_printf(out, ",\"detail\":"); json_str(out, g_progress.detail);
+    buf_printf(out, ",\"scan_folders\":%d,\"scan_pkgs\":%d,\"scan_organized\":%d,\"scan_path\":",
+               g_scan_folders, g_scan_examined, g_scan_organized);
+    json_str(out, g_scan_location);
+    buf_printf(out, "}");
 }
 
 /* --- settings --- */
@@ -2292,10 +2344,6 @@ static void url_decode(const char *in, size_t len, char *out, size_t n) {
 
 /* body: batch=0|1&batch_size=N&dlc=0|1&paths=<folders, one per line> (form encoded). */
 int app_config_set(const char *body, char *msg, size_t cap) {
-    if (g_operation_busy || g_manual_scan || g_mount_requested[0]) {
-        snprintf(msg, cap, "Configuracoes bloqueadas durante operacao");
-        return -1;
-    }
     config_t c = g_cfg;
     char value[1200], why[160] = "";
     for (const char *p = body; p && *p;) {
@@ -2344,63 +2392,12 @@ int app_config_set(const char *body, char *msg, size_t cap) {
     g_cfg = c;
     config_save();
     printf("[config] saved: batch=%d batch_size=%d dlc=%d folders=%d\n", c.batch, c.batch_size, c.dlc, c.npaths);
-    g_next_scan = 0;
     snprintf(msg, cap, "Settings saved");
     return 0;
 }
 
-/* --- Media tab shortcut (category 65536 + deeplinkUri, as other PS5 web panels) --- */
-
-#define PANEL_ID "PMNT00001"
-static const char k_panel_param[] =
-    "{\n"
-    "    \"titleId\": \"" PANEL_ID "\",\n"
-    "    \"applicationCategoryType\": 65536,\n"
-    "    \"deeplinkUri\": \"http://127.0.0.1:8770/\",\n"
-    "    \"localizedParameters\": {\n"
-    "        \"defaultLanguage\": \"en-US\",\n"
-    "        \"en-US\": {\n"
-    "            \"titleName\": \"PS4Mount\"\n"
-    "        }\n"
-    "    }\n"
-    "}\n";
-
-static int same_file(const char *path, const void *data, size_t size) {
-    struct stat st;
-    if (stat(path, &st) || (size_t)st.st_size != size)
-        return 0;
-    int fd = open(path, O_RDONLY);
-    if (fd < 0)
-        return 0;
-    uint8_t *tmp = malloc(size);
-    int same = tmp && read(fd, tmp, size) == (ssize_t)size && !memcmp(tmp, data, size);
-    free(tmp);
-    close(fd);
-    return same;
-}
-
-/* Installs the shortcut when it is missing or out of date (deleting it from the
- * home screen makes the next start install it again). */
-static void install_panel_shortcut(void) {
-    const char *param = "/user/app/" PANEL_ID "/sce_sys/param.json", *icon = "/user/app/" PANEL_ID "/sce_sys/icon0.png";
-    /* sceAppInstUtilAppExists reports 0 for this shortcut on fw 13.20; app.db is reliable */
-    int present = db_is_registered(PANEL_ID), rc = 0;
-    int same_param = same_file(param, k_panel_param, sizeof(k_panel_param) - 1);
-    int same_icon = same_file(icon, icon0_png, sizeof(icon0_png));
-    printf("[panel] exists rc=0x%08x present=%d param=%d icon=%d\n", rc, present, same_param, same_icon);
-    if (!rc && present && same_param && same_icon)
-        return;
-    mkdirs("/user/app/" PANEL_ID "/sce_sys", 0755);
-    if (write_file(param, k_panel_param, sizeof(k_panel_param) - 1, 0644) ||
-        write_file(icon, icon0_png, sizeof(icon0_png), 0644)) {
-        printf("[panel] shortcut files: %s\n", strerror(errno));
-        return;
-    }
-    rc = register_call(PANEL_ID);
-    printf("[panel] shortcut install rc=0x%08x\n", rc);
-    if (!rc)
-        notify("PS4Mount added to the Media tab");
-}
+/* Panel remains available at http://<PS5 IP>:8770. Existing Media-tab
+ * shortcut stays installed if present; NEVER run a global installer at boot. */
 
 static int single_instance(void) {
     int s = socket(AF_INET, SOCK_STREAM, 0);
@@ -2507,21 +2504,23 @@ int main(void) {
     setvbuf(stdout, NULL, _IOLBF, 0);
     config_load();
     signal(SIGPIPE, SIG_IGN);
-    check_firmware();
-    if (g_reg_mode != REG_NONE)
-        install_panel_shortcut(); /* registered by the system like the games */
+    /* Do not run AppInstallAll merely to create a panel shortcut. Use :8770. */
     g_web = web_listen();
-    if (g_reg_mode == REG_ALL)
-        notify(g_web >= 0 ? VERSION " running. Panel in the Media tab or http://<PS5 IP>:8770"
-                          : VERSION " running (panel unavailable)");
-    else if (g_reg_mode == REG_TITLEDIR)
-        notify(VERSION " running (firmware %s: games are added one at a time). Panel in the Media tab or "
-                       "http://<PS5 IP>:8770",
-               g_fw_text);
-    else
-        notify(VERSION ": firmware %s is not supported yet. To protect the system database, no games are added.",
-               g_fw_text);
+    printf("[main] " VERSION " panel %s (http://<PS5 IP>:8770)\n", g_web >= 0 ? "ready" : "unavailable");
     unlink(STATE_DIR "/stop");
+    unsigned last_usb_mask = 0;
+    time_t last_usb_check = 0;
+    int restore_on_reconnect = 0;
+    int previously_active = restore_active_games();
+    for (int i = 0; i < 10; ++i) {
+        char root[32];
+        if (i < 8) snprintf(root, sizeof(root), "/mnt/usb%d", i);
+        else snprintf(root, sizeof(root), "/mnt/ext%d", i - 8);
+        if (is_mountpoint(root)) last_usb_mask |= 1u << i;
+    }
+    last_usb_check = time(NULL);
+    if (!previously_active)
+        notify(g_web >= 0 ? VERSION " ready. Panel at http://<PS5 IP>:8770" : VERSION " panel unavailable");
     for (;;) {
         if (g_stop || exists(STATE_DIR "/stop")) {
             unlink(STATE_DIR "/stop");
@@ -2549,17 +2548,34 @@ int main(void) {
             end_delete_window();
         if (g_deleting && time(NULL) - g_deleting_since > 600)
             end_delete_window(); /* the line of the screen change was missed */
-        if (g_mount_requested[0] && !g_deleting && !g_operation_busy) {
-            char tid[10];
-            snprintf(tid, sizeof(tid), "%s", g_mount_requested);
-            g_mount_requested[0] = 0;
-            perform_mount(tid);
-            continue;
-        }
-        if (time(NULL) >= g_next_scan && !g_deleting && !g_operation_busy) {
-            scan_all(); /* USB metadata always; full discovery only on explicit click */
-            g_next_scan = time(NULL) + SCAN_SECONDS;
-        }
+        if (!g_deleting && g_discover_requested) discover_usb();
+        if (!g_deleting && g_activate_request[0]) activate_queued();
         pump_events(1000);
+        /* Lightweight USB polling: no PKG walk. Restore only known, active titles
+         * after a genuinely new storage mount appears. Never discover automatically. */
+        time_t now = time(NULL);
+        if (now - last_usb_check >= 10) {
+            last_usb_check = now;
+            unsigned mask = 0;
+            for (int i = 0; i < 10; ++i) {
+                char root[32];
+                if (i < 8) snprintf(root, sizeof(root), "/mnt/usb%d", i);
+                else snprintf(root, sizeof(root), "/mnt/ext%d", i - 8);
+                if (is_mountpoint(root)) mask |= 1u << i;
+            }
+            if (mask != last_usb_mask) {
+                printf("[usb] mount set changed 0x%03x -> 0x%03x\n", last_usb_mask, mask);
+                g_catalog_dirty = 1;
+                if (mask & ~last_usb_mask) restore_on_reconnect = 1;
+                last_usb_mask = mask;
+            }
+        }
+        if (restore_on_reconnect && !g_deleting && !g_discover_requested &&
+            !g_activate_request[0] && !g_restore_running &&
+            strcmp(g_progress.phase, "searching") && strcmp(g_progress.phase, "activating")) {
+            restore_on_reconnect = 0;
+            printf("[usb] newly connected storage; restoring previously active titles only\n");
+            restore_active_games();
+        }
     }
 }

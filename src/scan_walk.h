@@ -12,8 +12,14 @@ typedef int (*pkg_dir_visitor)(const char *dir, void *context);
  * When stop_on_first is set, returns on the first positive callback result.
  * Otherwise returns the sum of all nonnegative callback results. */
 typedef void (*pkg_dir_progress)(const char *path, void *context);
+typedef int (*pkg_scan_cancel)(void *context);
 /* Identical traversal with a callback for each directory considered.
  * Used only for displaying live progress during explicit USB search. */
+/* Cancellation is checked between directories, not during reads of a single PKG. */
+int walk_pkg_dirs_progress_cancel(const char *start, const char *library, pkg_dir_visitor visit,
+                                  void *context, int stop_on_first,
+                                  pkg_dir_progress progress, void *progress_context,
+                                  pkg_scan_cancel cancel, void *cancel_context);
 int walk_pkg_dirs_progress(const char *start, const char *library, pkg_dir_visitor visit,
                            void *context, int stop_on_first,
                            pkg_dir_progress progress, void *progress_context);

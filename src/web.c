@@ -150,7 +150,7 @@ void web_serve(int listen_fd) {
         app_games_json(&b);
         reply(fd, "200 OK", "application/json; charset=utf-8", b.data, b.len);
         buf_free(&b);
-    } else if (!strcmp(path, "/api/progress")) {
+    } else if (!strcmp(path, "/api/progress") && !post) {
         buf_t b = {0};
         app_progress_json(&b);
         reply(fd, "200 OK", "application/json; charset=utf-8", b.data, b.len);
@@ -178,19 +178,8 @@ void web_serve(int listen_fd) {
             json_msg(fd, !rc, msg);
         }
     } else if (post && !strcmp(path, "/api/rescan")) {
-        int rc = app_rescan(msg, sizeof(msg));
-        json_msg(fd, !rc, msg);
-    } else if (post && !strncmp(path, "/api/restore", 12) && (path[12] == 0 || path[12] == '?')) {
-        int rc;
-        if (strstr(path, "title_id="))
-            rc = title_param(path, tid) ? (snprintf(msg, sizeof(msg), "invalid title_id"), -1)
-                                        : app_restore(tid, msg, sizeof(msg));
-        else
-            rc = app_restore(NULL, msg, sizeof(msg));
-        json_msg(fd, !rc, msg);
-    } else if (post && !strcmp(path, "/api/restored/forget")) {
-        int rc = app_restored_forget(msg, sizeof(msg));
-        json_msg(fd, !rc, msg);
+        int rc = app_rescan();
+        json_msg(fd, !rc, rc ? "Busy: wait until current job finishes" : "Search queued; only manual discovery, no registration");
     } else if (!strcmp(path, "/api/config") && !post) {
         buf_t b = {0};
         app_config_json(&b);

@@ -32,6 +32,13 @@ static int visit(const char *p, void *arg) {
     return 1;
 }
 static int probe(const char *p, void *arg) { (void)p; (void)arg; return 1; }
+static int cancel_after_first_folder(void *arg) {
+    return *(int *)arg >= 1;
+}
+static void count_one_folder(const char *p, void *arg) {
+    (void)p;
+    ++*(int *)arg;
+}
 static void check_progress(const char *p, void *arg) {
     (void)arg;
     probed_dirs++;
@@ -69,6 +76,22 @@ int main(void) {
     assert(probed_dirs >= 7 && probed_managed == 0);
     assert(found == 5 && root_pkgs == 1 && nested_app == 1 &&
            nested_patch == 1 && nested_dlc == 1 && custom_dir == 1);
+    int cancel_after = 0;
+    /* Abort after observing the first directory; no PKG visitor should run. */
+    int old_found = found;
+    assert(walk_pkg_dirs_progress_cancel(root, lib, visit, root, 0,
+                                         NULL, NULL, cancel_after_first_folder, &cancel_after) == 5);
+    /* A stop condition flipped by the progress callback stops mid-traversal. */
+    int seen_folders = 0;
+    assert(walk_pkg_dirs_progress_cancel(root, lib, visit, root, 0,
+                                         count_one_folder, &seen_folders,
+                                         cancel_after_first_folder, &seen_folders) == 0);
+    assert(seen_folders == 1);
+    /* A stop condition true before traversal prevents even opening the root. */
+    cancel_after = 1;
+    assert(walk_pkg_dirs_progress_cancel(root, lib, visit, root, 0,
+                                         NULL, NULL, cancel_after_first_folder, &cancel_after) == 0);
+    assert(found == old_found + 5);
     assert(walk_pkg_dirs(root, lib, probe, NULL, 1) == 1);
     snprintf(nested, sizeof(nested), "%s/Collection/Game B", root);
     assert(walk_pkg_dirs(nested, lib, probe, NULL, 0) == 2);

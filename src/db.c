@@ -22,6 +22,7 @@
 static char (*g_titles)[10];
 static int g_ntitles, g_cap;
 static time_t g_read_at;
+static time_t g_last_good;
 static int g_read_ok;
 
 static void refresh(void) {
@@ -59,6 +60,7 @@ static void refresh(void) {
     if (ok) { /* a read that met a write in progress keeps the last list */
         g_ntitles = n;
         g_read_ok = 1;
+        g_last_good = time(NULL);
     }
 }
 
@@ -68,4 +70,12 @@ int db_is_registered(const char *title_id) {
         if (!strcmp(g_titles[i], title_id))
             return 1;
     return 0;
+}
+
+/* An inconclusive database read must not be mistaken for an absent game.
+ * The cache is useful for display, but permission to register requires a
+ * recent successful SQLite read. */
+int db_snapshot_healthy(void) {
+    refresh();
+    return g_read_ok && g_last_good && time(NULL) - g_last_good <= 2;
 }
