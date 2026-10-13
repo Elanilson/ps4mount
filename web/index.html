@@ -1,9 +1,9 @@
 <!doctype html>
-<html lang="pt-BR">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PS4Mount USB Organizer</title>
+<title>PS4Mount</title>
 <style>
 :root{--bg:#0e1116;--panel:#171b22;--line:#262c36;--fg:#e8eaed;--muted:#97a0ab;--accent:#3d7bfd;--ok:#2f9e57;--warn:#c98b1f;--bad:#c2453b}
 *{box-sizing:border-box}
@@ -25,7 +25,7 @@ main{padding:20px;max-width:1400px;margin:0 auto}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;overflow:hidden;display:flex;flex-direction:column}
 .art{aspect-ratio:1/1;background:#0b0d11 center/cover no-repeat;position:relative}
 .badge{position:absolute;left:10px;top:10px;padding:3px 10px;border-radius:999px;font-size:12px;font-weight:600;background:#000a}
-.b-ready{background:var(--ok)}.b-running{background:var(--accent)}.b-removed{background:#555}.b-internal{background:var(--warn)}.b-pending{background:var(--warn)}
+.b-ready{background:var(--ok)}.b-running{background:var(--accent)}.b-removed{background:#555}.b-internal{background:var(--warn)}.b-pending{background:var(--warn)}.b-duplicate{background:#555}
 .info{padding:12px 14px;display:flex;flex-direction:column;gap:4px;flex:1}
 .name{font-weight:600;font-size:16px}
 .meta{color:var(--muted);font-size:13px;word-break:break-all}
@@ -33,14 +33,15 @@ main{padding:20px;max-width:1400px;margin:0 auto}
 .empty{color:var(--muted);text-align:center;padding:60px 0}
 .warn{color:#f0c060;font-size:13px;background:#3a2e12;border:1px solid #5c4818;border-radius:8px;padding:6px 8px;margin-top:4px}
 dialog{background:var(--panel);color:var(--fg);border:1px solid var(--line);border-radius:12px;max-width:min(900px,95vw);width:900px}
-#orgconfirm{border:1px solid var(--line);border-radius:8px;padding:12px;margin:12px 0}
-#orgconfirm label{display:block;margin:8px 0}
-#orgconfirm input[type=text]{max-width:100%;background:#0b0d11;color:var(--fg);border:1px solid #647084;border-radius:8px;padding:9px 12px;font:inherit}
-#orgstatus{white-space:pre-wrap;overflow-wrap:anywhere;font-weight:600}
-#orgstatus.error{color:#ffaaa1}
-#orgstatus.success{color:#99e8b8}
 dialog::backdrop{background:#000a}
 pre{white-space:pre-wrap;font-size:12px;max-height:60vh;overflow:auto;background:#0b0d11;padding:12px;border-radius:8px}
+form.settings{display:flex;flex-direction:column;gap:14px}
+form.settings label{display:flex;flex-direction:column;gap:6px}
+form.settings label.check{flex-direction:row;align-items:center;gap:10px}
+form.settings textarea,form.settings input[type=number]{background:#0b0d11;color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:8px 10px;font:inherit}
+form.settings textarea{min-height:90px;resize:vertical;font-family:ui-monospace,Consolas,monospace}
+form.settings .hint{color:var(--muted);font-size:13px}
+form.settings .row{display:flex;gap:8px;justify-content:flex-end}
 #toast{position:fixed;right:20px;bottom:20px;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px 16px;display:none;max-width:420px}
 </style>
 </head>
@@ -49,116 +50,45 @@ pre{white-space:pre-wrap;font-size:12px;max-height:60vh;overflow:auto;background
   <h1>PS4Mount <small id="ver"></small></h1>
   <div class="bar">
     <input id="q" type="search" placeholder="Search game or CUSA">
-    <button id="batchpreview" class="primary">Iniciar registro em grupos de 5</button>
-    <button id="rescan" class="primary">Sincronizar (somente leitura)</button>
-    <button id="queueplan">Consultar fila (somente leitura)</button>
-    <button id="settingsbtn">Configurações</button>
-    <button id="dlcbtn">DLCs (leitura)</button>
-    <button id="recoverbtn">USB recovery</button>
+    <button id="rescan" class="primary">Scan for games</button>
+    <button id="settingsbtn">Settings</button>
     <button id="logbtn">Log</button>
     <button id="stop" class="danger">Stop</button>
   </div>
 </header>
 <main>
   <div class="summary" id="summary"></div>
-  <section aria-label="Sincronizacao" style="margin-bottom:14px;padding:12px;border:1px solid var(--line);border-radius:10px;background:var(--panel)">
-    <div id="syncstatus" role="status" aria-live="polite">Aguardando leitura dos jogos...</div>
-    <progress id="syncprogress" value="0" max="1" style="width:100%;height:16px"></progress>
-    <div class="warn" style="margin-top:8px">Sincronizacao SOMENTE LEITURA. Registrar jogos exige clicar em "Iniciar registro em grupos de 5", conferir a fila e confirmar. Abrir/reabrir a pagina nunca inicia registros.</div>
-  </section>
-  <section aria-label="Progresso do registro em grupos" style="margin-bottom:14px;padding:12px;border:1px solid var(--line);border-radius:10px;background:var(--panel)">
-    <strong>Registro manual por grupos</strong>
-    <div id="grouplive" role="status" aria-live="polite">Nenhum grupo em execucao.</div>
-    <progress id="groupprogress" value="0" max="1" style="width:100%;height:16px"></progress>
-  </section>
   <div class="grid" id="grid"></div>
-  <div class="empty" id="empty" hidden>No games found. PKGs may be in any subfolder; rescan to refresh.</div>
+  <div class="empty" id="empty" hidden>No PS4 games found. Put the .pkg files (game and update) in the root of a USB drive.</div>
 </main>
-<dialog id="settingsdlg"><h3>Configurações — integração original 0.4.0</h3>
-  <p class="warn">Pastas, catalogo de DLC e previsualizacao sao configuraveis. O registro e exclusivamente manual por grupos FIXOS de 5, com um POST e verificacao individual do banco de dados. A instalacao de DLC continua desativada.</p>
-  <label>Pastas para buscar PKGs, uma por linha ("/" = HD inteiro). Pastas PS4/ps4 sempre incluídas:<br>
-    <textarea id="scanpaths" rows="5" style="width:100%;background:#10131a;color:#eee"></textarea></label><br>
-  <label><input id="groupenabled" type="checkbox"> Agrupar títulos na PRÉVIA (nao altera a fila manual de 5)</label><br>
-  <label>Tamanho do grupo na prévia: <select id="groupsize"><option>1</option><option>2</option><option>3</option><option>4</option><option selected>5</option></select></label><br>
-  <label><input id="dlccatalog" type="checkbox"> Indexar DLCs (SOMENTE LEITURA; sem instalar)</label>
-  <pre id="settingsstatus"></pre><div class="bar"><button id="savesettings" class="primary">Salvar preferências</button><button id="closesettings">Fechar</button></div>
-</dialog>
-<dialog id="dlcdlg"><h3>DLCs encontrados (somente leitura)</h3><pre id="dlcinfo"></pre>
-  <p class="warn">Associação por CUSA e SERVICE_ID_ADDCONT_ADD_n do original 0.4.0. Nenhum DLC será movido, montado ou instalado nesta versão.</p>
-  <form method="dialog"><button>Fechar</button></form>
-</dialog>
-<dialog id="batchdlg"><h3>Registro manual — grupos de 5 jogos</h3>
-  <p>Uma confirmacao inicia toda a fila elegivel, em grupos de 5. Entre grupos, o ELF confere os 5 titulos no app.db, suas montagens RO e marcadores. Depois aguarda 10 segundos.</p>
-  <select id="batchlimit" hidden><option value="5" selected>5</option></select>
-  <pre id="batchitems"></pre>
-  <p class="warn">EXPERIMENTAL: os registros foram validados em poucos jogos. A cada jogo:
-    organiza no USB (se necessario), verifica PKGs e banco de dados, monta em RO,
-    libera a montagem e executa registro INDIVIDUAL. Os arquivos podem ser movidos
-    e metadados internos do PS5 serao escritos. Nunca usa AppInstallAll ou SQL WRITE.
-    Para no PRIMEIRO erro/resultado desconhecido; nao repete POST. Uma execucao pode afetar dezenas de jogos, sem rollback automatico. Nao desconecte o HD.
-    A fila roda NO ELF: a pagina pode ser fechada, mas NAO pare o ELF nem desconecte USB.</p>
-  <label><input id="batchbackup" type="checkbox"> Tenho backup do PS5 e dos PKGs fora do USB; nao ha jogos em execucao.</label>
-  <progress id="batchprogress" value="0" max="1" style="width:100%;height:16px"></progress>
-  <pre id="batchstatus" role="status" aria-live="polite"></pre>
-  <div class="bar"><button id="batchstart" class="danger" disabled>CONFIRMAR e iniciar registro dos grupos</button>
-    <button id="batchclose">Fechar</button></div>
-</dialog>
-<dialog id="queuedlg"><h3>Fila planejada (sem registro)</h3><pre id="queueinfo" style="max-height:55vh;overflow:auto"></pre><form method="dialog"><button>Fechar</button></form></dialog>
-<dialog id="auditdlg"><h3>Auditoria de montagem (somente leitura)</h3><pre id="auditinfo"></pre><p class="warn">A verificacao nao monta, libera ou registra. Se houver camada estrangeira, nao a remova sem identificar a origem.</p><form method="dialog"><button>Fechar</button></form></dialog>
+<dialog id="setdlg"><h3>Settings</h3>
+<form class="settings" id="setform">
+  <label>Folders to search for pkgs (one per line, relative to each drive)
+    <textarea id="s-paths" spellcheck="false"></textarea>
+    <span class="hint">/ is the root of the drive. Games are moved into the ps4 folder, so it cannot be used here.</span>
+  </label>
+  <label class="check"><input type="checkbox" id="s-batch"> Add new games in groups</label>
+  <label>Games per group
+    <input type="number" id="s-size" min="1" max="50">
+    <span class="hint">Smaller groups are gentler on the system when many games are added at once.</span>
+  </label>
+  <label class="check"><input type="checkbox" id="s-dlc"> Install add-ons (DLC)</label>
+  <div class="row"><button type="button" id="s-cancel">Cancel</button><button class="primary" type="submit">Save</button></div>
+</form></dialog>
 <dialog id="logdlg"><h3>Log</h3><pre id="log"></pre><form method="dialog"><button>Close</button></form></dialog>
-<dialog id="launchdlg"><h3>Fase 4A — verificação de montagem e registro (somente leitura)</h3><pre id="launchinfo"></pre><p class="warn">Este teste NÃO monta, registra ou executa jogos. Resultado positivo valida somente os requisitos locais verificados; a integração com o sistema ainda precisa de auditoria.</p><form method="dialog"><button>Close</button></form></dialog>
-<dialog id="probedlg"><h3>Teste de montagem real — SOMENTE LEITURA</h3>
-  <pre id="probeinfo"></pre>
-  <p class="warn">Risco experimental: altera TEMPORARIAMENTE os pontos de montagem /user/app e /user/patch para UM jogo. Nunca registra, instala ou inicia jogos. Faça backup dos dados importantes. Remova a montagem pelo painel ANTES de parar o PS4Mount.</p>
-  <pre id="probestatus"></pre>
-  <div class="bar"><button id="probeaction" class="danger">Executar montagem</button><form method="dialog"><button>Close (does NOT release mount)</button></form></div>
-</dialog>
-<dialog id="registerdlg"><h3>Tentar registro individual (EXPERIMENTAL)</h3>
-  <pre id="registerinfo"></pre>
-  <p class="warn">Esta operacao ESCREVE metadados e licencas no armazenamento interno do PS5 e no USB. Exige backup do PS5 e dos PKGs. NUNCA usa AppInstallAll. Se a API individual estiver indisponivel no firmware, a operacao sera BLOQUEADA antes das escritas. Depois de registrado, tente iniciar o jogo pela tela inicial.</p>
-  <label><input id="registerbackup" type="checkbox"> Tenho backup e aceito o risco para somente este CUSA</label>
-  <pre id="registerstatus"></pre>
-  <div class="bar"><button id="registeraction" class="danger">Registrar APENAS este jogo</button><form method="dialog"><button>Fechar</button></form></div>
-</dialog>
-<dialog id="autodlg"><h3>Preparação automática — um jogo</h3>
-  <pre id="autostatus" role="status" aria-live="polite"></pre>
-  <p class="warn">A ação movimenta app.pkg/patch.pkg SOMENTE do CUSA escolhido, dentro do mesmo HD USB. Mantenha um backup externo e não desconecte o USB. NÃO monta nem registra jogos.</p>
-  <form method="dialog"><button id="autoclose">Fechar</button></form>
-</dialog>
-<dialog id="plandlg"><h3>Organization preview — review before writing</h3>
-  <pre id="planinfo"></pre>
-  <p class="warn">USB FILES MAY BE MOVED by the explicit action below. Keep a backup OUTSIDE this USB drive. Do NOT unplug it during a move. NO games will be registered or launched.</p>
-  <div id="orgconfirm" hidden>
-    <strong>Confirmar organização de UM jogo</strong>
-    <label for="orgtid">Digite exatamente <strong id="orgexpected"></strong>:</label>
-    <input id="orgtid" type="text" inputmode="text" maxlength="9" autocapitalize="characters" autocomplete="off" spellcheck="false" placeholder="CUSA00000">
-    <label><input id="orgbackup" type="checkbox"> Confirmei que existe um backup dos dois PKGs fora deste HD.</label>
-    <p id="orgstatus" role="status" aria-live="polite"></p>
-  </div>
-  <div class="bar">
-    <button id="organizebtn" class="danger" type="button">Organize THIS title on USB</button>
-    <button id="organizeconfirmbtn" class="danger" type="button" hidden>Confirmar movimentação de UM jogo</button>
-    <form method="dialog"><button id="plancancel" type="submit">Cancel / Close</button></form>
-  </div>
-</dialog>
 <div id="toast"></div>
 <script>
-var games = [], busy = {}, currentPlan = null, currentProbe = null, currentRegister = null, organizing = false;
-var autoBusy = false;
-var batchBusy = false, batchCandidates = [], batchCompleted = 0, batchToken = "";
-var labels = {ready: 'Ready', running: 'Running', internal: 'Installed on console', discovered: 'Discovered', queued: 'Queued', conflict: 'Conflict'};
-var registrationEnabled = false; // safety-preview build: must remain false
+var games = [], busy = {};
+var labels = {ready: 'Ready', running: 'Running', removed: 'Not in library', internal: 'Installed on console', pending: 'Adding', duplicate: 'On another drive'};
 
 function $(id) { return document.getElementById(id); }
 function esc(s) { return String(s).replace(/[&<>"']/g, function (c) { return '&#' + c.charCodeAt(0) + ';'; }); }
 function gb(n) { return (n / 1073741824).toFixed(n >= 10737418240 ? 0 : 1) + ' GB'; }
 function toast(msg) { var t = $('toast'); t.textContent = msg; t.style.display = 'block'; clearTimeout(toast.t); toast.t = setTimeout(function () { t.style.display = 'none'; }, 4000); }
 
-function api(path, method, token) {
-  var options = {method: method || 'GET', cache: 'no-store'};
-  if (token) options.headers = {'X-PS4Mount-Token': token};
-  return fetch(path, options).then(function (r) {
-    return r.json().then(function (j) { if (!r.ok) throw new Error(j.error || j.message || r.status); return j; });
+function api(path, method) {
+  return fetch(path, {method: method || 'GET', cache: 'no-store'}).then(function (r) {
+    return r.json().then(function (j) { if (!r.ok) throw new Error(j.error || r.status); return j; });
   });
 }
 
@@ -169,518 +99,71 @@ function render() {
     if (q && (g.name + ' ' + g.title_id).toLowerCase().indexOf(q) < 0) return;
     shown++;
     var act = '';
-    if (g.state === 'discovered') act = '';
-    else if (g.state === 'ready') act = '<button disabled>Registered</button>';
-    else if (g.state === 'conflict') act = '<button disabled>Manual review required</button>';
-    else if (g.state === 'queued') act = '<button disabled>Queued</button>';
-    if (g.state !== 'conflict' && g.state !== 'internal' && g.state !== 'queued')
-      act = '<button data-a="auto-prepare" data-t="' + g.title_id + '" class="primary">Preparar automaticamente (1 jogo)</button>' + act;
-    if (g.state !== 'conflict' && g.state !== 'internal' && g.state !== 'queued')
-      act = '<button data-a="plan" data-t="' + g.title_id + '">Preview folder plan</button>' + act;
-    if (g.state !== 'conflict' && g.state !== 'internal' && g.state !== 'queued')
-      act = '<button data-a="probe" data-t="' + g.title_id + '">Temporary read-only mount (Phase 4B)</button>' + act;
-    if (g.title_id === 'CUSA06886' && g.state !== 'conflict' && g.state !== 'internal' && g.state !== 'queued' && g.state !== 'ready')
-      act = '<button data-a="register" data-t="' + g.title_id + '">Tentar registro individual (apos montagem)</button>' + act;
-    if (g.state !== 'conflict' && g.state !== 'internal' && g.state !== 'queued')
-      act = '<button data-a="mount-audit" data-t="' + g.title_id + '">Auditar montagem (leitura)</button>' + act;
-    if (g.state !== 'conflict' && g.state !== 'internal' && g.state !== 'queued')
-      act = '<button data-a="launch-check" data-t="' + g.title_id + '">Check launch prerequisites (READ-ONLY)</button>' + act;
+    if (g.state === 'removed') act = '<button class="primary" data-a="mount" data-t="' + g.title_id + '">Add to library</button>';
+    else if (g.state === 'ready') act = '<button class="danger" data-a="unmount" data-t="' + g.title_id + '">Remove from library</button>';
+    else if (g.state === 'running') act = '<button disabled>Close the game to remove it</button>';
     if (busy[g.title_id]) act = '<button disabled>Please wait…</button>';
     html += '<div class="card"><div class="art" style="background-image:url(/icon/' + g.title_id + ')">' +
       '<span class="badge b-' + g.state + '">' + esc(labels[g.state] || g.state) + '</span></div>' +
       '<div class="info"><div class="name">' + esc(g.name) + '</div>' +
-      '<div class="meta">' + g.title_id + ' · v' + esc(g.version) + (g.has_patch ? ' · update v' + esc(g.update_version) : '') +
-      (g.update_candidates > 1 ? ' · ' + g.update_candidates + ' updates found' : '') +
-      (g.verified_duplicate_updates ? ' · ' + g.verified_duplicate_updates + ' exact duplicate(s)' : '') +
-      (g.unverified_duplicate_updates ? ' · ' + g.unverified_duplicate_updates + ' unverified duplicate(s)' : '') +
-      (g.suspicious_updates ? ' · ' + g.suspicious_updates + ' possible DLC(s)' : '') +
-      ' · ' + gb(g.size) + '</div>' +
+      '<div class="meta">' + g.title_id + ' · v' + esc(g.version) + (g.has_patch ? ' (with update)' : '') +
+        (g.dlc ? ' · ' + g.dlc + ' add-on' + (g.dlc > 1 ? 's' : '') : '') + ' · ' + gb(g.size) + '</div>' +
       '<div class="meta">' + esc(g.source) + (g.mount ? ' · mounted ' + g.mount : '') + '</div>' +
-      (g.update_source ? '<div class="meta">Selected update: ' + esc(g.update_source) + '</div>' : '') +
       (g.update_issue ? '<div class="warn">' + esc(g.update_issue) + '</div>' : '') + '</div>' +
       '<div class="actions">' + act + '</div></div>';
   });
   $('grid').innerHTML = html;
   $('empty').hidden = games.length > 0;
-  var s = '<span>PHASE 4M · grupos manuais de 5, conferidos no banco</span><span>' + games.length + ' game(s)</span>';
+  var s = '<span>' + games.length + ' game(s)</span>';
   for (var k in counts) s += '<span>' + esc(labels[k] || k) + ': ' + counts[k] + '</span>';
   $('summary').innerHTML = s;
 }
 
 function load() {
-  api('/api/games').then(function (j) { games = j.games; $('ver').textContent = j.version; render(); if (j.fault) toast('Registration blocked after error; see log'); })
+  api('/api/games').then(function (j) { games = j.games; $('ver').textContent = j.version; render(); })
     .catch(function (e) { toast('Could not read the list: ' + e.message); });
 }
 
 $('grid').addEventListener('click', function (e) {
   var b = e.target.closest('button[data-a]');
   if (!b) return;
-  if (autoBusy || batchBusy) return toast('Ha uma operacao em andamento. Aguarde a conclusao.');
   var tid = b.getAttribute('data-t'), a = b.getAttribute('data-a');
-  if (a === 'mount-audit') {
-    api('/api/mount-audit?title_id=' + tid).then(function (x) {
-      $('auditinfo').textContent = ['CUSA: ' + x.title_id,
-        'Atualizacao presente: ' + x.has_patch,
-        '/user/app: ' + x.app_layer,
-        '/user/patch: ' + x.patch_layer,
-        'Acao de patch: ' + x.patch_action,
-        'Montagem de teste permitida: ' + x.safe_to_probe,
-        'Status: ' + x.message,
-        'Nenhuma montagem foi alterada.'].join('\n');
-      $('auditdlg').showModal();
-    }).catch(function(e) { toast('Falha na auditoria: ' + e.message); });
-    return;
-  }
-  if (a === 'auto-prepare') return autoPrepareOne(tid);
-  if (a === 'probe') {
-    busy[tid] = 1; render();
-    api('/api/probe-preview?title_id=' + tid).then(function (p) {
-      currentProbe = p;
-      $('probestatus').textContent = '';
-      var action = p.can_release ? 'release' : p.can_mount ? 'mount' : null;
-      $('probeinfo').textContent = [
-        'CUSA: ' + p.title_id,
-        'Status: ' + (action || 'BLOCKED'),
-        'Reason: ' + p.message,
-        'Single attempt this session: ' + (p.attempted ? 'already used' : 'available'),
-        'Mode: READ-ONLY nullfs, one title only',
-        'NO registration, NO AppInstallAll, NO DB modification, NO launch.'
-      ].join('\n');
-      $('probeaction').disabled = !action || !p.confirm_token;
-      $('probeaction').textContent = p.can_release ? 'Liberar montagem deste jogo' : 'Montar SOMENTE este jogo (RO)';
-      $('probedlg').showModal();
-    }).catch(function (err) { toast('Mount preview failed: ' + err.message); })
-      .then(function () { delete busy[tid]; render(); });
-    return;
-  }
-  if (a === 'register') {
-    busy[tid] = 1; render();
-    api('/api/register-preview?title_id=' + tid).then(function (p) {
-      currentRegister = p;
-      $('registerinfo').textContent = 'CUSA: ' + p.title_id + '\nMount verified and released: ' + p.verified_mount +
-        '\nIndividual API available: ' + p.single_api_available + '\nStatus: ' + p.message;
-      $('registerbackup').checked = false;
-      $('registerstatus').textContent = '';
-      $('registeraction').disabled = !p.can_register || !p.confirm_token;
-      $('registerdlg').showModal();
-    }).catch(function (e) { toast('Targeted register preview failed: ' + e.message); })
-      .then(function () { delete busy[tid]; render(); });
-    return;
-  }
-  if (a === 'launch-check') {
-    busy[tid] = 1; render();
-    api('/api/launch-check?title_id=' + tid).then(function (p) {
-      var lines = [
-        'Game: ' + p.title_id,
-        'Preflight: ' + (p.preflight_passed ? 'PASSED (local checks only)' : 'BLOCKED'),
-        'Reason: ' + p.message,
-        'Filesystem detail: ' + (p.detail || '(none)'),
-        'PS5 app database: ' + p.database_status,
-        '', 'Source PKG: ' + p.app_path,
-        'Update PKG: ' + (p.update_path || '(none)'),
-        'Expected app: ' + (p.expected_app_path || '(not known yet)'),
-        'Expected update: ' + (p.expected_update_path || '(none)'),
-        'PROPOSED app mount: ' + p.proposed_app_mount,
-        'PROPOSED patch mount: ' + (p.proposed_patch_mount || '(none)'),
-        '', 'Read-only checks:'
-      ];
-      Object.keys(p.checks).forEach(function (key) {
-        lines.push('  ' + (p.checks[key] ? '[OK] ' : '[BLOCKED/NOT CHECKED] ') + key);
-      });
-      lines.push('', 'NO GAME WAS MOUNTED, REGISTERED, OR LAUNCHED.');
-      $('launchinfo').textContent = lines.join('\n');
-      $('launchdlg').showModal();
-    }).catch(function (err) { toast('Launch preflight failed: ' + err.message); })
-      .then(function () { delete busy[tid]; render(); });
-    return;
-  }
-  if (a === 'plan') {
-    busy[tid] = 1; render();
-    api('/api/plan?title_id=' + tid).then(function (p) {
-      $('planinfo').textContent = [
-        'Game: ' + p.title_id,
-        'Base source: ' + p.app_source,
-        'Base destination: ' + p.app_destination,
-        'Move base: ' + (p.move_base ? 'yes' : 'no — already in place'),
-        'Update source: ' + (p.update_source || '(none)'),
-        'Update destination: ' + (p.update_destination || '(none)'),
-        'Move update: ' + (p.move_update ? 'yes' : 'no'),
-        'New directories required: ' + (p.create_folders ? 'yes' : 'no'),
-        '', 'PREVIEW ONLY: NO FILES CHANGED YET. REGISTRATION LOCKED.'
-      ].join('\n');
-      currentPlan = p;
-      organizing = false;
-      $('orgconfirm').hidden = true;
-      $('orgtid').value = '';
-      $('orgbackup').checked = false;
-      $('orgstatus').textContent = '';
-      $('orgstatus').className = '';
-      $('orgexpected').textContent = p.title_id;
-      $('organizebtn').hidden = false;
-      $('organizebtn').disabled = !p.confirm_token || (!p.move_base && !p.move_update);
-      $('organizeconfirmbtn').hidden = true;
-      $('organizeconfirmbtn').disabled = false;
-      $('plancancel').disabled = false;
-      $('plandlg').showModal();
-    }).catch(function (err) { toast('Plan blocked: ' + err.message); })
-      .then(function () { delete busy[tid]; render(); });
-    return;
-  }
   if (a === 'unmount' && !confirm('Remove ' + tid + ' from the library? The pkg stays on the USB drive.')) return;
   busy[tid] = 1; render();
   api('/api/' + a + '?title_id=' + tid, 'POST').then(function (j) { toast(j.message); })
     .catch(function (err) { toast('Error: ' + err.message); })
     .then(function () { delete busy[tid]; load(); });
 });
-/* Explicitly selected ONE CUSA -> plan -> one protected rename transaction ->
- * scan -> read-only preflight.  Never run at startup, never enumerate/move
- * every title, never install, register or mount automatically. A failed/lost
- * response is terminal: do NOT retry a possibly-completed transaction. */
-function autoSetStatus(text) { $('autostatus').textContent = text; }
-function autoWaitCatalog(tid, plan, attempt) {
-  return api('/api/games').then(function (data) {
-    var item = (data.games || []).find(function (g) { return g.title_id === tid; });
-    var ready = item && item.source === plan.app_destination &&
-      (!plan.move_update || item.update_source === plan.update_destination);
-    if (ready) { games = data.games; render(); return item; }
-    if (attempt >= 14) throw new Error('Movimentação confirmada, mas o catálogo ainda não atualizou. Confira o log e faça um único Scan for games. Não repita a movimentação.');
-    return new Promise(function (resolve) { setTimeout(resolve, 1800); }).then(function () {
-      return autoWaitCatalog(tid, plan, attempt + 1);
-    });
-  });
-}
-function autoPrepareOne(tid) {
-  if (autoBusy) return;
-  autoBusy = true;
-  busy[tid] = 1;
-  render();
-  $('autoclose').disabled = true;
-  autoSetStatus('CUSA: ' + tid + '\nVerificando os arquivos e preparando o plano...');
-  $('autodlg').showModal();
-  var plan, didMove = false;
-  api('/api/plan?title_id=' + tid).then(function (p) {
-    if (p.title_id !== tid || !p.confirm_token) throw new Error('Plano inválido ou sem autorização; nenhum arquivo modificado.');
-    plan = p;
-    if (!p.move_base && !p.move_update) {
-      autoSetStatus('CUSA: ' + tid + '\nPKGs já estão organizados; verificando requisitos...');
-      return null;
-    }
-    autoSetStatus('CUSA: ' + tid + '\nMovimentando somente este jogo. Não desconecte o HD...');
-    /* POST exactly once. Backend uses the existing single-use nonce + journal. */
-    return api('/api/organize?title_id=' + tid, 'POST', p.confirm_token).then(function (r) {
-      didMove = true;
-      autoSetStatus('CUSA: ' + tid + '\n' + r.message + '\nAtualizando a lista automaticamente...');
-      return api('/api/rescan', 'POST').then(function () { return autoWaitCatalog(tid, p, 0); });
-    });
-  }).then(function () {
-    return api('/api/launch-check?title_id=' + tid);
-  }).then(function (check) {
-    autoSetStatus('CUSA: ' + tid + '\nOrganização: ' + (didMove ? 'CONCLUÍDA' : 'JÁ ESTAVA PRONTA') +
-      '\nVerificação: ' + (check.preflight_passed ? 'PREFLIGHT-PASS' : 'BLOCKED') +
-      '\nMotivo: ' + check.message +
-      '\n\nNenhum jogo registrado ou iniciado. Montagem continua sendo um teste separado.');
-  }).catch(function (e) {
-    autoSetStatus('CUSA: ' + tid + '\nPROCESSO NÃO CONFIRMADO: ' + e.message +
-      '\n\nNÃO tente novamente. Consulte o log e USB recovery antes de qualquer outra movimentação.');
-  }).then(function () {
-    autoBusy = false;
-    delete busy[tid];
-    $('autoclose').disabled = false;
-    load();
-  });
-}
-// Phase 4H: the ELF owns the queue. The page only reviews, starts once,
-// and polls read-only status. Reopening the browser never repeats a POST.
-function batchLog(line) {
-  $('batchstatus').textContent += line + '\n';
-  $('batchstatus').scrollTop = $('batchstatus').scrollHeight;
-}
-function batchDisplay(s) {
-  batchBusy = !!s.running;
-  var result = 'Estado: ' + s.phase + ' | Etapa: ' + (s.group_phase || '-') +
-    '\nGrupo: ' + (s.group_index || 0) + '/' + (s.group_total || 0) +
-    '\nRegistrados: ' + s.registered + ' / ' + s.count +
-    '\nProcessados: ' + s.processed + ' / ' + s.count +
-    '\nCUSA atual: ' + (s.current || '-') +
-    (s.wait_seconds > 0 ? '\nIntervalo antes do proximo grupo: ' + s.wait_seconds + 's' : '') +
-    '\n' + (s.message || '') +
-    (s.previous_batch_unresolved ? '\nBLOQUEADO: lote anterior ' + s.legacy_batch_phase + ': ' + s.legacy_batch_message : '');
-  var total = Math.max(1, s.count || 0), done = Math.min(total, s.processed || 0);
-  $('batchprogress').max = total; $('batchprogress').value = done;
-  $('groupprogress').max = total; $('groupprogress').value = done;
-  $('grouplive').textContent = result;
-  $('batchstatus').textContent = result;
-  $('batchstart').disabled = batchBusy || !batchToken || !$('batchbackup').checked;
-  $('batchbackup').disabled = batchBusy;
-  $('batchlimit').disabled = batchBusy;
-  $('batchpreview').disabled = false;
-  // Browser never starts automatically; the daemon keeps executing the ONE confirmed POST.
-  $('batchclose').disabled = false;
-}
-function batchRefresh() {
-  return api('/api/batch-status').then(function (s) {
-    batchDisplay(s);
-    if (s.running && s.processed !== batchCompleted) { batchCompleted = s.processed; load(); }
-    if (s.phase === 'completed' && s.processed !== batchCompleted) { batchCompleted=s.processed; load(); }
-    return s;
-  });
-}
-function batchSelect() {
-  if (autoBusy) return toast('Outra operacao ja esta em andamento');
-  $('batchdlg').showModal();
-  batchRefresh().then(function (s) {
-    if (s.running || s.phase === 'failed' || s.phase === 'interrupted') {
-      $('batchitems').textContent = (s.titles || []).join('\n') || 'Estado anterior requer inspecao';
-      return;
-    }
-    batchReview();
-  }).catch(function (e) { batchLog('Erro consultando ELF: ' + e.message); });
-}
-function batchReview() {
-  if (batchBusy || autoBusy) return;
-  batchToken = '';
-  batchCandidates = [];
-  $('batchstart').disabled = true;
-  $('batchitems').textContent = 'Consultando lista e elegibilidade no ELF...';
-  $('batchstatus').textContent = '';
-  $('batchbackup').checked = false;
-  var limit = $('batchlimit').value;
-  api('/api/batch-preview?limit=' + limit).then(function (plan) {
-    batchCandidates = plan.games || [];
-    batchToken = plan.can_start ? plan.confirm_token : '';
-    $('batchitems').textContent = batchCandidates.length ? batchCandidates.map(function (g,i) {
-      return (i+1) + '. ' + g.name + ' (' + g.title_id + ') — ' + gb(g.size);
-    }).join('\n') : 'Nenhum jogo elegivel';
-    if (!plan.can_start) batchLog('BLOQUEADO: ' + plan.message);
-    $('batchstart').disabled = !batchToken || !$('batchbackup').checked;
-  }).catch(function (e) { batchLog('Erro de previa: ' + e.message); });
-}
-$('batchpreview').onclick = batchSelect;
-$('batchlimit').onchange = batchReview;
-$('batchbackup').onchange = function () {
-  $('batchstart').disabled = batchBusy || !this.checked || !batchToken;
-};
-$('batchclose').onclick = function () { $('batchdlg').close(); };
-$('batchstart').onclick = function () {
-  if (batchBusy || autoBusy || !$('batchbackup').checked || !batchToken || !batchCandidates.length) return;
-  var limit = $('batchlimit').value, token = batchToken;
-  batchToken = ''; // Never auto-repeat a lost response.
-  $('batchstart').disabled = true;
-  $('batchlimit').disabled = true;
-  batchLog('Enviando UMA solicitacao para todos os grupos de 5...');
-  api('/api/batch-start?limit=' + limit,'POST',token).then(function (j) {
-    batchBusy = true;
-    batchLog(j.message + '\nPode sair da pagina. Nao pare o ELF ou desligue o PS5.');
-    return batchRefresh();
-  }).catch(function (e) {
-    batchLog('Inicio nao confirmado: ' + e.message +
-      '. Consulte o STATUS antes de qualquer nova tentativa; NUNCA repita este POST.');
-    return batchRefresh();
-  });
-};
-// Poll even when the dialog is closed. This never changes console data.
-setInterval(function () { batchRefresh().catch(function () {}); }, 2500);
-batchRefresh().catch(function () {});
-$('autodlg').addEventListener('cancel', function (event) { if (autoBusy) event.preventDefault(); });
-$('probeaction').onclick = function () {
-  if (!currentProbe || !currentProbe.confirm_token) return;
-  var p = currentProbe, tid = p.title_id;
-  var action = p.can_release ? 'release' : p.can_mount ? 'mount' : null;
-  if (!action) return;
-  currentProbe = null; // single POST; NEVER auto retry on a lost response
-  $('probeaction').disabled = true;
-  $('probestatus').textContent = action === 'mount' ? 'Tentando montar CUSA ' + tid + '... aguarde' : 'Liberando montagem...';
-  api('/api/probe-' + action + '?title_id=' + tid, 'POST', p.confirm_token).then(function (j) {
-    $('probestatus').textContent = 'SUCESSO: ' + j.message +
-      (action === 'mount' ? '\n\nAgora feche e abra esta janela novamente para LIBERAR a montagem antes de registrar.' :
-         '\n\nMontagem liberada. Agora use "Tentar registro individual" neste CUSA.');
-  }).catch(function (e) {
-    $('probestatus').textContent = 'FALHA/ESTADO DESCONHECIDO: ' + e.message +
-      '\n\nNAO repita cegamente. Confira o log e as montagens.';
-  }).then(function () { load(); });
-};
-$('registeraction').onclick = function () {
-  var p = currentRegister;
-  if (!p || !p.can_register || !p.confirm_token || !$('registerbackup').checked) {
-    $('registerstatus').textContent = 'Confirme backup e abra uma previa valida antes de continuar.';
-    return;
-  }
-  currentRegister = null; // one authorization, no retries
-  $('registeraction').disabled = true;
-  $('registerstatus').textContent = 'Registrando SOMENTE ' + p.title_id +
-    '... Nao desligue console nem USB. Aguarde a resposta.';
-  api('/api/register-one?title_id=' + p.title_id, 'POST', p.confirm_token).then(function (j) {
-    $('registerstatus').textContent = 'RESULTADO: ' + j.message +
-      '\nSe registrado, tente o jogo na tela inicial do PS5.';
-  }).catch(function (e) {
-    $('registerstatus').textContent = 'FALHA/ESTADO DESCONHECIDO: ' + e.message +
-      '\nNAO repita nem limpe manualmente os arquivos. Verifique o log.';
-  }).then(function () { load(); });
-};
-/* Native browser prompt()/confirm() may be suppressed while an HTML <dialog>
- * is open (especially on TV/mobile clients). Use an in-dialog, two-stage
- * explicit confirmation with visible results. NEVER retry a USB move blindly. */
-$('organizebtn').onclick = function () {
-  if (organizing) return;
-  if (!currentPlan || !currentPlan.confirm_token) return toast('Preview expired. Open a new plan.');
-  if (!currentPlan.move_base && !currentPlan.move_update) return toast('Files are already in place');
-  $('orgconfirm').hidden = false;
-  $('organizebtn').hidden = true;
-  $('organizeconfirmbtn').hidden = false;
-  $('orgstatus').textContent = 'Type the exact CUSA and confirm the backup, then press Confirm.';
-  $('orgtid').focus();
-};
-$('organizeconfirmbtn').onclick = function () {
-  if (organizing) return;
-  if (!currentPlan || !currentPlan.confirm_token) {
-    $('orgstatus').textContent = 'Confirmation token missing. Close and preview again.';
-    return;
-  }
-  var p = currentPlan, tid = p.title_id;
-  if ($('orgtid').value.trim() !== tid) {
-    $('orgstatus').className = 'error';
-    $('orgstatus').textContent = 'CUSA does not match. Enter ' + tid + ' exactly.';
-    return;
-  }
-  if (!$('orgbackup').checked) {
-    $('orgstatus').className = 'error';
-    $('orgstatus').textContent = 'Backup confirmation is required before a USB move.';
-    return;
-  }
-  organizing = true;
-  busy[tid] = 1;
-  $('orgstatus').className = '';
-  $('orgstatus').textContent = 'Sending the ONE-title USB move request. Do NOT unplug the drive or close this window.';
-  $('organizeconfirmbtn').disabled = true;
-  $('orgtid').disabled = true;
-  $('orgbackup').disabled = true;
-  $('plancancel').disabled = true;
-  api('/api/organize?title_id=' + tid, 'POST', p.confirm_token).then(function (j) {
-    /* Acknowledged success means the back end has finished and removed the journal. */
-    currentPlan = null;
-    $('orgstatus').className = 'success';
-    $('orgstatus').textContent = 'SUCCESS: ' + j.message + '\n\nClose this window and click Scan for games.';
-    $('organizeconfirmbtn').hidden = true;
-  }).catch(function (e) {
-    /* A lost HTTP response may follow a completed/partial operation. Do NOT retry. */
-    currentPlan = null;
-    $('orgstatus').className = 'error';
-    $('orgstatus').textContent = 'NOT CONFIRMED: ' + e.message +
-      '\n\nDo NOT retry. Inspect USB recovery and the log before any other write.';
-    $('organizeconfirmbtn').hidden = true;
-  }).then(function () {
-    organizing = false;
-    delete busy[tid];
-    $('plancancel').disabled = false;
-    $('orgtid').disabled = false;
-    $('orgbackup').disabled = false;
-    render();
-  });
-};
-$('plandlg').addEventListener('cancel', function (event) {
-  if (organizing) event.preventDefault();
-});
-$('plandlg').addEventListener('close', function () {
-  if (!organizing) currentPlan = null;
-});
-$('recoverbtn').onclick = function () {
-  if (batchBusy) return toast('Lote em andamento');
-  var usb = prompt('Inspect USB drive number (0–7). Your games were found on 0:', '0');
-  if (!/^[0-7]$/.test(usb || '')) return;
-  api('/api/recovery?usb=' + usb).then(function (j) {
-    if (!j.pending) return alert(j.message);
-    if (!j.confirm_token) return alert('Recovery unavailable: read log and do not move files manually');
-    var text = 'ROLLBACK USB' + usb;
-    var typed = prompt(j.message + '\nType ' + text + ' to restore the original paths. The operation will REFUSE overwrites.');
-    if (typed !== text || !confirm('Attempt rollback on USB' + usb + '?')) return;
-    api('/api/rollback?usb=' + usb, 'POST', j.confirm_token).then(function (r) {
-      alert(r.message); setTimeout(load, 1500);
-    }).catch(function (e) { alert('Rollback NOT completed: ' + e.message + '\nInspect the journal and filesystem before proceeding.'); });
-  }).catch(function (e) { alert('Cannot inspect recovery: ' + e.message); });
-};
 $('q').addEventListener('input', render);
-function syncRefresh() {
-  return api('/api/sync-status').then(function(s) {
-    var total = Math.max(1, s.total || 0);
-    $('syncprogress').max = total;
-    $('syncprogress').value = Math.min(total, s.processed || 0);
-    $('syncstatus').textContent = (s.phase === 'completed' ? 'Finalizado: ' :
-      s.phase === 'verifying' ? 'Lendo jogos: ' : 'Aguardando USB: ') +
-      (s.processed || 0) + '/' + (s.total || 0) +
-      ' | Elegiveis: ' + (s.eligible || 0) +
-      ' | Ja registrados: ' + (s.registered || 0) +
-      ' | Bloqueados: ' + ((s.blocked || 0)+(s.unknown || 0));
-    $('rescan').disabled = s.phase === 'verifying' || batchBusy;
-    return s;
-  }).catch(function(e) { $('syncstatus').textContent = 'Erro consultando status: ' + e.message; });
-}
-$('queueplan').onclick = function () {
-  api('/api/registration-plan').then(function (p) {
-    var lines = ['PLANEJAMENTO (SOMENTE LEITURA)',
-      'Fase: ' + p.phase, 'Jogos encontrados: ' + p.total,
-      'Elegiveis pendentes: ' + p.eligible,
-      'Registrados: ' + p.registered, 'Bloqueados: ' + p.blocked,
-      'Estado desconhecido: ' + p.unknown,
-      'Registro automatico: DESATIVADO',
-      'Lote anterior exige inspecao: ' + p.previous_batch_unresolved,
-      'Teste isolado: ' + p.single_title_test,
-      '', 'Nenhum CUSA desta lista sera registrado automaticamente.',
-      '', 'Pendentes:'];
-    (p.games || []).forEach(function (g, i) {
-      lines.push((i + 1) + '/' + p.games.length + ' - ' + g.title_id +
-                 ' - ' + g.name + (g.has_patch ? ' [update]' : ' [base only]'));
-    });
-    $('queueinfo').textContent = lines.join('\n');
-    $('queuedlg').showModal();
-  }).catch(function (e) { toast('Nao foi possivel consultar a fila: ' + e.message); });
-};
-$('rescan').onclick = function () {
-  if (batchBusy) return toast('Lote em andamento');
-  $('rescan').disabled = true;
-  $('syncstatus').textContent = 'Solicitando nova leitura dos PKGs...';
-  api('/api/rescan', 'POST').then(function(j) { toast('Sincronizacao solicitada (nao registra jogos)'); })
-    .catch(function(e) { toast('Erro: ' + e.message); $('rescan').disabled = false; });
-};
-setInterval(syncRefresh, 1000);
-syncRefresh();
+$('rescan').onclick = function () { api('/api/rescan', 'POST').then(function (j) { toast(j.message); setTimeout(load, 3000); }); };
 $('logbtn').onclick = function () { api('/api/log').then(function (j) { $('log').textContent = j.log; $('logdlg').showModal(); }); };
+$('settingsbtn').onclick = function () {
+  api('/api/config').then(function (c) {
+    $('s-paths').value = c.paths.join('\n');
+    $('s-batch').checked = c.batch;
+    $('s-size').value = c.batch_size;
+    $('s-dlc').checked = c.dlc;
+    $('s-size').disabled = !c.batch;
+    $('setdlg').showModal();
+  }).catch(function (e) { toast('Could not read the settings: ' + e.message); });
+};
+$('s-batch').onchange = function () { $('s-size').disabled = !this.checked; };
+$('s-cancel').onclick = function () { $('setdlg').close(); };
+$('setform').onsubmit = function (e) {
+  e.preventDefault();
+  var body = 'batch=' + ($('s-batch').checked ? 1 : 0) + '&batch_size=' + encodeURIComponent($('s-size').value) +
+    '&dlc=' + ($('s-dlc').checked ? 1 : 0) + '&paths=' + encodeURIComponent($('s-paths').value);
+  fetch('/api/config', {method: 'POST', cache: 'no-store', headers: {'Content-Type': 'application/x-www-form-urlencoded'}, body: body})
+    .then(function (r) { return r.json(); })
+    .then(function (j) { toast(j.message || j.error); if (j.ok) $('setdlg').close(); })
+    .catch(function (err) { toast('Error: ' + err.message); });
+};
 $('stop').onclick = function () {
-  if (batchBusy) return toast('Lote em andamento: nao pare o daemon durante uma escrita.');
   if (!confirm('Stop PS4Mount? The games stay unavailable until it is loaded again.')) return;
   api('/api/stop', 'POST').then(function (j) { toast(j.message); });
 };
 load();
 setInterval(load, 5000);
-
-// Phase 4L: Upstream settings and DLC metadata, no automatic mutation.
-$('settingsbtn').onclick=function(){
-  api('/api/settings').then(function(c){
-    $('scanpaths').value=(c.paths||['/']).join('\n');
-    $('groupenabled').checked=!!c.group_preview;
-    $('groupsize').value=String(c.group_size||5);
-    $('dlccatalog').checked=!!c.dlc_catalog;
-    $('settingsstatus').textContent='O registro em grupo e a instalacao de DLC continuam desativados.';
-    $('settingsdlg').showModal();
-  }).catch(function(e){toast(e.message);});
-};
-$('closesettings').onclick=function(){$('settingsdlg').close();};
-$('savesettings').onclick=function(){
-  var data='paths='+encodeURIComponent($('scanpaths').value)+'&group_preview='+($('groupenabled').checked?'1':'0')+
-    '&group_size='+encodeURIComponent($('groupsize').value)+'&dlc_catalog='+($('dlccatalog').checked?'1':'0');
-  $('savesettings').disabled=true;
-  fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:data}).then(function(r){
-    return r.json().then(function(j){if(!r.ok)throw Error(j.error||'Erro');return j;});
-  }).then(function(j){$('settingsstatus').textContent=j.message;}).catch(function(e){$('settingsstatus').textContent='Erro: '+e.message;}).then(function(){$('savesettings').disabled=false;});
-};
-$('dlcbtn').onclick=function(){
-  api('/api/dlcs').then(function(d){
-    var lines=['DLCs indexados: '+d.indexed,'Associados a jogos: '+d.matched,'Aguardando jogo: '+d.waiting,
-      'Acima do limite do catalogo: '+d.overflow,'Instalados por esta versao: 0',''];
-    (d.samples||[]).forEach(function(a){lines.push((a.game||'AGUARDANDO')+'  '+a.addon_id+'  '+a.kind+'  '+a.content_id);});
-    $('dlcinfo').textContent=lines.join('\n');
-    $('dlcdlg').showModal();
-  }).catch(function(e){toast(e.message);});
-};
 </script>
 </body>
 </html>

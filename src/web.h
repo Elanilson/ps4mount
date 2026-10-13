@@ -9,39 +9,16 @@
 
 /* Implemented by main.c for the web panel. */
 void app_games_json(buf_t *out);
-int app_plan_json(const char *tid, buf_t *out);
-int app_launch_check_json(const char *tid, buf_t *out);
-int app_probe_preview_json(const char *tid, buf_t *out);
-int app_probe_mount(const char *tid, const char *nonce, char *msg, size_t cap);
-int app_probe_release(const char *tid, const char *nonce, char *msg, size_t cap);
-int app_register_preview_json(const char *tid, buf_t *out);
-int app_register_one(const char *tid, const char *nonce, char *msg, size_t cap);
-int app_organize(const char *tid, const char *nonce, char *msg, size_t cap);
-int app_recovery_json(int usb, buf_t *out);
-int app_rollback(int usb, const char *nonce, char *msg, size_t cap);
 int app_add(const char *tid, char *msg, size_t cap);
 int app_remove(const char *tid, char *msg, size_t cap);
 void app_rescan(void);
 void app_stop(void);
+void app_config_json(buf_t *out);
+/* body: form-encoded settings; 0 when saved, msg says why not. */
+int app_config_set(const char *body, char *msg, size_t cap);
 /* Fills an icon0.png for tid; 0 on success. */
 int app_icon(const char *tid, buf_t *out);
 
 int web_listen(void);
 /* Serves one connection on the listening socket. */
 void web_serve(int listen_fd);
-
-/* Phase 4H: daemon-owned sequential queue, not browser-controlled. */
-int app_batch_preview_json(int limit, buf_t *out);
-int app_batch_start(int limit,const char *token,char *msg,size_t cap);
-void app_batch_status_json(buf_t *out);
-int app_batch_active(void);
-
-/* Safe catalog synchronization status; GET-only. */
-void app_sync_status_json(buf_t *out);
-void app_registration_plan_json(buf_t *out);
-int app_mount_audit_json(const char *tid, buf_t *out);
-
-/* PS4Mount 0.4.0 merge: metadata/settings ONLY; no bulk registration. */
-void app_settings_json(buf_t *out);
-int app_settings_set(const char *body, char *msg, size_t cap);
-void app_dlcs_json(buf_t *out);

@@ -14,10 +14,6 @@
 
 static int unwrap_key3(pkg_t *pkg);
 
-/* PKG entry metadata (icons, SFO, PlayGo, licences) should not request
- * unbounded allocations from corrupt/untrusted package headers. */
-#define MAX_METADATA_ENTRY_SIZE (32u * 1024u * 1024u)
-
 static uint32_t be32(const uint8_t *p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
 static uint64_t be64(const uint8_t *p) { return (uint64_t)be32(p) << 32 | be32(p + 4); }
 
@@ -114,8 +110,7 @@ uint8_t *pkg_entry(pkg_t *pkg, uint32_t id, size_t *len) {
         pkg_entry_t *e = &pkg->entries[i];
         if (e->id != id)
             continue;
-        if (e->size > MAX_METADATA_ENTRY_SIZE) return NULL;
-        size_t padded = ((size_t)e->size + 15u) & ~(size_t)15u;
+        size_t padded = (e->size + 15u) & ~15u;
         uint8_t *buf = malloc(padded + 1);
         if (!buf || read_at(pkg->fd, buf, padded, e->offset)) {
             free(buf);
@@ -143,28 +138,20 @@ static uint32_t le32(const uint8_t *p) { return (uint32_t)p[0] | (uint32_t)p[1] 
 static uint16_t le16(const uint8_t *p) { return (uint16_t)(p[0] | p[1] << 8); }
 
 int sfo_parse(const uint8_t *d, size_t len, sfo_t *out) {
-    if (!out) return -1;
     memset(out, 0, sizeof(*out));
-    if (!d || len < 20 || le32(d) != 0x46535000) return -1;
-    size_t ko = le32(d + 8), dof = le32(d + 12);
-    uint32_t n = le32(d + 16);
-    if (n > 128 || n > (len - 20) / 16 || ko >= len || dof >= len) return -1;
-    for (uint32_t i = 0; i < n; i++) {
-        const uint8_t *ent = d + 20 + (size_t)i * 16;
-        size_t kof = le16(ent), vof = le32(ent + 12);
-        uint16_t fmt = le16(ent + 2);
-        size_t ln = le32(ent + 4);
-        if (kof >= len - ko || vof >= len - dof) return -1;
-        size_t key_off = ko + kof, val_off = dof + vof;
-        if (ln > len - val_off) return -1;
-        const char *key = (const char *)(d + key_off);
-        const char *terminator = memchr(key, 0, len - key_off);
-        if (!terminator || (size_t)(terminator - key) >= sizeof(out->items[0].key)) return -1;
+    if (len < 20 || le32(d) != 0x46535000)
+        return -1;
+    uint32_t ko = le32(d + 8), dof = le32(d + 12), n = le32(d + 16);
+    for (uint32_t i = 0; i < n && out->count < 128; i++) {
+        const uint8_t *ent = d + 20 + i * 16;
+        if ((size_t)(ent - d) + 16 > len)
+            return -1;
+        uint16_t kof = le16(ent), fmt = le16(ent + 2);
+        uint32_t ln = le32(ent + 4), vof = le32(ent + 12);
         sfo_item_t *it = &out->items[out->count++];
-        memcpy(it->key, key, (size_t)(terminator - key));
-        const uint8_t *v = d + val_off;
+        strncpy(it->key, (const char *)d + ko + kof, sizeof(it->key) - 1);
+        const uint8_t *v = d + dof + vof;
         if (fmt == 0x404) {
-            if (ln < 4) return -1;
             it->is_int = 1;
             it->ival = le32(v);
         } else {
