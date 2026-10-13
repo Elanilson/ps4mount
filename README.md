@@ -1,3 +1,24 @@
+# PS4Mount 0.5.9 — Fila automatica no ELF (Phase 4H)
+
+**Base:** PS4Mount 0.5.8, mantendo o mesmo `app_plan_json` / `app_organize` / `app_probe_mount` / `app_probe_release` / `app_register_one`, com registro INDIVIDUAL por `sceAppInstUtilAppInstallTitleDir`. Nenhuma API global foi reativada.
+
+## Objetivo
+
+Na 0.5.8, fechar o navegador interrompia o `for` do JavaScript no meio do lote. A partir da 0.5.9 o painel apenas envia **UMA** solicitacao com nonce para iniciar; uma maquina de estados no `src/main.c` processa o restante dentro do ELF. O painel pode ser fechado e reaberto para consultar `/api/batch-status`; isso NAO fecha/para o ELF. **Se o ELF ou PS5 parar, o processamento para e NAO reinicia automaticamente.** O ultimo lote incompleto e marcado `interrupted` e novas escritas automaticas sao bloqueadas ate inspecao manual.
+
+- Escolha `3` (recomendado para primeiro teste) ou `5` (somente depois de validar tres jogos). Nao ha opcoes de 10/147.
+- Server seleciona no maximo 3 ou 5 CUSAs elegiveis, ordenados por tamanho e CUSA. Jogos registrados e conflitos/suspeitas sao ignorados. A pre-visualizacao informa cada nome e CUSA; confirme com backup.
+- Para cada jogo: plano+nonce -> USB organizar apenas se necessario -> reindexar -> preflight -> RO mount+nonce -> release+nonce -> registro individual+nonce -> conferir app.db/RO. So entao passa ao seguinte.
+- Um erro causa parada definitiva do lote. Sem retry, sem AppInstallAll, sem SQLite WRITE e sem executar automaticamente jogos.
+- Progresso e fases persistidos atomicamente em `/data/ps4mount/batch-v1.state` (NAO inclui tokens); um reboot nunca refaz mutacoes incertas.
+- Enquanto roda, o servidor rejeita outras chamadas POST no painel, inclusive `stop`. Nao desconecte USB, nao encerre ELF, nao inicie outro jogo ate terminar. A fila nao executa novas fases se detectar jogo gerenciado rodando ou montado RW.
+
+**Procedimento:** compile pelo GitHub Actions, inicie o ELF, abra painel na porta 8770, clique `Automatizar jogos (ELF)`, selecione 3, leia a lista, confirme backup, clique `Iniciar lote no ELF` UMA VEZ. Aguarde `Estado: completed`, com `Registrados neste lote: 3 / 3`. Pode sair da pagina e retornar, mas nao desligar PS5 ou encerrar ELF. Se `failed` ou `interrupted`, NAO tente novo lote; envie log e inspecione app.db, USB journal e mountpoints. Depois de validar um lote inteiro de 3 e jogos no home screen, pode escolher 5 com novo preview.
+
+**Validacao:** `bash tests/run_host_tests.sh` passou no ambiente de host (testes C de estados e tokens, recuperacao apos interrupcao simulada, e navegador simulado incluindo fechamento/reabertura). Compilacao e API reais do PS5 **nao foram executadas aqui**; o GitHub Actions continua responsavel por gerar o ELF. Escritas em metadados internos e mounts experimentais podem danificar o console; faça backups restauraveis. A interface web **nao tem login**: use somente rede local confiavel.
+
+---
+
 # PS4Mount 0.5.8 — Automacao limitada a 3 jogos por vez (Phase 4G)
 
 Registro REAL foi comprovado no log do PS5 0.5.7 para `CUSA03323` usando `sceAppInstUtilAppInstallTitleDir`; o PS5 lancou `eboot.bin` e o usuario confirmou que jogou. **Essa evidencia nao valida automaticamente outros titulos nem justifica registrar 147 de uma vez.**

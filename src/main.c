@@ -4,8 +4,8 @@
 /* Safety-preview design:
  * - Discovery only READS USB PKGs; explicit per-title USB relocation requires
  *   a fresh preview nonce and journal, NEVER automatic registration.
- * - Registration and preparation are disabled from the web/API in this build.
- * - Historical code paths for explicit preparation remain for isolated tests.
+ * - Only explicitly confirmed per-CUSA registration and daemon-owned bounded batches
+ *   can write metadata. No background auto-start, bulk API or SQLite fallback.
  * - No direct SQLite fallback.
  * - DLCs (ac) are ignored; existing games and system DB are never bulk-updated.
  * - Any unconfirmed registration blocks further requests until restart.
@@ -39,7 +39,7 @@
 #include "organize.h"
 #include "icon_data.h"
 
-#define VERSION "PS4Mount 0.5.8-phase4g-batch3"
+#define VERSION "PS4Mount 0.5.9-phase4h-daemon-batch"
 #define LOCK_PORT 9032
 #define SCAN_SECONDS 10
 #define STATE_DIR "/data/ps4mount"
@@ -1434,11 +1434,13 @@ static void handle_klog_line(const char *line) {
 
 /* --- web panel --- */
 
+static int batch_running(void);
+static void batch_tick(void);
 static time_t g_next_scan;
 static int g_stop;
 
 void app_rescan(void) {
-    if (!g_registration_busy) { g_next_scan = 0; g_manual_scan = 1; }
+    if (!g_registration_busy && !batch_running()) { g_next_scan = 0; g_manual_scan = 1; }
 }
 void app_stop(void) { g_stop = 1; }
 
@@ -2142,6 +2144,337 @@ int app_organize(const char *tid, const char *nonce, char *msg, size_t cap) {
     return rc;
 }
 
+/* Phase 4H: explicit backend-managed bounded queue. No browser loop, threads,
+ * AppInstallAll or replays. Work advances one phase per daemon event-loop turn.
+ * Crash recovery is fail-closed: incomplete batches NEVER resume automatically. */
+#define BATCH_MAX 5
+#ifndef BATCH_FILE
+#define BATCH_FILE STATE_DIR "/batch-v1.state"
+#endif
+typedef enum {
+    BATCH_IDLE = 0, BATCH_PREPARE, BATCH_RESCAN, BATCH_PREFLIGHT,
+    BATCH_MOUNT, BATCH_RELEASE, BATCH_REGISTER, BATCH_VERIFY,
+    BATCH_DONE, BATCH_FAILED, BATCH_INTERRUPTED
+} batch_phase_t;
+typedef struct {
+    batch_phase_t phase;
+    int count, index, registered;
+    char titles[BATCH_MAX][10];
+    char message[256];
+} batch_state_t;
+static batch_state_t g_batch;
+static struct {
+    char token[33];
+    char titles[BATCH_MAX][10];
+    int count;
+    time_t issued;
+} g_batch_auth;
+static int batch_running(void) {
+    return g_batch.phase >= BATCH_PREPARE && g_batch.phase <= BATCH_VERIFY;
+}
+int app_batch_active(void) { return batch_running(); }
+static const char *batch_phase_name(batch_phase_t p) {
+    switch (p) {
+    case BATCH_IDLE: return "idle";
+    case BATCH_PREPARE: return "organize";
+    case BATCH_RESCAN: return "rescan";
+    case BATCH_PREFLIGHT: return "preflight";
+    case BATCH_MOUNT: return "mount";
+    case BATCH_RELEASE: return "release";
+    case BATCH_REGISTER: return "register";
+    case BATCH_VERIFY: return "verify";
+    case BATCH_DONE: return "completed";
+    case BATCH_FAILED: return "failed";
+    case BATCH_INTERRUPTED: return "interrupted";
+    }
+    return "invalid";
+}
+static int batch_store(void) {
+    /* Persist BEFORE running the next irreversible phase; never blindly retry.
+     * Write via the original atomic metadata helper, not via SQL. */
+    char content[640];
+    int n = snprintf(content, sizeof(content), "PS4MOUNT-BATCH-1 %d %d %d %d\n%s\n%s\n%s\n%s\n%s\n%s\n",
+                     (int)g_batch.phase, g_batch.count, g_batch.index, g_batch.registered,
+                     g_batch.titles[0], g_batch.titles[1], g_batch.titles[2],
+                     g_batch.titles[3], g_batch.titles[4], g_batch.message);
+    if (n < 0 || n >= (int)sizeof(content)) return -1;
+    return write_file(BATCH_FILE, content, (size_t)n, 0600);
+}
+static void batch_restore(void) {
+    memset(&g_batch, 0, sizeof(g_batch));
+    int fd = open(BATCH_FILE, O_RDONLY | O_NOFOLLOW);
+    if (fd < 0) {
+        if (errno != ENOENT) { g_batch.phase = BATCH_INTERRUPTED; snprintf(g_batch.message,sizeof(g_batch.message),"Cannot safely read previous batch state"); }
+        return;
+    }
+    char line[640];
+    ssize_t n = read(fd, line, sizeof(line)-1);
+    close(fd);
+    if (n <= 0 || n >= (ssize_t)sizeof(line)-1) goto corrupt;
+    line[n] = 0;
+    int phase, count, index, registered;
+    if (sscanf(line, "PS4MOUNT-BATCH-1 %d %d %d %d", &phase, &count, &index, &registered) != 4 ||
+        phase < BATCH_IDLE || phase > BATCH_INTERRUPTED || count < 0 || count > BATCH_MAX ||
+        index < 0 || index > count || registered < 0 || registered > count) goto corrupt;
+    char *newline = strchr(line, '\n');
+    if (!newline) goto corrupt;
+    char *p = newline + 1;
+    g_batch.count=count; g_batch.index=index; g_batch.registered=registered;
+    for (int i=0; i<BATCH_MAX; i++) {
+        char *end = strchr(p, '\n');
+        if (!end || end-p >= (int)sizeof(g_batch.titles[0])) goto corrupt;
+        memcpy(g_batch.titles[i],p,(size_t)(end-p));
+        p=end+1;
+    }
+    char *end = strchr(p,'\n');
+    if (!end || end-p >= (int)sizeof(g_batch.message)) goto corrupt;
+    memcpy(g_batch.message,p,(size_t)(end-p));
+    g_batch.phase = (batch_phase_t)phase;
+    if (batch_running()) {
+        g_batch.phase = BATCH_INTERRUPTED;
+        snprintf(g_batch.message,sizeof(g_batch.message),"Process stopped during %s; inspect USB, app.db and mountpoints. No automatic replay",
+                 batch_phase_name((batch_phase_t)phase));
+        (void)batch_store();
+        printf("[safe][batch] INTERRUPTED: previous unfinished run never resumed\n");
+    }
+    return;
+corrupt:
+    memset(&g_batch,0,sizeof(g_batch));
+    g_batch.phase=BATCH_INTERRUPTED;
+    snprintf(g_batch.message,sizeof(g_batch.message),"Invalid saved batch state; inspect before any new writes");
+}
+static int batch_nounce_create(char token[33]) {
+    unsigned char bytes[16];
+    int fd=open("/dev/urandom",O_RDONLY);
+    if(fd<0) return -1;
+    size_t got=0;
+    while(got<sizeof(bytes)) {
+        ssize_t n=read(fd,bytes+got,sizeof(bytes)-got);
+        if(n<0 && errno==EINTR) continue;
+        if(n<=0) { close(fd); return -1; }
+        got+=(size_t)n;
+    }
+    close(fd);
+    for(int i=0;i<16;i++) snprintf(token+i*2,3,"%02x",bytes[i]);
+    return 0;
+}
+static int batch_candidate(title_t *t) {
+    if(!t || !t->app_path[0] || t->conflict || t->patch_conflict || t->suspicious_updates ||
+       t->unverified_duplicate_updates || (t->update_count && !t->patch_path[0]) ||
+       !supported_usb(t) || installed_internally(t->tid) || org_pending(t->root)) return 0;
+    return db_registered_status(t->tid) == 0;
+}
+/* A deterministic, server-reviewed queue. Sort by PKG byte size like v0.5.8;
+ * previews and starts use the SAME snapshot, and a new preview revokes old token. */
+int app_batch_preview_json(int limit, buf_t *out) {
+    memset(&g_batch_auth,0,sizeof(g_batch_auth));
+    int allowed = (limit==3 || limit==5) && !batch_running() &&
+        g_batch.phase!=BATCH_INTERRUPTED && g_batch.phase!=BATCH_FAILED &&
+        !g_probe.active && !g_probe.attempted && !g_registration_busy &&
+        !g_registration_fault && !g_deleting && !g_queued_tid[0] && one_title_install_api();
+    title_t *chosen[BATCH_MAX] = {0};
+    if(allowed) {
+        for(int i=0;i<g_title_count;i++) {
+            title_t *t=&g_titles[i];
+            if(!batch_candidate(t)) continue;
+            int j=0;
+            while(j<limit && chosen[j] &&
+                  (chosen[j]->size+chosen[j]->patch_size < t->size+t->patch_size ||
+                  (chosen[j]->size+chosen[j]->patch_size==t->size+t->patch_size &&
+                   strcmp(chosen[j]->tid,t->tid)<0))) j++;
+            if(j>=limit) continue;
+            for(int k=limit-1;k>j;k--) chosen[k]=chosen[k-1];
+            chosen[j]=t;
+        }
+        for(int i=0;i<limit && chosen[i];i++) {
+            snprintf(g_batch_auth.titles[i],10,"%s",chosen[i]->tid);
+            g_batch_auth.count++;
+        }
+        if(g_batch_auth.count && !batch_nounce_create(g_batch_auth.token))
+            g_batch_auth.issued=time(NULL);
+        else allowed=0;
+    }
+    buf_printf(out,"{\"ok\":true,\"can_start\":%s,\"count\":%d,\"limit\":%d,\"games\":[",
+        allowed && g_batch_auth.count ? "true":"false",g_batch_auth.count,limit);
+    for(int i=0;i<g_batch_auth.count;i++) {
+        title_t *t=chosen[i];
+        buf_printf(out,"%s{\"title_id\":",i?",":""); json_str(out,t->tid);
+        buf_printf(out,",\"name\":"); json_str(out,t->name);
+        buf_printf(out,",\"size\":%llu}",t->size+t->patch_size);
+    }
+    buf_printf(out,"],\"confirm_token\":"); json_str(out,allowed?g_batch_auth.token:"");
+    buf_printf(out,",\"message\":");
+    json_str(out,allowed?(g_batch_auth.count?"Confirm backup before starting backend batch":"No eligible unregistered games"):
+        "Another operation, unresolved batch or registration fault blocks automatic writes");
+    buf_printf(out,"}");
+}
+int app_batch_start(int limit,const char *token,char *msg,size_t cap) {
+    int count=g_batch_auth.count;
+    time_t now=time(NULL);
+    int valid=(limit==3 || limit==5) && count>0 && count<=limit &&
+        g_batch_auth.token[0] && token && strlen(token)==32 &&
+        now>=g_batch_auth.issued && now-g_batch_auth.issued<=120;
+    unsigned char diff=0;
+    if(valid) for(int i=0;i<32;i++) diff |= (unsigned char)(token[i]^g_batch_auth.token[i]);
+    if(diff) valid=0;
+    char titles[BATCH_MAX][10];
+    memcpy(titles,g_batch_auth.titles,sizeof(titles));
+    memset(&g_batch_auth,0,sizeof(g_batch_auth)); /* consumed even on failure */
+    if(!valid || batch_running() || g_batch.phase==BATCH_INTERRUPTED ||
+       g_batch.phase==BATCH_FAILED || g_probe.active || g_probe.attempted ||
+       g_registration_busy || g_registration_fault || g_deleting || g_queued_tid[0])
+        return plan_error(msg,cap,"Batch preview expired or cannot start; no changes made");
+    for(int i=0;i<count;i++) if(!batch_candidate(catalog_find(titles[i])))
+        return plan_error(msg,cap,"A previewed game changed or is registered; preview again");
+    memset(&g_batch,0,sizeof(g_batch));
+    g_batch.phase=BATCH_PREPARE; g_batch.count=count;
+    memcpy(g_batch.titles,titles,sizeof(titles));
+    snprintf(g_batch.message,sizeof(g_batch.message),"Accepted %d games; controlled by ELF, not browser",count);
+    if(batch_store()) {
+        g_batch.phase=BATCH_FAILED;
+        return plan_error(msg,cap,"Cannot persist queue; refusing any writes");
+    }
+    printf("[safe][batch] START count=%d first=%s (daemon-owned, no bulk API)\n",count,g_batch.titles[0]);
+    snprintf(msg,cap,"Backend queue accepted (%d games). You may leave/reopen panel, but keep ELF/PS5/USB powered",count);
+    return 0;
+}
+void app_batch_status_json(buf_t *out) {
+    buf_printf(out,"{\"ok\":true,\"phase\":"); json_str(out,batch_phase_name(g_batch.phase));
+    buf_printf(out,",\"running\":%s,\"count\":%d,\"processed\":%d,\"registered\":%d,\"current\":",
+      batch_running()?"true":"false",g_batch.count,g_batch.index,g_batch.registered);
+    json_str(out,(g_batch.index<g_batch.count)?g_batch.titles[g_batch.index]:"");
+    buf_printf(out,",\"titles\":[");
+    for(int i=0;i<g_batch.count;i++){if(i) buf_printf(out,",");json_str(out,g_batch.titles[i]);}
+    buf_printf(out,"],\"message\":"); json_str(out,g_batch.message);
+    buf_printf(out,"}");
+}
+/* Only internally-produced previews are parsed, never user-provided JSON.
+ * Preserve the existing per-title one-use tokens and hardware validation. */
+static int batch_get_token(buf_t *out,const char *required,char token[33]) {
+    char *data=malloc(out->len+1);
+    if(!data) return -1;
+    memcpy(data,out->data,out->len); data[out->len]=0;
+    int good=0;
+    if(strstr(data,required)) {
+        const char *p=strstr(data,"\"confirm_token\":\"");
+        if(p){ p+=strlen("\"confirm_token\":\"");
+            if(strlen(p)>=33 && p[32]=='"') {
+                good=1;
+                for(int i=0;i<32;i++) if(!((p[i]>='0'&&p[i]<='9')||(p[i]>='a'&&p[i]<='f')))good=0;
+                if(good){memcpy(token,p,32);token[32]=0;}
+            }
+        }
+    }
+    free(data);
+    return good?0:-1;
+}
+static void batch_fail(const char *error) {
+    char rollback[256];
+    if(g_probe.active) {
+        if(probe_release_internal(rollback,sizeof(rollback)))
+            printf("[safe][batch] probe release incomplete: %s\n",rollback);
+    }
+    g_batch.phase=BATCH_FAILED;
+    snprintf(g_batch.message,sizeof(g_batch.message),"%s; DO NOT auto-retry, inspect log/recovery",error);
+    (void)batch_store();
+    printf("[safe][batch] FAILED at %d/%d %s: %s\n",g_batch.index+1,g_batch.count,
+           g_batch.index<g_batch.count?g_batch.titles[g_batch.index]:"none",g_batch.message);
+}
+static void batch_tick(void) {
+    if(!batch_running()) return;
+    if(g_batch.index>=g_batch.count) { batch_fail("Invalid queue index"); return; }
+    const char *tid=g_batch.titles[g_batch.index];
+    title_t *t=catalog_find(tid);
+    char detail[256]="", token[33]="";
+    buf_t b={0};
+    int err=0;
+    for(int i=0;i<MAX_TITLES;i++) if(g_managed[i].used &&
+        (g_managed[i].running || g_managed[i].rw)) {
+        batch_fail("A game is running/has read-write mount; pause and inspect"); return;
+    }
+    if(g_deleting || g_registration_fault || !t) {batch_fail("PS5 state fault or title disappeared");return;}
+    /* Do not re-register any CUSA. DB-unavailable is a HARD error. */
+    int db=db_registered_status(tid);
+    if(db<0) {batch_fail("Cannot read app.db for next title");return;}
+    if(db==1 && g_batch.phase!=BATCH_VERIFY) {
+        /* A different process registered this title mid-queue. Never overwrite;
+         * never skip a mounted/partially processed title without inspection. */
+        if(g_batch.phase!=BATCH_PREPARE) {
+            batch_fail("Title became registered mid-operation; inspect mount and app.db");
+            return;
+        }
+        snprintf(g_batch.message,sizeof(g_batch.message),"%s already registered: skipped",tid);
+        printf("[safe][batch] %s SKIP already registered\n",tid);
+        g_batch.index++;
+        g_batch.phase=g_batch.index==g_batch.count?BATCH_DONE:BATCH_PREPARE;
+        if(batch_store()) batch_fail("Cannot persist skipped title");
+        return;
+    }
+    if(g_batch.phase==BATCH_PREPARE) {
+        /* Inspect plan; NO backup files are overwritten. */
+        if(app_plan_json(tid,&b)) {err=1; snprintf(detail,sizeof(detail),"Plan refused for %s",tid);}
+        else if(batch_get_token(&b,"\"ok\":true",token)) {err=1;snprintf(detail,sizeof(detail),"No valid organizer token");}
+        else {
+            char *json=malloc(b.len+1);
+            if(!json){err=1;snprintf(detail,sizeof(detail),"Out of memory");}
+            else {
+                memcpy(json,b.data,b.len);json[b.len]=0;
+                int move=strstr(json,"\"move_base\":true")||strstr(json,"\"move_update\":true");
+                free(json);
+                if(move) {
+                    if(app_organize(tid,token,detail,sizeof(detail)))err=1;
+                    else g_batch.phase=BATCH_RESCAN;
+                } else g_batch.phase=BATCH_PREFLIGHT;
+            }
+        }
+    } else if(g_batch.phase==BATCH_RESCAN) {
+        /* A USB-only file rename updates source paths; mandatory before mount. */
+        char root[32];snprintf(root,sizeof(root),"%s",t->root);
+        scan_root(root);
+        g_batch.phase=BATCH_PREFLIGHT;
+    } else if(g_batch.phase==BATCH_PREFLIGHT) {
+        int db_status=-2;
+        title_plan_t plan={0};
+        unsigned int checks=(unsigned int)phase4_compute(t,&plan,detail,sizeof(detail),&db_status);
+        if(!phase4_ready(checks)) {
+            const char *blocker=phase4_first_blocker(checks);
+            err=1;snprintf(detail,sizeof(detail),"Preflight failed: %s",blocker);
+        } else g_batch.phase=BATCH_MOUNT;
+    } else if(g_batch.phase==BATCH_MOUNT) {
+        app_probe_preview_json(tid,&b);
+        if(batch_get_token(&b,"\"can_mount\":true",token) ||
+           app_probe_mount(tid,token,detail,sizeof(detail)))err=1;
+        else g_batch.phase=BATCH_RELEASE;
+    } else if(g_batch.phase==BATCH_RELEASE) {
+        app_probe_preview_json(tid,&b);
+        if(batch_get_token(&b,"\"can_release\":true",token) ||
+           app_probe_release(tid,token,detail,sizeof(detail)))err=1;
+        else g_batch.phase=BATCH_REGISTER;
+    } else if(g_batch.phase==BATCH_REGISTER) {
+        app_register_preview_json(tid,&b);
+        if(batch_get_token(&b,"\"can_register\":true",token) ||
+           app_register_one(tid,token,detail,sizeof(detail)))err=1;
+        else g_batch.phase=BATCH_VERIFY;
+    } else if(g_batch.phase==BATCH_VERIFY) {
+        if(db_registered_status(tid)!=1 || g_registration_fault || g_probe.active ||
+           g_probe.attempted || !managed_by(tid,NULL)) {
+            err=1;snprintf(detail,sizeof(detail),"Registration verification failed; stop batch");
+        } else {
+            printf("[safe][batch] %s VERIFIED %d/%d\n",tid,g_batch.index+1,g_batch.count);
+            g_batch.registered++;g_batch.index++;
+            g_batch.phase=g_batch.index==g_batch.count?BATCH_DONE:BATCH_PREPARE;
+        }
+    }
+    buf_free(&b);
+    if(err){batch_fail(detail[0]?detail:"Single-title operation refused; inspect last log");return;}
+    snprintf(g_batch.message,sizeof(g_batch.message),g_batch.phase==BATCH_DONE?
+             "LOTE CONCLUIDO. Check each game in PS5 library before another batch":
+             "Title phase completed. Awaiting next backend step");
+    if(batch_store()) batch_fail("Cannot persist updated progress; no further operations");
+    else printf("[safe][batch] PROGRESS %d/%d registered=%d next_phase=%s\n",
+       g_batch.index,g_batch.count,g_batch.registered,batch_phase_name(g_batch.phase));
+}
+
 int app_recovery_json(int usb, buf_t *out) {
     auth_clear();
     if (usb < 0 || usb > 7) return -1;
@@ -2402,13 +2735,14 @@ int main(void) {
     signal(SIGPIPE, SIG_IGN);
     /* SAFE PREVIEW: shortcut installation invokes AppInstallAll and writes
      * to PS5 DB even during discovery; never install it automatically. */
+    batch_restore();
     printf("\n======= " VERSION " session start =======\n");
     printf("[safe] shortcut install DISABLED; bulk registration DISABLED; targeted one-title test opt-in; open http://<PS5 IP>:8770\n");
     g_web = web_listen();
     notify(g_web >= 0 ? VERSION " running. ONE-title mount + optional targeted registration; NO bulk fallback; panel :8770" : VERSION " panel unavailable");
     unlink(STATE_DIR "/stop");
     for (;;) {
-        if (g_stop || exists(STATE_DIR "/stop")) {
+        if ((g_stop || exists(STATE_DIR "/stop")) && !batch_running()) {
             unlink(STATE_DIR "/stop");
             if (g_probe.active) {
                 char why[256];
@@ -2430,11 +2764,12 @@ int main(void) {
                 set_rw(m, 0);
             }
         }
-        if (time(NULL) >= g_next_scan && !g_deleting && !g_registration_busy) {
+        if (time(NULL) >= g_next_scan && !g_deleting && !g_registration_busy && !batch_running()) {
             scan_all();
             g_next_scan = time(NULL) + SCAN_SECONDS;
         }
+        if (batch_running()) batch_tick();
         process_queue();
-        pump_events(1000);
+        pump_events(batch_running() ? 400 : 1000);
     }
 }

@@ -29,3 +29,9 @@ int app_icon(const char *tid, buf_t *out);
 int web_listen(void);
 /* Serves one connection on the listening socket. */
 void web_serve(int listen_fd);
+
+/* Phase 4H: daemon-owned sequential queue, not browser-controlled. */
+int app_batch_preview_json(int limit, buf_t *out);
+int app_batch_start(int limit,const char *token,char *msg,size_t cap);
+void app_batch_status_json(buf_t *out);
+int app_batch_active(void);

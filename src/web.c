@@ -115,6 +115,14 @@ static int usb_param(const char *path) {
     return p[5] - '0';
 }
 
+static int batch_limit_param(const char *path) {
+    const char *p = strstr(path,"?limit=");
+    if (!p) return -1;
+    if (!strncmp(p,"?limit=3",8) && (!p[8] || p[8]=='&')) return 3;
+    if (!strncmp(p,"?limit=5",8) && (!p[8] || p[8]=='&')) return 5;
+    return -1;
+}
+
 static void send_log(int fd) {
     buf_t b = {0}, j = {0};
     int f = open(LOG_PATH, O_RDONLY);
@@ -161,7 +169,23 @@ void web_serve(int listen_fd) {
     sscanf(req, "%7s %255s", method, path);
     int post = !strcmp(method, "POST");
 
-    if (!strcmp(path, "/") || !strcmp(path, "/index.html")) {
+    /* During a daemon batch, reject unrelated write endpoints from other tabs.
+     * GETs, batch status and the existing PS5 game launch monitor remain usable. */
+    if (post && app_batch_active() && strncmp(path,"/api/batch-",11)) {
+        json_msg(fd,0,"Backend batch is running. Other write operations are blocked");
+    } else if (!post && !strcmp(path,"/api/batch-status")) {
+        buf_t b={0};app_batch_status_json(&b);
+        reply(fd,"200 OK","application/json; charset=utf-8",b.data,b.len);buf_free(&b);
+    } else if (!post && !strncmp(path,"/api/batch-preview?",19)) {
+        int limit=batch_limit_param(path);
+        if(limit<0) json_msg(fd,0,"Batch limit must be 3 or 5");
+        else {buf_t b={0};app_batch_preview_json(limit,&b);
+              reply(fd,"200 OK","application/json; charset=utf-8",b.data,b.len);buf_free(&b);}
+    } else if (post && !strncmp(path,"/api/batch-start?",17)) {
+        int limit=batch_limit_param(path);char token[33];
+        if(limit<0 || confirmation_header(req,token))json_msg(fd,0,"Invalid batch confirmation");
+        else {int rc=app_batch_start(limit,token,msg,sizeof(msg));json_msg(fd,!rc,msg);}
+    } else if (!strcmp(path, "/") || !strcmp(path, "/index.html")) {
         reply(fd, "200 OK", "text/html; charset=utf-8", index_html, sizeof(index_html));
     } else if (!strcmp(path, "/api/games")) {
         buf_t b = {0};

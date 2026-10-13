@@ -1,4 +1,5 @@
 /* Host-only test: mount functions must not touch foreign mounts. */
+#define BATCH_FILE "/tmp/ps4mount-phase4h-host-safety.state"
 #define main ps4mount_console_main
 #include "../src/main.c"
 #undef main
@@ -65,6 +66,40 @@ int main(void) {
     assert(!probe_auth_consume("CUSA01623", "release", token, NULL, NULL, NULL, NULL));
     assert(mount_calls == 0 && unmount_calls == 0);
     printf("PASS: Phase 4B rejects wrong-mode, expired, replayed, and invalid tokens\n");
+    /* Phase 4H: backend queue state is independent of the browser. */
+    assert(!batch_running());
+    g_batch.phase = BATCH_PREPARE;
+    assert(batch_running());
+    g_batch.phase = BATCH_VERIFY;
+    assert(batch_running());
+    g_batch.phase = BATCH_FAILED;
+    assert(!batch_running());
+    g_batch.phase = BATCH_INTERRUPTED;
+    assert(!batch_running());
+    char good[] = "{\"can_mount\":true,\"confirm_token\":\"0123456789abcdef0123456789abcdef\"}";
+    char bad[] = "{\"can_mount\":false,\"confirm_token\":\"0123456789abcdef0123456789abcdef\"}";
+    buf_t preview = { .data = (uint8_t*)good, .len = strlen(good) };
+    char batch_token[33];
+    assert(!batch_get_token(&preview, "\"can_mount\":true", batch_token));
+    assert(!strcmp(batch_token, "0123456789abcdef0123456789abcdef"));
+    preview.data = (uint8_t*)bad; preview.len = strlen(bad);
+    assert(batch_get_token(&preview, "\"can_mount\":true", batch_token));
+    puts("PASS: Phase 4H daemon phase boundaries and verified internal action tokens");
+    /* A crashed daemon cannot retry a previously started phase on next boot. */
+    unlink(BATCH_FILE);
+    memset(&g_batch,0,sizeof(g_batch));
+    g_batch.phase=BATCH_RELEASE;
+    g_batch.count=1;
+    snprintf(g_batch.titles[0],10,"CUSA03323");
+    snprintf(g_batch.message,sizeof(g_batch.message),"last step may have completed");
+    assert(batch_store()==0);
+    memset(&g_batch,0,sizeof(g_batch));
+    batch_restore();
+    assert(g_batch.phase==BATCH_INTERRUPTED);
+    assert(!batch_running());
+    assert(strstr(g_batch.message,"No automatic replay"));
+    unlink(BATCH_FILE);
+    puts("PASS: Phase 4H restores unfinished work as INTERRUPTED without any automatic replay");
     assert(rmdir(target) == 0);
     assert(rmdir(root) == 0);
     puts("PASS: foreign mounts left untouched and unreadable running-state blocks mutations");

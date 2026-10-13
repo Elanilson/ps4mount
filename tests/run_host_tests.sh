@@ -31,4 +31,4 @@ cc -std=gnu11 -O1 -Wall -Wextra -Wno-format-truncation -Wno-unused-function \
 
 # Browser-only deterministic test of max-3 sequential writes and abort-on-first-error.
 node tests/test_phase4f_panel.cjs
-node tests/test_phase4g_batch.cjs
+node tests/test_phase4h_batch.cjs
