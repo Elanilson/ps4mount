@@ -28,3 +28,7 @@ cc -std=gnu11 -O1 -Wall -Wextra -I./src \
 cc -std=gnu11 -O1 -Wall -Wextra -Wno-format-truncation -Wno-unused-function \
   -ffunction-sections -fdata-sections -I./src tests/test_organize.c -o /tmp/ps4mount-organize-test
 /tmp/ps4mount-organize-test
+
+# Browser-only deterministic test of max-3 sequential writes and abort-on-first-error.
+node tests/test_phase4f_panel.cjs
+node tests/test_phase4g_batch.cjs

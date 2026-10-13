@@ -39,7 +39,7 @@
 #include "organize.h"
 #include "icon_data.h"
 
-#define VERSION "PS4Mount 0.5.7-phase4f-single-register"
+#define VERSION "PS4Mount 0.5.8-phase4g-batch3"
 #define LOCK_PORT 9032
 #define SCAN_SECONDS 10
 #define STATE_DIR "/data/ps4mount"
@@ -2038,6 +2038,12 @@ int app_register_one(const char *tid, const char *token, char *msg, size_t cap) 
     printf("[safe][register-one] %s REGISTERED INDIVIDUALLY; launch via PS5 home screen\n", tid);
     snprintf(msg, cap, "%s registered! Try launching its tile in PS5 home; leave USB and daemon active", tid);
     g_registration_fault = 0;
+    /* Batch continuation is allowed ONLY after a confirmed targeted DB row,
+     * owned read-only mount verification, and a successful tracking marker.
+     * Any uncertain registration leaves g_probe.attempted set and faults locked. */
+    g_probe.attempted = 0;
+    g_verified_ro_tid[0] = 0;
+    printf("[safe][batch-ready] %s confirmed; next DISTINCT CUSA permitted in this session\n", tid);
     rc = 0;
 reg_done:
     src_close(&src);

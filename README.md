@@ -1,3 +1,19 @@
+# PS4Mount 0.5.8 — Automacao limitada a 3 jogos por vez (Phase 4G)
+
+Registro REAL foi comprovado no log do PS5 0.5.7 para `CUSA03323` usando `sceAppInstUtilAppInstallTitleDir`; o PS5 lancou `eboot.bin` e o usuario confirmou que jogou. **Essa evidencia nao valida automaticamente outros titulos nem justifica registrar 147 de uma vez.**
+
+NOVO: no painel, clique **Automatizar proximos 3 (experimental)**, confira os ate tres nomes mostrados, declare backup de console e PKGs e inicie. O browser executa sequencialmente, sem novas confirmacoes por jogo: preflight, plano, se preciso rename via journal, rescan, novo preflight, montagem read-only individual, liberacao, registro com API individual e verificacao de app.db + mount RO pela rotina existente. Nao inclui AppInstallAll, SQL WRITE, registro no scan nem execucao automatica de jogos. Se houver falha, timeout, mount nao liberado ou resultado desconhecido, PARA e nao tenta novamente. Um novo lote so e iniciado manualmente apos conferir a biblioteca e logs.
+
+O backend da 0.5.7 permitia somente uma montagem experimental por sessao. Na 0.5.8 o bloqueio e resetado **somente apos o registro individual completar sem falha, com app.db confirmada, marcador escrito e montagem verificada como RO**. Caso contrario continua bloqueado.
+
+**Nao tente 147 jogos em um lote**: ha 6 conflitos e 3 atualizacoes suspeitas no catalogo conhecido, outros titulos podem falhar na API. Nao ha rollback transacional dos metadados internos; mesmo tres titulos podem causar travamento, degradacao ou recuperacao da base de dados. Producao desaconselhada. Executar games somente pelo PS5 home. Recomendo testar o primeiro lote e enviar log antes de seguir.
+
+Se uma solicitacao HTTP falhar, o status real do console pode ser desconhecido. Nao repita. Console e disco devem ter backups testados. O painel :8770 nao tem login: use somente em rede local confiavel e desative acesso durante os testes.
+
+Testes locais validam apenas codigo de host e JavaScript simulado, **nao** garantem funcionamento de varios jogos no PS5. ELF via GitHub Actions.
+
+---
+
 # PS4Mount 0.5.7 — Registro individual experimental (Fase 4F)
 
 **Limites:** esta compilacao NAO garante execucao do jogo. O log 0.5.6 nao mostrou montagem efetiva, somente PREVIEW. A nova versao corrige os `prompt()/confirm()` escondidos pelo `<dialog>`, para que o botao realmente envie a tentativa de montagem. Adiciona suporte *condicional* a `sceAppInstUtilAppInstallTitleDir` (NID `Wudg3Xe3heE`), SEM fallback para `sceAppInstUtilAppInstallAll(NULL)`. Firmwares 12.00+ podem nao oferecer essa API: neste caso, o painel bloqueia registro ANTES de escrever metadados.

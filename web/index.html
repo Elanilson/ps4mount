@@ -49,6 +49,7 @@ pre{white-space:pre-wrap;font-size:12px;max-height:60vh;overflow:auto;background
   <h1>PS4Mount <small id="ver"></small></h1>
   <div class="bar">
     <input id="q" type="search" placeholder="Search game or CUSA">
+    <button id="batchpreview" class="primary">Automatizar proximos 3 (experimental)</button>
     <button id="rescan" class="primary">Scan for games</button>
     <button id="recoverbtn">USB recovery</button>
     <button id="logbtn">Log</button>
@@ -60,6 +61,19 @@ pre{white-space:pre-wrap;font-size:12px;max-height:60vh;overflow:auto;background
   <div class="grid" id="grid"></div>
   <div class="empty" id="empty" hidden>No games found. PKGs may be in any subfolder; rescan to refresh.</div>
 </main>
+<dialog id="batchdlg"><h3>Registro automatico sequencial — ate 3 jogos</h3>
+  <pre id="batchitems"></pre>
+  <p class="warn">EXPERIMENTAL: o fluxo por jogo foi validado apenas no Uncanny Valley. A cada jogo:
+    organiza no USB (se necessario), verifica PKGs e banco de dados, monta em RO,
+    libera a montagem e executa registro INDIVIDUAL. Os arquivos podem ser movidos
+    e metadados internos do PS5 serao escritos. Nunca usa AppInstallAll ou SQL WRITE.
+    Para no PRIMEIRO erro/resultado desconhecido; nao repete POST. Nao desconecte o HD.
+    Recomenda-se validar este lote e o log antes de prosseguir para outros.</p>
+  <label><input id="batchbackup" type="checkbox"> Tenho backup do PS5 e dos PKGs fora do USB; nao ha jogos em execucao.</label>
+  <pre id="batchstatus" role="status" aria-live="polite"></pre>
+  <div class="bar"><button id="batchstart" class="danger" disabled>Processar ate 3 jogos, um por vez</button>
+    <button id="batchclose">Fechar</button></div>
+</dialog>
 <dialog id="logdlg"><h3>Log</h3><pre id="log"></pre><form method="dialog"><button>Close</button></form></dialog>
 <dialog id="launchdlg"><h3>Fase 4A — verificação de montagem e registro (somente leitura)</h3><pre id="launchinfo"></pre><p class="warn">Este teste NÃO monta, registra ou executa jogos. Resultado positivo valida somente os requisitos locais verificados; a integração com o sistema ainda precisa de auditoria.</p><form method="dialog"><button>Close</button></form></dialog>
 <dialog id="probedlg"><h3>Teste de montagem real — SOMENTE LEITURA</h3>
@@ -100,6 +114,7 @@ pre{white-space:pre-wrap;font-size:12px;max-height:60vh;overflow:auto;background
 <script>
 var games = [], busy = {}, currentPlan = null, currentProbe = null, currentRegister = null, organizing = false;
 var autoBusy = false;
+var batchBusy = false, batchCandidates = [], batchCompleted = 0;
 var labels = {ready: 'Ready', running: 'Running', internal: 'Installed on console', discovered: 'Discovered', queued: 'Queued', conflict: 'Conflict'};
 var registrationEnabled = false; // safety-preview build: must remain false
 
@@ -154,7 +169,7 @@ function render() {
   });
   $('grid').innerHTML = html;
   $('empty').hidden = games.length > 0;
-  var s = '<span>PHASE 4F · ONE title at a time · no bulk registration</span><span>' + games.length + ' game(s)</span>';
+  var s = '<span>PHASE 4G · sequential batch of 3 · per-CUSA registration only</span><span>' + games.length + ' game(s)</span>';
   for (var k in counts) s += '<span>' + esc(labels[k] || k) + ': ' + counts[k] + '</span>';
   $('summary').innerHTML = s;
 }
@@ -167,7 +182,7 @@ function load() {
 $('grid').addEventListener('click', function (e) {
   var b = e.target.closest('button[data-a]');
   if (!b) return;
-  if (autoBusy) return toast('Já estou preparando um jogo. Aguarde a conclusão.');
+  if (autoBusy || batchBusy) return toast('Ha uma operacao em andamento. Aguarde a conclusao.');
   var tid = b.getAttribute('data-t'), a = b.getAttribute('data-a');
   if (a === 'auto-prepare') return autoPrepareOne(tid);
   if (a === 'probe') {
@@ -327,6 +342,103 @@ function autoPrepareOne(tid) {
     load();
   });
 }
+// Phase 4G: client-driven BOUNDED sequential workflow. No automatic startup,
+// no daemon-wide register_all; every mutation still passes a distinct one-use
+// nonce and the original validated per-title endpoints.
+function batchLog(line) {
+  $('batchstatus').textContent += line + '\n';
+  $('batchstatus').scrollTop = $('batchstatus').scrollHeight;
+}
+function batchAvailable(g) {
+  return g.state === 'discovered' && !g.update_issue && !g.suspicious_updates &&
+    /^[A-Z0-9]{9}$/.test(g.title_id) && g.title_id.indexOf('CUSA') === 0;
+}
+function batchSelect() {
+  if (autoBusy || batchBusy) return toast('Uma operacao ja esta em andamento');
+  // Start with the smallest known non-conflicted titles to limit the impact
+  // of the first hardware batch. Already registered are excluded by backend.
+  batchCandidates = games.filter(batchAvailable).slice().sort(function (a,b) {
+    return a.size - b.size || a.title_id.localeCompare(b.title_id);
+  }).slice(0, 3);
+  $('batchitems').textContent = batchCandidates.length ? batchCandidates.map(function (g, i) {
+    return (i+1) + '. ' + g.name + ' (' + g.title_id + ') — ' + gb(g.size);
+  }).join('\n') : 'Nenhum jogo elegivel na lista. Jogos ja registrados ou com conflitos nao participam.';
+  $('batchstatus').textContent = '';
+  $('batchbackup').checked = false;
+  $('batchbackup').disabled = false;
+  $('batchstart').disabled = true;
+  $('batchclose').disabled = false;
+  $('batchdlg').showModal();
+}
+$('batchpreview').onclick = batchSelect;
+$('batchbackup').onchange = function () {
+  $('batchstart').disabled = batchBusy || !this.checked || !batchCandidates.length;
+};
+$('batchclose').onclick = function () { if (!batchBusy) $('batchdlg').close(); };
+$('batchdlg').addEventListener('cancel', function (event) { if (batchBusy) event.preventDefault(); });
+async function batchOne(tid) {
+  batchLog('[' + tid + '] Verificando plano e arquivos...');
+  // A title registered during an earlier session must be skipped, never
+  // re-registered. app_launch_check_json checks app.db read-only.
+  var before = await api('/api/launch-check?title_id=' + tid);
+  if (before.database_status === 'already_registered') {
+    batchLog('[' + tid + '] JA REGISTRADO — ignorado sem alterar arquivos.');
+    return 'skip';
+  }
+  if (before.database_status === 'unavailable') throw new Error('Banco de dados indisponivel; nao continuar.');
+  var plan = await api('/api/plan?title_id=' + tid);
+  if (plan.title_id !== tid || !plan.confirm_token) throw new Error('Plano ou confirmacao invalida.');
+  if (plan.move_base || plan.move_update) {
+    batchLog('[' + tid + '] Organizando PKGs no USB (uma solicitacao)...');
+    await api('/api/organize?title_id=' + tid, 'POST', plan.confirm_token);
+    await api('/api/rescan', 'POST');
+    await autoWaitCatalog(tid, plan, 0);
+  }
+  var check = await api('/api/launch-check?title_id=' + tid);
+  if (!check.preflight_passed) throw new Error('Preflight bloqueado: ' + check.message);
+  batchLog('[' + tid + '] Montando read-only...');
+  var mount = await api('/api/probe-preview?title_id=' + tid);
+  if (!mount.can_mount || !mount.confirm_token) throw new Error('Montagem nao autorizada: ' + mount.message);
+  await api('/api/probe-mount?title_id=' + tid, 'POST', mount.confirm_token);
+  batchLog('[' + tid + '] Liberando a montagem de teste...');
+  var release = await api('/api/probe-preview?title_id=' + tid);
+  if (!release.can_release || !release.confirm_token) throw new Error('RELEASE bloqueado; nao registrar: ' + release.message);
+  await api('/api/probe-release?title_id=' + tid, 'POST', release.confirm_token);
+  batchLog('[' + tid + '] Registrando SOMENTE este CUSA (escrita interna)...');
+  var reg = await api('/api/register-preview?title_id=' + tid);
+  if (!reg.can_register || !reg.confirm_token) throw new Error('Registro bloqueado: ' + reg.message);
+  var result = await api('/api/register-one?title_id=' + tid, 'POST', reg.confirm_token);
+  batchLog('[' + tid + '] REGISTRADO: ' + result.message);
+  return 'registered';
+}
+$('batchstart').onclick = async function () {
+  if (batchBusy || autoBusy || !$('batchbackup').checked || !batchCandidates.length) return;
+  // No more than 3 per activation; another batch requires another review.
+  var titles = batchCandidates.slice(0, 3).map(function (g) { return g.title_id; });
+  batchBusy = true; autoBusy = true;
+  batchCompleted = 0;
+  $('batchstart').disabled = true;
+  $('batchclose').disabled = true;
+  $('batchbackup').disabled = true;
+  $('batchpreview').disabled = true;
+  batchLog('INICIANDO lote limitado a ' + titles.length + '. Nao feche o navegador nem desligue o PS5.');
+  try {
+    for (var i = 0; i < titles.length; i++) {
+      var outcome = await batchOne(titles[i]);
+      if (outcome === 'registered') batchCompleted++;
+      batchLog('Progresso: ' + (i+1) + '/' + titles.length + ' verificados; ' + batchCompleted + ' registrados.');
+    }
+    batchLog('LOTE CONCLUIDO. Verifique os jogos na biblioteca ANTES de iniciar outro lote.');
+  } catch (e) {
+    batchLog('PARADO NO PRIMEIRO ERRO/RESULTADO INCERTO: ' + e.message);
+    batchLog('Nao repita esta etapa nem processe o proximo lote. Consulte o log e verifique montagens e USB recovery.');
+  } finally {
+    batchBusy = false; autoBusy = false;
+    $('batchclose').disabled = false;
+    $('batchpreview').disabled = false;
+    load();
+  }
+};
 $('autodlg').addEventListener('cancel', function (event) { if (autoBusy) event.preventDefault(); });
 $('probeaction').onclick = function () {
   if (!currentProbe || !currentProbe.confirm_token) return;
@@ -430,6 +542,7 @@ $('plandlg').addEventListener('close', function () {
   if (!organizing) currentPlan = null;
 });
 $('recoverbtn').onclick = function () {
+  if (batchBusy) return toast('Lote em andamento');
   var usb = prompt('Inspect USB drive number (0–7). Your games were found on 0:', '0');
   if (!/^[0-7]$/.test(usb || '')) return;
   api('/api/recovery?usb=' + usb).then(function (j) {
@@ -444,9 +557,10 @@ $('recoverbtn').onclick = function () {
   }).catch(function (e) { alert('Cannot inspect recovery: ' + e.message); });
 };
 $('q').addEventListener('input', render);
-$('rescan').onclick = function () { api('/api/rescan', 'POST').then(function (j) { toast(j.message); setTimeout(load, 3000); }); };
+$('rescan').onclick = function () { if (batchBusy) return toast('Lote em andamento'); api('/api/rescan', 'POST').then(function (j) { toast(j.message); setTimeout(load, 3000); }); };
 $('logbtn').onclick = function () { api('/api/log').then(function (j) { $('log').textContent = j.log; $('logdlg').showModal(); }); };
 $('stop').onclick = function () {
+  if (batchBusy) return toast('Lote em andamento: nao pare o daemon durante uma escrita.');
   if (!confirm('Stop PS4Mount? The games stay unavailable until it is loaded again.')) return;
   api('/api/stop', 'POST').then(function (j) { toast(j.message); });
 };
