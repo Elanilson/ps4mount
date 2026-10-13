@@ -42,11 +42,13 @@ static int is_library(const char *path, const struct stat *dir, const char *libr
 }
 
 static int walk(const char *dir, const char *library, dev_t device,
-                pkg_dir_visitor visit, void *context, int stop_on_first, int depth) {
+                pkg_dir_visitor visit, void *context, int stop_on_first, int depth,
+                pkg_dir_progress progress, void *progress_context) {
     struct stat here;
     /* lstat prevents links to other folders (including parent loops). */
     if (lstat(dir, &here) || !S_ISDIR(here.st_mode) || here.st_dev != device)
         return 0;
+    if (progress) progress(dir, progress_context);
     DIR *d = opendir(dir);
     if (!d)
         return 0;
@@ -95,7 +97,8 @@ static int walk(const char *dir, const char *library, dev_t device,
             struct stat child;
             if (lstat(path, &child) || !S_ISDIR(child.st_mode) || child.st_dev != device)
                 continue;
-            result += walk(path, library, device, visit, context, stop_on_first, depth + 1);
+            result += walk(path, library, device, visit, context, stop_on_first, depth + 1,
+                           progress, progress_context);
             if (stop_on_first && result)
                 break;
         }
@@ -104,10 +107,17 @@ static int walk(const char *dir, const char *library, dev_t device,
     return result;
 }
 
-int walk_pkg_dirs(const char *start, const char *library, pkg_dir_visitor visit,
-                  void *context, int stop_on_first) {
+int walk_pkg_dirs_progress(const char *start, const char *library, pkg_dir_visitor visit,
+                           void *context, int stop_on_first,
+                           pkg_dir_progress progress, void *progress_context) {
     struct stat st;
     if (!visit || lstat(start, &st) || !S_ISDIR(st.st_mode))
         return 0;
-    return walk(start, library, st.st_dev, visit, context, stop_on_first, 0);
+    return walk(start, library, st.st_dev, visit, context, stop_on_first, 0,
+                progress, progress_context);
+}
+
+int walk_pkg_dirs(const char *start, const char *library, pkg_dir_visitor visit,
+                  void *context, int stop_on_first) {
+    return walk_pkg_dirs_progress(start, library, visit, context, stop_on_first, NULL, NULL);
 }

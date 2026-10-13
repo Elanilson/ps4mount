@@ -137,14 +137,14 @@ $('grid').addEventListener('click', function (e) {
   if (!b) return;
   var tid = b.getAttribute('data-t'), a = b.getAttribute('data-a');
   if (a === 'unmount' && !confirm('Desmontar ' + tid + '? O registro no PS5 será mantido; a restauração automática deste jogo será desativada.')) return;
-  if (a === 'mount' && !confirm('Montar ' + tid + '? Se necessário, o PS4Mount registrará o jogo ou reparará seus próprios metadados.')) return;
+  if (a === 'mount' && !confirm('Montar ' + tid + '? Jogos já registrados serão montados sem reinstalação; os arquivos auxiliares podem ser atualizados.')) return;
   busy[tid] = 1; render();
   api('/api/' + a + '?title_id=' + tid, 'POST').then(function (j) { toast(j.message); })
     .catch(function (err) { toast('Erro: ' + err.message); })
     .then(function () { delete busy[tid]; load(); });
 });
 $('q').addEventListener('input', render);
-$('rescan').onclick = function () { if (!confirm('Buscar PKGs em subpastas e organizá-los dentro do mesmo HD? Nenhum jogo será registrado nessa etapa.')) return; api('/api/rescan', 'POST').then(function (j) { toast(j.message); }).catch(function (e) { toast('Erro: ' + e.message); }); };
+$('rescan').onclick = function () { if (!confirm('Buscar PKGs em subpastas e organizá-los dentro do mesmo HD? Nenhum jogo será registrado nessa etapa.')) return; $('progress-title').textContent = 'Solicitando busca no USB…'; api('/api/rescan', 'POST').then(function (j) { toast(j.message); loadProgress(); }).catch(function (e) { toast('Erro: ' + e.message); loadProgress(); }); };
 $('logbtn').onclick = function () { api('/api/log').then(function (j) { $('log').textContent = j.log; $('logdlg').showModal(); }); };
 $('settingsbtn').onclick = function () {
   api('/api/config').then(function (c) {
@@ -177,10 +177,16 @@ function loadProgress() {
     var active = ['restoring','searching','activating','queued'].indexOf(p.phase) >= 0;
     $('rescan').disabled = active;
     $('progress-bar').max = Math.max(p.total, 1);
-    $('progress-bar').value = p.done;
+    if (p.phase === 'searching') $('progress-bar').removeAttribute('value'); // total unknown: animated indeterminate progress
+    else $('progress-bar').value = p.done;
     var phases = {idle: 'Aguardando comando', queued: 'Preparando ativação', restoring: 'Restaurando jogos ativos', searching: 'Buscando PKGs no USB', activating: 'Ativando jogo', complete: 'Operação concluída', error: 'Operação com erro'};
-    $('progress-title').textContent = (phases[p.phase] || p.phase) + ' — ' + p.done + '/' + p.total + ' · OK: ' + p.ok + ' · Falhas: ' + p.failed;
-    $('progress-detail').textContent = (p.current ? p.current + ' · ' : '') + p.detail;
+    if (p.phase === 'searching') {
+      $('progress-title').textContent = 'Buscando jogos no USB… · ' + p.scan_folders + ' pastas · ' + p.scan_pkgs + ' PKGs examinados · ' + p.scan_organized + ' organizados';
+      $('progress-detail').textContent = (p.scan_path || p.detail || 'Iniciando busca');
+    } else {
+      $('progress-title').textContent = (phases[p.phase] || p.phase) + ' — ' + p.done + '/' + p.total + ' · OK: ' + p.ok + ' · Falhas: ' + p.failed;
+      $('progress-detail').textContent = (p.current ? p.current + ' · ' : '') + p.detail;
+    }
     if (lastPhase && ['restoring','searching','activating'].indexOf(lastPhase) >= 0 && ['complete','error'].indexOf(p.phase) >= 0) load();
     lastPhase = p.phase;
   }).catch(function () { $('progress-detail').textContent = 'Painel desconectado; confira o log ao reconectar.'; });

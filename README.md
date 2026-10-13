@@ -1,4 +1,4 @@
-# PS4Mount 0.4.2 — ativação manual e recuperação automática (experimental)
+# PS4Mount 0.4.4 — montagem manual e progresso da busca USB (experimental)
 
 > Fork de teste baseado na **0.4.1 do gasb07**, mantendo a busca recursiva da nossa
 > versão anterior. **Não é uma versão oficial do autor.** O ELF não foi executado no
@@ -14,21 +14,24 @@
    (marcador `.src` válido e não `.disabled`). O painel mostra barra de progresso;
    há notificação no começo e no fim, se houver jogos a restaurar.
 4. Clique em **Buscar jogos no USB** para procurar PKGs em pastas e subpastas.
+   Enquanto a busca acontece, o painel mostra pastas percorridas, PKGs examinados,
+   arquivos organizados e a pasta atual, com barra animada (total ainda desconhecido).
    **ATENÇÃO: esta descoberta organiza/move os PKGs no mesmo HD externo**, seguindo
    o comportamento original: `ps4/<CUSA>/app.pkg`, `patch.pkg` e add-ons.
    Buscar não registra nem monta jogos novos.
-5. Clique em **Ativar jogo** em um cartão para registrar **somente aquele CUSA**.
-   Confirme o aviso; o painel exibe estado, contagem e eventuais falhas. Se já estiver
-   corretamente registrado, apenas remonta; caso contrário, usa a API individual
-   `AppInstallTitleDir` **quando disponível**. Não há fallback global.
-6. **Desativar jogo** libera as montagens de app/patch identificadas como nossas,
+5. Clique em **Montar** no cartão do jogo selecionado. Jogos já registrados
+   serão remontados mesmo se seus antigos marcadores estiverem ausentes ou
+   desatualizados; nesse caso, os arquivos auxiliares podem ser reconstruídos a
+   partir dos PKGs presentes no USB. Se ainda não estiver registrado, tenta o
+   registro individual `AppInstallTitleDir` **quando disponível**. Não há fallback global.
+6. **Desmontar** libera as montagens de app/patch identificadas como nossas,
    interrompe sua recuperação nas próximas inicializações e **não desinstala** o
    registro do PS5. As montagens de DLC compartilhadas não são forçadas a sair.
    **Encerrar ELF** encerra o daemon (na recuperação, após concluir o título atual).
 
 ## DLCs: limite importante
 
-Ao ativar um título, o fluxo original prepara os arquivos auxiliares para sua
+Ao montar um título, o fluxo original pode preparar os arquivos auxiliares para sua
 atualização e DLCs encontradas. Quando existem várias DLCs, seu **preparo** ocorre
 em grupos configuráveis (padrão de 5), com cada grupo registrado no log. **Isso
 não garante que os registros das DLCs sejam efetivamente concluídos no banco do
@@ -38,8 +41,10 @@ com um teste real no PS5. O sistema possui limites de dispositivos de montagem.
 
 ## Segurança e persistência
 
-- `/data/ps4mount/CUSAxxxxx.src`: marcador de origem já registrado; criado pelo
-  original, reutilizado somente após validação com `app.db`, arquivos e metadados.
+- `/data/ps4mount/CUSAxxxxx.src`: marcador da origem do PKG. Na montagem manual
+  de um título já registrado, ele pode ser atualizado a partir do PKG escolhido,
+  sem exigir um marcador antigo válido. A recuperação automática ainda exige
+  uma fonte persistida e validação antes de montar.
 - `.active`: jogo incluído na recuperação automática; `.disabled`: exclusão
   explícita dessa recuperação, sem desinstalar; `.attempt`: tentativa de registro
   em andamento/interrompida. **Não apague `.attempt` sem analisar o log e o estado

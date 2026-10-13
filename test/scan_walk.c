@@ -10,6 +10,7 @@
 #include "scan_walk.h"
 
 static int found, root_pkgs, nested_app, nested_patch, nested_dlc, custom_dir;
+static int probed_dirs, probed_managed;
 
 static void make_dir(const char *p) { assert(!mkdir(p, 0700)); }
 static void touch(const char *p) {
@@ -31,6 +32,11 @@ static int visit(const char *p, void *arg) {
     return 1;
 }
 static int probe(const char *p, void *arg) { (void)p; (void)arg; return 1; }
+static void check_progress(const char *p, void *arg) {
+    (void)arg;
+    probed_dirs++;
+    if (strstr(p, "/ps4/CUSA00001")) probed_managed++;
+}
 int main(void) {
     char template[] = "/tmp/ps4mount-walk-XXXXXX";
     char *root = mkdtemp(template);
@@ -59,7 +65,8 @@ int main(void) {
     snprintf(p, sizeof(p), "%s/Collection/Game B/loop", root); assert(!symlink(root, p));
     /* A directory with a .pkg suffix is not a package. */
     snprintf(p, sizeof(p), "%s/empty/directory.pkg", root); make_dir(p);
-    assert(walk_pkg_dirs(root, lib, visit, root, 0) == 5);
+    assert(walk_pkg_dirs_progress(root, lib, visit, root, 0, check_progress, NULL) == 5);
+    assert(probed_dirs >= 7 && probed_managed == 0);
     assert(found == 5 && root_pkgs == 1 && nested_app == 1 &&
            nested_patch == 1 && nested_dlc == 1 && custom_dir == 1);
     assert(walk_pkg_dirs(root, lib, probe, NULL, 1) == 1);
@@ -69,6 +76,6 @@ int main(void) {
     /* Cleanup test fixture without touching anything outside our own temp tree. */
     snprintf(p, sizeof(p), "rm -rf '%s'", root);
     assert(system(p) == 0);
-    puts("Recursive PKG discovery: OK (root, subfolders, DLC, patch, managed library exclusion, symlink)");
+    puts("Recursive PKG discovery + live folder callback: OK (root, nested DLC/patch, exclusion, symlink)");
     return 0;
 }

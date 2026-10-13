@@ -28,7 +28,7 @@
 - Fazer backup e testar ativação de **um jogo por vez**. Consultar
   `/data/ps4mount/log.txt` diante de qualquer estado incerto.
 
-## v0.4.3 — somente três ajustes solicitados
+## Histórico: v0.4.3 — três ajustes (reparo antigo substituído na 0.4.4)
 
 1. **Montar/Desmontar no painel:** botões renomeados; painel dá prioridade ao
    estado real de montagem ao exibir “Montado”, mesmo que haja um marcador de
@@ -54,3 +54,14 @@ host não substituem validação em console físico.
 Verificações extras no reparo: não prossegue se existir guarda `.attempt` de
 registro interrompido, se o digest base anterior divergir do pacote atual,
 ou se houver montagem de patch desconhecida em título sem atualização.
+
+
+## PS4Mount 0.4.4 — Montagem manual e progresso da busca
+
+Apenas **duas alterações solicitadas** em relação à 0.4.3:
+
+1. **Montar sem exigência do marcador de propriedade antigo:** ao clicar em **Montar** para um CUSA organizado no USB, se esse título já estiver registrado no banco do PS5, a aplicação usa o registro existente. Se os links/metadados auxiliares do próprio PS4Mount estiverem ausentes ou desatualizados, recria-os a partir do PKG encontrado, sem chamar o instalador do PS5 novamente. Isso permite remontar títulos desmontados e títulos anteriormente gerenciados pela 0.4.1. **Desmontar** mantém o registro no sistema. Para títulos ainda não registrados, continua sendo utilizada a API individual anterior, sem `AppInstallAll` global.
+
+2. **Progresso visível durante a busca USB:** ao clicar em **Buscar jogos no USB**, a barra fica animada (total desconhecido) e o painel atualiza a contagem de pastas percorridas, PKGs examinados, arquivos organizados e a pasta atual. A interface consulta `/api/progress` durante a varredura. A busca continua exclusivamente manual, sem registrar jogos nesta etapa.
+
+**Limites preservados:** não desmonta à força camadas ocupadas por outro aplicativo, não altera diretamente os bancos de dados do console e não instala títulos internos sobre PKGs do USB. A recriação de metadados do jogo selecionado pode sobrescrever arquivos auxiliares antigos do próprio título; faça backup restaurável antes de testar. Não testado no PS5 real; testes de compilação de sintaxe local não equivalem à build com SDK PS5 nem à execução no console.
