@@ -4,9 +4,8 @@
 /* Safety-preview design:
  * - Discovery only READS USB PKGs; explicit per-title USB relocation requires
  *   a fresh preview nonce and journal, NEVER automatic registration.
- * - Only targeted per-CUSA registration and daemon-owned bounded batches
- *   can write metadata. This opt-in auto-boot build starts ONE batch of up
- *   to five at first USB discovery; never auto-chains a second batch.
+ * - Only explicitly confirmed isolated CUSA06886 registration can write
+ *   metadata, after RO probe and release. Batch and auto-boot are blocked.
  * - No bulk API or SQLite fallback.
  * - No direct SQLite fallback.
  * - DLCs (ac) are ignored; existing games and system DB are never bulk-updated.
@@ -36,12 +35,15 @@
 #include "build.h"
 #include "db.h"
 #include "pkg.h"
+#include "upstream_safe.h"
 #include "update_version.h"
 #include "web.h"
 #include "organize.h"
 #include "icon_data.h"
 
-#define VERSION "PS4Mount 0.5.11-phase4j-safe-sync"
+#define VERSION "PS4Mount 0.5.13-phase4l-upstream040-safe"
+#define ISOLATED_TEST_TID "CUSA06886"
+static int prior_batch_unresolved(void);
 #define LOCK_PORT 9032
 #define SCAN_SECONDS 10
 #define STATE_DIR "/data/ps4mount"
@@ -55,8 +57,8 @@
  * files remain blocked unless a different sample disproves equality. */
 #define EXACT_COMPARE_MAX_BYTES (64ULL * 1024 * 1024)
 #define COMPARE_BLOCK_BYTES (16 * 1024)
-/* Until isolated console tests are completed, forbid ALL manual registrations.
- * Flip only in a dedicated test branch after backup/rollback planning. */
+/* Legacy app_add/global registration remains disabled; only the independently
+ * confirmed single-title API may be used after explicit per-CUSA confirmation. */
 #define ENABLE_EXPERIMENTAL_REGISTRATION 0
 
 typedef struct { char useless[45]; char message[3075]; } notify_request_t;
@@ -452,6 +454,25 @@ static int nullfs_mount(const char *dir, const char *target, int rw) {
     return 0;
 }
 
+/* Upstream 0.4.0: an unreachable USB mount can remain in the kernel mount
+ * table after the drive is disconnected. Observe this discrepancy in the
+ * audit ONLY. Never force-unmount or silently adopt an unknown layer. */
+static int stale_mount_layers(const char *path) {
+    int n=getfsstat(NULL,0,MNT_NOWAIT);
+    if(n<=0)return -1;
+    struct statfs *entries=calloc((size_t)n+16,sizeof(*entries));
+    if(!entries)return -1;
+    int found=0;
+    int count=getfsstat(entries,(long)(((size_t)n+16)*sizeof(*entries)),MNT_NOWAIT);
+    if(count<0){free(entries);return -1;}
+    for(int i=0;i<count;i++)if(!strcmp(entries[i].f_mntonname,path))found++;
+    free(entries);
+    if(!found)return 0;
+    struct statfs stat;
+    /* POSITIVE means a recorded layer exists but statfs cannot reach it. */
+    return statfs(path,&stat)!=0 ? found : 0;
+}
+
 /* One layer per path: switching read-only <-> read-write is unmount + mount
  * (this nullfs supports neither MNT_UPDATE nor a writable layer on top). */
 /* A running PS4 title keeps /mnt/sandbox/pfsmnt/<TID>-app0 mounted. Unlike the klog
@@ -527,8 +548,12 @@ static void unmount_title(const char *tid) {
     char target[64];
     snprintf(target, sizeof(target), "/user/app/%s", tid);
     unmount_owned_layer(target, m->dir);
-    snprintf(target, sizeof(target), "/user/patch/%s", tid);
-    unmount_owned_layer(target, m->dir);
+    /* A base-only title does NOT own /user/patch/<CUSA>. Leave it untouched,
+     * even when the firmware or another process has a foreign layer there. */
+    if (m->has_patch) {
+        snprintf(target, sizeof(target), "/user/patch/%s", tid);
+        unmount_owned_layer(target, m->dir);
+    }
 }
 
 /* /user/app/<TID> always, /user/patch/<TID> only with an update. */
@@ -537,10 +562,12 @@ static int mount_paths(const char *dir, const char *tid, int has_patch, int rw) 
     snprintf(target, sizeof(target), "/user/app/%s", tid);
     if (mount_dir(dir, target, rw))
         return -1;
+    if (!has_patch) {
+        printf("[safe][mount] %s BASE ONLY: /user/patch untouched (no patch.pkg)\n", tid);
+        return 0;
+    }
     snprintf(target, sizeof(target), "/user/patch/%s", tid);
-    if (has_patch)
-        return mount_dir(dir, target, rw);
-    return unmount_owned_layer(target, dir);
+    return mount_dir(dir, target, rw);
 }
 
 static int mount_title(const title_src_t *t, int rw) { return mount_paths(t->dir, t->app.title_id, t->has_patch, rw); }
@@ -756,6 +783,108 @@ static title_t g_titles[MAX_TITLES];
 static int g_title_count;
 static int g_manual_scan;
 static int g_last_seen[10];
+/* Upstream 0.4.0 inspired: SETTINGS here are for READ-ONLY catalog and planning.
+ * No setting can trigger AppInstallAll, add-on installation or daemon batch writes. */
+#define CONFIG_SAFE_PATH STATE_DIR "/config-safe-0.5.13.txt"
+#define MAX_SAFE_DLC 2048
+#define MAX_SCAN_FOLDERS 8
+typedef struct {
+    int group_size, group_preview, dlc_catalog;
+    int npaths;
+    char paths[MAX_SCAN_FOLDERS][128];
+} safe_config_t;
+static safe_config_t g_cfg_safe = {5, 1, 1, 1, {{""}}};
+typedef struct {
+    char path[PATH_MAX], root[32], title_id[10], content_id[37], game_id[10];
+    int data; /* 0: unlock-only; 1: data; -1: unknown */
+} safe_dlc_t;
+static safe_dlc_t *g_dlcs;
+static int g_dlc_count, g_dlc_overflow, g_dlc_matched, g_dlc_waiting;
+static void safe_dlc_forget_root(const char *root) {
+    for (int i = 0; i < g_dlc_count; ) {
+        if (!strcmp(root, g_dlcs[i].root)) {
+            memmove(g_dlcs+i, g_dlcs+i+1, (size_t)(g_dlc_count-i-1)*sizeof(g_dlcs[0]));
+            g_dlc_count--;
+        } else i++;
+    }
+}
+/* Purely informational: read SFO, no fake-key assertion and NO DLC installation.
+ * Upstream has the same header[0x77] classification and content-id convention. */
+static void safe_dlc_index(const char *root, const char *path) {
+    if (!g_cfg_safe.dlc_catalog) return;
+    /* Overlapping configured scan paths must not count the same DLC twice. */
+    for(int i=0;i<g_dlc_count;i++)
+        if(!strcmp(g_dlcs[i].root,root)&&!strcmp(g_dlcs[i].path,path)) return;
+    if (!g_dlcs) g_dlcs = calloc(MAX_SAFE_DLC, sizeof(*g_dlcs));
+    if (!g_dlcs || g_dlc_count >= MAX_SAFE_DLC) { g_dlc_overflow++; return; }
+    pkg_t pkg;
+    if (pkg_open(&pkg, path)) return;
+    sfo_t sfo;
+    const sfo_item_t *cat = read_sfo(&pkg, &sfo) ? NULL : sfo_get(&sfo, "CATEGORY");
+    if (cat && !cat->is_int && !strcmp(cat->sval,"ac") &&
+        strlen(pkg.title_id)==9 && !strncmp(pkg.title_id,"CUSA",4) &&
+        strlen(pkg.content_id)==36) {
+        safe_dlc_t *a=&g_dlcs[g_dlc_count++];
+        snprintf(a->root,sizeof(a->root),"%s",root);
+        snprintf(a->path,sizeof(a->path),"%s",path);
+        snprintf(a->title_id,sizeof(a->title_id),"%s",pkg.title_id);
+        snprintf(a->content_id,sizeof(a->content_id),"%s",pkg.content_id);
+        a->data = pkg.header[0x77]==0x1b ? 1 : pkg.header[0x77]==0x1c ? 0 : -1;
+    }
+    pkg_close(&pkg);
+}
+
+static title_t *catalog_find(const char *tid);
+static void safe_dlc_resolve_root(const char *root) {
+    /* In the original, title ID is matched first; SERVICE_ID_ADDCONT_ADD_n
+     * in the base/patch SFO handles add-ons with a different regional CUSA. */
+    typedef struct { char root[32], tid[10], prefix[20]; } service_t;
+    service_t *services = calloc(MAX_TITLES*14, sizeof(*services));
+    int nservices=0;
+    if (services) for(int i=0;i<g_title_count;i++) {
+        title_t *t=&g_titles[i];
+        if(strcmp(t->root,root)||!t->app_path[0]) continue;
+        for(int k=0;k<2;k++) {
+            const char *path=k?t->patch_path:t->app_path;
+            if(!path[0]) continue;
+            pkg_t pkg;
+            if(pkg_open(&pkg,path)) continue;
+            sfo_t sfo;
+            if(!read_sfo(&pkg,&sfo)) {
+                for(int z=1;z<=7;z++) {
+                    char key[32]; snprintf(key,sizeof(key),"SERVICE_ID_ADDCONT_ADD_%d",z);
+                    const sfo_item_t *it=sfo_get(&sfo,key);
+                    if(it&&!it->is_int&&strlen(it->sval)>=19&&nservices<MAX_TITLES*14) {
+                        service_t *e=&services[nservices++];
+                        snprintf(e->root,sizeof(e->root),"%s",root);
+                        snprintf(e->tid,sizeof(e->tid),"%s",t->tid);
+                        memcpy(e->prefix,it->sval,19);e->prefix[19]=0;
+                    }
+                }
+            }
+            pkg_close(&pkg);
+        }
+    }
+    g_dlc_matched=g_dlc_waiting=0;
+    for(int i=0;i<g_dlc_count;i++) {
+        safe_dlc_t *d=&g_dlcs[i];
+        d->game_id[0]=0;
+        title_t *t=catalog_find(d->title_id);
+        if(t && !strcmp(t->root,d->root) && t->app_path[0])
+            snprintf(d->game_id,sizeof(d->game_id),"%s",t->tid);
+        else for(int k=0;k<nservices;k++)
+            if(!strcmp(d->root,services[k].root) &&
+               !strncmp(d->content_id,services[k].prefix,19)) {
+                snprintf(d->game_id,sizeof(d->game_id),"%s",services[k].tid);
+                break;
+            }
+        if(d->game_id[0])g_dlc_matched++;else g_dlc_waiting++;
+    }
+    free(services);
+    printf("[safe][dlc] indexed=%d matched=%d waiting=%d overflow=%d (READ ONLY, metadata only; NO INSTALL)\n",
+           g_dlc_count,g_dlc_matched,g_dlc_waiting,g_dlc_overflow);
+}
+
 static int g_scan_dlc_ignored;
 static int g_scan_unreadable;
 
@@ -878,9 +1007,10 @@ static void inspect_pkg(const char *root, const char *path) {
     int kind = 0;
     if (describe_pkg(path, tid, &kind, name, ver, &size, content_id)) {
         if (kind == 3) {
-            g_scan_dlc_ignored++;
+            g_scan_dlc_ignored++; /* retained legacy field; means not installed */
+            safe_dlc_index(root, path);
             if (g_scan_dlc_ignored <= 8)
-                printf("[safe][pkg] CATEGORY=ac DLC ignored: %s\n", path);
+                printf("[safe][pkg] CATEGORY=ac DLC indexed for read-only matching: %s\n", path);
         } else {
             g_scan_unreadable++;
             if (g_scan_unreadable <= 8)
@@ -922,6 +1052,10 @@ static void inspect_pkg(const char *root, const char *path) {
         char *slash = strrchr(t->dir, '/');
         if (slash) *slash = 0;
     } else {
+        /* Multiple scan folders can overlap. Do not turn the same physical
+         * patch path into a false same-version conflict. */
+        for(int j=0;j<t->update_count;j++)
+            if(!strcmp(t->patches[j].path,path)) return;
         if (t->update_count >= MAX_UPDATE_CANDIDATES) {
             t->update_overflow = 1;
             t->patch_conflict = 1;
@@ -1272,7 +1406,21 @@ static int plan_title(const title_t *t, title_plan_t *plan, char *why, size_t ca
 static void scan_root(const char *root) {
     g_scan_dlc_ignored = g_scan_unreadable = 0;
     catalog_forget_root(root);
-    scan_nested(root, root, 0);
+    safe_dlc_forget_root(root);
+    int scan_everywhere=0;
+    for(int i=0;i<g_cfg_safe.npaths;i++) if(!g_cfg_safe.paths[i][0]) scan_everywhere=1;
+    if(scan_everywhere) scan_nested(root,root,0);
+    else {
+        /* Always keep canonical PS4 folders visible; do not orphan a registered
+         * game when a search folder setting is edited in the browser. */
+        char d[PATH_MAX];
+        snprintf(d,sizeof(d),"%s/PS4",root);scan_nested(root,d,0);
+        snprintf(d,sizeof(d),"%s/ps4",root);scan_nested(root,d,0);
+        for(int i=0;i<g_cfg_safe.npaths;i++) {
+            snprintf(d,sizeof(d),"%s/%s",root,g_cfg_safe.paths[i]);
+            scan_nested(root,d,0);
+        }
+    }
     for (int i = 0; i < g_title_count; ++i)
         if (!strcmp(root, g_titles[i].root)) resolve_updates(&g_titles[i]);
     int games = 0, conflicts = 0, updates = 0, total_candidates = 0, ignored_incompatible = 0;
@@ -1289,6 +1437,7 @@ static void scan_root(const char *root) {
         duplicates_verified += t->verified_duplicate_updates;
         duplicates_unverified += t->unverified_duplicate_updates;
     }
+    safe_dlc_resolve_root(root);
     printf("[safe][scan] %s: games=%d selected_updates=%d candidates=%d incompatible=%d conflicts=%d suspects=%d verified_duplicates=%d unverified_duplicates=%d ignored_dlc=%d unreadable=%d; NO files moved, NO games registered\n",
            root, games, updates, total_candidates, ignored_incompatible, conflicts,
            suspicious, duplicates_verified, duplicates_unverified, g_scan_dlc_ignored, g_scan_unreadable);
@@ -1362,6 +1511,142 @@ void app_sync_status_json(buf_t *out) {
         g_sync.processed,g_sync.total,g_sync.eligible,g_sync.registered,g_sync.blocked,g_sync.uncertain);
     json_str(out,g_sync.message);
     buf_printf(out,"}");
+}
+
+/* Preview of the eligible snapshot, not an executable queue. All endpoints
+ * remain read-only; no 125-game registration can be started in Phase 4K. */
+void app_registration_plan_json(buf_t *out) {
+    buf_printf(out,"{\"ok\":true,\"phase\":");
+    json_str(out,g_sync.active?"scanning":g_sync.complete?"ready":"waiting");
+    buf_printf(out,",\"auto_registration\":false,\"previous_batch_unresolved\":%s,\"single_title_test\":",
+               prior_batch_unresolved()?"true":"false");
+    json_str(out,ISOLATED_TEST_TID);
+    buf_printf(out,",\"total\":%d,\"eligible\":%d,\"registered\":%d,\"blocked\":%d,\"unknown\":%d,\"games\":[",
+       g_sync.total,g_sync.eligible,g_sync.registered,g_sync.blocked,g_sync.uncertain);
+    int first=1;
+    if(g_sync.complete && !g_sync.active)for(int i=0;i<g_title_count;i++) {
+        title_t *t=&g_titles[i];
+        if(!t->app_path[0] || t->conflict || t->patch_conflict || t->suspicious_updates ||
+           t->unverified_duplicate_updates || (t->update_count&&!t->patch_path[0]) ||
+           !supported_usb(t) || installed_internally(t->tid) || org_pending(t->root) ||
+           db_registered_status(t->tid)!=0) continue;
+        if(!first)buf_printf(out,",");
+        first=0;
+        buf_printf(out,"{\"title_id\":");json_str(out,t->tid);
+        buf_printf(out,",\"name\":");json_str(out,t->name);
+        buf_printf(out,",\"has_patch\":%s}",t->patch_path[0]?"true":"false");
+    }
+    buf_printf(out,"],\"group_size_preview\":%d,\"groups_estimate\":%d,\"message\":",g_cfg_safe.group_size,
+       g_cfg_safe.group_preview ? (g_sync.eligible+g_cfg_safe.group_size-1)/g_cfg_safe.group_size : 0);
+    json_str(out,"Read-only planning snapshot. Upstream AppInstallAll group registration DISABLED. Only isolated CUSA06886 test remains possible");
+    buf_printf(out,"}");
+}
+
+
+static int batch_running(void);
+/* --- Upstream 0.4.0 settings, safe subset. No registrations or DLC installs. --- */
+static void safe_config_load(void) {
+    FILE *f=fopen(CONFIG_SAFE_PATH,"r");
+    if(!f)return;
+    safe_config_t c=g_cfg_safe;
+    c.npaths=0;
+    char line[256], cleaned[128];
+    while(fgets(line,sizeof(line),f)) {
+        line[strcspn(line,"\r\n")]=0;
+        if(!strncmp(line,"group_size=",11)) c.group_size=atoi(line+11);
+        else if(!strncmp(line,"group_preview=",14)) c.group_preview=atoi(line+14)!=0;
+        else if(!strncmp(line,"dlc_catalog=",12)) c.dlc_catalog=atoi(line+12)!=0;
+        else if(!strncmp(line,"path=",5) && c.npaths<MAX_SCAN_FOLDERS &&
+                !ps4mount_safe_path(line+5,cleaned,sizeof(cleaned)))
+            snprintf(c.paths[c.npaths++],sizeof(c.paths[0]),"%s",cleaned);
+    }
+    fclose(f);
+    if(c.group_size<1||c.group_size>5)c.group_size=5;
+    if(!c.npaths){c.npaths=1;c.paths[0][0]=0;}
+    g_cfg_safe=c;
+}
+void app_settings_json(buf_t *out) {
+    buf_printf(out,"{\"ok\":true,\"group_preview\":%s,\"group_size\":%d,\"dlc_catalog\":%s,\"dlc_install_enabled\":false,\"group_registration_enabled\":false,\"paths\":[",
+       g_cfg_safe.group_preview?"true":"false",g_cfg_safe.group_size,g_cfg_safe.dlc_catalog?"true":"false");
+    for(int i=0;i<g_cfg_safe.npaths;i++) {
+        if(i)buf_printf(out,",");
+        char text[136];snprintf(text,sizeof(text),"/%s",g_cfg_safe.paths[i]);
+        json_str(out,text);
+    }
+    buf_printf(out,"]}");
+}
+int app_settings_set(const char *body, char *msg, size_t cap) {
+    if(g_sync.active || batch_running() || g_registration_busy) {
+        snprintf(msg,cap,"Aguarde o fim da leitura/operacao atual");return -1;
+    }
+    safe_config_t c=g_cfg_safe;
+    char v[1200];
+    for(const char *it=body;it&&*it;) {
+        const char *amp=strchr(it,'&');
+        const char *end=amp?amp:it+strlen(it);
+        const char *eq=memchr(it,'=',(size_t)(end-it));
+        if(!eq){snprintf(msg,cap,"Campo de configuracao invalido");return -1;}
+        if(ps4mount_url_decode(eq+1,(size_t)(end-eq-1),v,sizeof(v))) {
+            snprintf(msg,cap,"Codificacao de configuracao invalida");return -1;
+        }
+        size_t key=(size_t)(eq-it);
+        if(key==10&&!strncmp(it,"group_size",10)) {
+            if(strlen(v)!=1||v[0]<'1'||v[0]>'5'){
+                snprintf(msg,cap,"Grupo para planejamento: 1 a 5");return -1;
+            }
+            c.group_size=v[0]-'0';
+        }else if(key==13&&!strncmp(it,"group_preview",13)) {
+            if(strcmp(v,"0")&&strcmp(v,"1"))return -1;
+            c.group_preview=v[0]=='1';
+        }else if(key==11&&!strncmp(it,"dlc_catalog",11)) {
+            if(strcmp(v,"0")&&strcmp(v,"1"))return -1;
+            c.dlc_catalog=v[0]=='1';
+        }else if(key==5&&!strncmp(it,"paths",5)) {
+            c.npaths=0;
+            char *p=v;
+            do {
+                char *next=strchr(p,'\n');
+                if(next)*next++=0;
+                char clean[128];
+                if(ps4mount_safe_path(p,clean,sizeof(clean))) {
+                    snprintf(msg,cap,"Pasta de pesquisa invalida (sem .., /ps4, caracteres especiais)");
+                    return -1;
+                }
+                int duplicate=0;
+                for(int i=0;i<c.npaths;i++)if(!strcmp(c.paths[i],clean))duplicate=1;
+                if(!duplicate) {
+                    if(c.npaths>=MAX_SCAN_FOLDERS){snprintf(msg,cap,"Maximo de 8 pastas");return -1;}
+                    snprintf(c.paths[c.npaths++],sizeof(c.paths[0]),"%s",clean);
+                }
+                p=next;
+            } while(p);
+            if(!c.npaths){c.npaths=1;c.paths[0][0]=0;}
+        }else {snprintf(msg,cap,"Opcao desconhecida");return -1;}
+        it=amp?amp+1:NULL;
+    }
+    char conf[2048];int n=snprintf(conf,sizeof(conf),"group_size=%d\ngroup_preview=%d\ndlc_catalog=%d\n",c.group_size,c.group_preview,c.dlc_catalog);
+    for(int i=0;i<c.npaths;i++)n+=snprintf(conf+n,sizeof(conf)-(size_t)n,"path=%s\n",c.paths[i]);
+    if(n<0||(size_t)n>=sizeof(conf)||write_file(CONFIG_SAFE_PATH,conf,(size_t)n,0666)){
+        snprintf(msg,cap,"Falha ao gravar configuracao; estado anterior mantido");return -1;
+    }
+    g_cfg_safe=c;
+    printf("[safe][settings] saved group_size=%d paths=%d dlc_catalog=%d; no write actions enabled\n",c.group_size,c.npaths,c.dlc_catalog);
+    snprintf(msg,cap,"Preferencias salvas. Clique Sincronizar para atualizar a leitura; nenhum registro foi iniciado.");
+    return 0;
+}
+void app_dlcs_json(buf_t *out) {
+    buf_printf(out,"{\"ok\":true,\"indexed\":%d,\"matched\":%d,\"waiting\":%d,\"overflow\":%d,\"installed\":0,\"install_enabled\":false,\"metadata_only\":true,\"samples\":[",g_dlc_count,g_dlc_matched,g_dlc_waiting,g_dlc_overflow);
+    for(int i=0;i<g_dlc_count && i<80;i++){
+        safe_dlc_t *d=&g_dlcs[i];
+        if(i)buf_printf(out,",");
+        buf_printf(out,"{\"addon_id\":");json_str(out,d->title_id);
+        buf_printf(out,",\"content_id\":");json_str(out,d->content_id);
+        buf_printf(out,",\"game\":");json_str(out,d->game_id);
+        buf_printf(out,",\"kind\":");json_str(out,d->data==1?"data":d->data==0?"unlock":"unknown");
+        buf_printf(out,",\"path\":");json_str(out,d->path);
+        buf_printf(out,"}");
+    }
+    buf_printf(out,"]}");
 }
 
 static void scan_all(void) {
@@ -1672,7 +1957,7 @@ static const char *phase4_first_blocker(unsigned int checks) {
  * Real console verification is required before enabling registration. */
 static int phase4_ready(unsigned int checks);
 static struct {
-    int active, attempted, made_app_dir, made_patch_dir;
+    int active, attempted, made_app_dir, made_patch_dir, has_patch;
     char tid[10], dir[PATH_MAX];
 } g_probe;
 static struct {
@@ -1682,6 +1967,8 @@ static struct {
 } g_probe_auth;
 /* Registration may follow ONLY a verified RO mount AND safe release. */
 static char g_verified_ro_tid[10];
+/* Phase 4K: ONLY this title is authorized to attempt the single-title
+ * registration path. No unattended registration of the other titles. */
 
 
 static void probe_auth_clear(void) { memset(&g_probe_auth, 0, sizeof(g_probe_auth)); }
@@ -1803,7 +2090,8 @@ int app_probe_preview_json(const char *tid, buf_t *out) {
             snprintf(app, sizeof(app), "/user/app/%.9s", tid);
             snprintf(patch, sizeof(patch), "/user/patch/%.9s", tid);
             can_mount = !probe_safe_target(app, "/user/app", t->dir, &make_app) &&
-                        !probe_safe_target(patch, "/user/patch", t->dir, &make_patch);
+                        (!t->patch_path[0] ||
+                         !probe_safe_target(patch, "/user/patch", t->dir, &make_patch));
         }
     }
     const char *mode = can_release ? "release" : can_mount ? "mount" : "";
@@ -1832,13 +2120,51 @@ static int probe_layer(const char *target, const char *source) {
     if (!S_ISDIR(st.st_mode)) return -1;
     return top_layer(target, source);
 }
+/* Isolated diagnostic endpoint. No mkdir, mount, unmount, PKG relocation or
+ * registration. A base-only title may have an unrelated/foreign patch mount:
+ * report it as unowned, but NEVER change it. */
+int app_mount_audit_json(const char *tid, buf_t *out) {
+    title_t *t = catalog_find(tid);
+    if (!t || !t->app_path[0]) return -1;
+    char app[64], patch[64];
+    int made_app=0, made_patch=0;
+    snprintf(app,sizeof(app),"/user/app/%.9s",tid);
+    snprintf(patch,sizeof(patch),"/user/patch/%.9s",tid);
+    const int app_layer=probe_layer(app,t->dir);
+    const int patch_layer=probe_layer(patch,t->dir);
+    const int has_patch=!!t->patch_path[0];
+    const int app_safe=probe_safe_target(app,"/user/app",t->dir,&made_app)==0;
+    const int patch_safe=!has_patch ||
+        probe_safe_target(patch,"/user/patch",t->dir,&made_patch)==0;
+    buf_printf(out,"{\"ok\":true,\"title_id\":"); json_str(out,tid);
+    buf_printf(out,",\"has_patch\":%s,\"app_layer\":",has_patch?"true":"false");
+    json_str(out,app_layer<0?"foreign_or_unknown":app_layer==0?"unmounted":app_layer==1?"owned_ro":"owned_rw");
+    buf_printf(out,",\"patch_layer\":");
+    json_str(out,patch_layer<0?"foreign_or_unknown":patch_layer==0?"unmounted":patch_layer==1?"owned_ro":"owned_rw");
+    buf_printf(out,",\"patch_action\":");json_str(out,has_patch?"required_for_update":"UNUSED_UNTOUCHED");
+    const int stale_app=stale_mount_layers(app), stale_patch=stale_mount_layers(patch);
+    buf_printf(out,",\"stale_app_layers\":%d,\"stale_patch_layers\":%d,",stale_app,stale_patch);
+    buf_printf(out,"\"safe_to_probe\":%s,\"registration_auto_enabled\":false,\"message\":",
+               app_safe&&patch_safe&&stale_app==0&&(!has_patch||stale_patch==0)?"true":"false");
+    json_str(out,app_safe&&patch_safe&&stale_app==0&&(!has_patch||stale_patch==0)?
+       "No occupied required mountpoints or stale layers found. READ-ONLY audit only":
+       "Required mountpoint occupied/unavailable. Do not retry registration until inspected");
+    buf_printf(out,"}");
+    printf("[safe][mount-audit] %s app_layer=%d patch_layer=%d has_patch=%d safe=%d PATCH_%s (NO writes)\n",
+           tid,app_layer,patch_layer,has_patch,app_safe&&patch_safe,
+           has_patch?"REQUIRED":"IGNORED_UNTOUCHED");
+    return 0;
+}
+
 static int probe_release_internal(char *msg, size_t cap) {
     if (!g_probe.active) return plan_error(msg, cap, "No active mount probe");
     int failed = 0;
     char app[64], patch[64];
     snprintf(app, sizeof(app), "/user/app/%.9s", g_probe.tid);
     snprintf(patch, sizeof(patch), "/user/patch/%.9s", g_probe.tid);
-    int pa = probe_layer(app, g_probe.dir), pp = probe_layer(patch, g_probe.dir);
+    int pa = probe_layer(app, g_probe.dir);
+    /* Skip inspection AND unmount of the unowned patch path on base-only games. */
+    int pp = g_probe.has_patch ? probe_layer(patch, g_probe.dir) : 0;
     if (pa < 0 || pp < 0) {
         snprintf(msg, cap, "Unknown or foreign mount detected; no mount touched. Inspect before retry");
         return -1;
@@ -1885,7 +2211,8 @@ int app_probe_mount(const char *tid, const char *token, char *msg, size_t cap) {
     snprintf(patch_target, sizeof(patch_target), "/user/patch/%.9s", tid);
     int made_app = 0, made_patch = 0;
     if (probe_safe_target(app_target, "/user/app", t->dir, &made_app) ||
-        probe_safe_target(patch_target, "/user/patch", t->dir, &made_patch))
+        (t->patch_path[0] &&
+         probe_safe_target(patch_target, "/user/patch", t->dir, &made_patch)))
         return plan_error(msg, cap, "Mount target not empty/available; NO mounts made");
     /* Create only the directories confirmed absent. Reject races or replacements. */
     if (made_app && mkdir(app_target, 0777))
@@ -1897,6 +2224,7 @@ int app_probe_mount(const char *tid, const char *token, char *msg, size_t cap) {
     snprintf(g_probe.tid, sizeof(g_probe.tid), "%s", tid);
     snprintf(g_probe.dir, sizeof(g_probe.dir), "%s", t->dir);
     g_probe.active = 1;
+    g_probe.has_patch = !!t->patch_path[0];
     /* Record any targets we created, so an interrupted second mount can be cleaned. */
     g_probe.made_app_dir = made_app;
     g_probe.made_patch_dir = t->patch_path[0] && made_patch;
@@ -1993,11 +2321,14 @@ int app_register_preview_json(const char *tid, buf_t *out) {
     int verified = tid && !strcmp(g_verified_ro_tid, tid) && g_probe.attempted && !g_probe.active;
     app_install_title_dir_fn single = one_title_install_api();
     int supported = single != NULL;
-    int ready = verified && supported && !g_registration_busy && !g_registration_fault &&
-                phase4_ready(checks);
+    int isolated = tid && !strcmp(tid, ISOLATED_TEST_TID);
+    int ready = isolated && !prior_batch_unresolved() && verified && supported &&
+                !g_registration_busy && !g_registration_fault && phase4_ready(checks);
     /* A blocked registration preview must NOT invalidate an active release token. */
     if (ready && probe_auth_generate(tid, "register", t)) ready = 0;
-    const char *message = g_probe.active ? "Release the read-only mount before registration" :
+    const char *message = !isolated ? "Phase 4K permits registration ONLY for isolated CUSA06886" :
+        prior_batch_unresolved() ? "Previous batch FAILED/INTERRUPTED: inspect its state before any new system writes" :
+        g_probe.active ? "Release the read-only mount before registration" :
         !verified ? "Complete an ACTUAL read-only mount and release it in this PS4Mount session first" :
         !supported ? "Single-title AppInstallTitleDir unavailable on this firmware. NO AppInstallAll fallback" :
         g_registration_fault ? "Prior registration attempt failed; stop and inspect internal metadata" :
@@ -2020,6 +2351,8 @@ int app_register_one(const char *tid, const char *token, char *msg, size_t cap) 
     char app_path[PATH_MAX], patch_path[PATH_MAX];
     if (!probe_auth_consume(tid, "register", token, &a, &p, app_path, patch_path))
         return plan_error(msg, cap, "Invalid or expired ONE-title registration nonce");
+    if (!tid || strcmp(tid, ISOLATED_TEST_TID) || prior_batch_unresolved())
+        return plan_error(msg, cap, "Only isolated CUSA06886 allowed; old failed batch must be investigated first");
     if (g_probe.active || !g_probe.attempted || strcmp(g_verified_ro_tid, tid) ||
         g_registration_busy || g_registration_fault)
         return plan_error(msg, cap, "RO mount not verified/released or registration already attempted");
@@ -2042,7 +2375,8 @@ int app_register_one(const char *tid, const char *token, char *msg, size_t cap) 
     snprintf(app_target, sizeof(app_target), "/user/app/%.9s", tid);
     snprintf(patch_target, sizeof(patch_target), "/user/patch/%.9s", tid);
     if (probe_safe_target(app_target, "/user/app", t->dir, &create_app) ||
-        probe_safe_target(patch_target, "/user/patch", t->dir, &create_patch))
+        (t->patch_path[0] &&
+         probe_safe_target(patch_target, "/user/patch", t->dir, &create_patch)))
         return plan_error(msg, cap, "A target mount path is occupied: nothing registered");
     g_registration_busy = 1;
     g_registration_fault = 1; /* no retries after ANY mutation or unknown result */
@@ -2226,9 +2560,7 @@ int app_organize(const char *tid, const char *nonce, char *msg, size_t cap) {
  * AppInstallAll or replays. Work advances one phase per daemon event-loop turn.
  * Crash recovery is fail-closed: incomplete batches NEVER resume automatically. */
 #define BATCH_MAX 5
-/* This distribution is the explicitly opted-in auto-boot edition.
- * ONE batch per ELF process, at most 5 titles. No endless background batches.
- * Set to 0 before building if auto-registration is NOT wanted. */
+/* No unattended registration: preview-only planning for the whole catalog. */
 #define AUTO_BOOT_BATCH_LIMIT 0
 #ifndef BATCH_FILE
 #define BATCH_FILE STATE_DIR "/batch-v1.state"
@@ -2245,6 +2577,10 @@ typedef struct {
     char message[256];
 } batch_state_t;
 static batch_state_t g_batch;
+static int prior_batch_unresolved(void) {
+    return g_batch.phase == BATCH_FAILED || g_batch.phase == BATCH_INTERRUPTED ||
+           (g_batch.phase >= BATCH_PREPARE && g_batch.phase <= BATCH_VERIFY);
+}
 static int g_auto_boot_attempted;
 static struct {
     char token[33];
@@ -2351,7 +2687,7 @@ static int batch_candidate(title_t *t) {
  * previews and starts use the SAME snapshot, and a new preview revokes old token. */
 int app_batch_preview_json(int limit, buf_t *out) {
     memset(&g_batch_auth,0,sizeof(g_batch_auth));
-    int allowed = (limit==3 || limit==5) && !batch_running() &&
+    int allowed = 0 && (limit==3 || limit==5) && !batch_running() &&
         g_batch.phase!=BATCH_INTERRUPTED && g_batch.phase!=BATCH_FAILED &&
         !g_probe.active && !g_probe.attempted && !g_registration_busy &&
         !g_registration_fault && !g_deleting && !g_queued_tid[0] && one_title_install_api();
@@ -2393,6 +2729,9 @@ int app_batch_preview_json(int limit, buf_t *out) {
     return 0;
 }
 int app_batch_start(int limit,const char *token,char *msg,size_t cap) {
+    (void)limit; (void)token;
+    return plan_error(msg,cap,"Phase 4K: bulk/batch registration intentionally disabled; inspect CUSA06886 first");
+#if 0 /* Keep the reviewed state-machine implementation for a later opt-in build. */
     int count=g_batch_auth.count;
     time_t now=time(NULL);
     int valid=(limit==3 || limit==5) && count>0 && count<=limit &&
@@ -2421,6 +2760,7 @@ int app_batch_start(int limit,const char *token,char *msg,size_t cap) {
     printf("[safe][batch] START count=%d first=%s (daemon-owned, no bulk API)\n",count,g_batch.titles[0]);
     snprintf(msg,cap,"Backend queue accepted (%d games). You may leave/reopen panel, but keep ELF/PS5/USB powered",count);
     return 0;
+#endif
 }
 /* Disabled auto-registration on this safe-sync edition. Phase 4I: one-shot daemon auto-boot: NO browser actions and NO repeated
  * registrations. It invokes the SAME reviewed preview/start path as the panel,
@@ -2599,6 +2939,7 @@ static void batch_tick(void) {
             err=1;snprintf(detail,sizeof(detail),"Registration verification failed; stop batch");
         } else {
             printf("[safe][batch] %s VERIFIED %d/%d\n",tid,g_batch.index+1,g_batch.count);
+            notify("PS4Mount: registro %d/%d concluido (%s)",g_batch.index+1,g_batch.count,tid);
             g_batch.registered++;g_batch.index++;
             g_batch.phase=g_batch.index==g_batch.count?BATCH_DONE:BATCH_PREPARE;
         }
@@ -2874,8 +3215,9 @@ int main(void) {
     /* SAFE PREVIEW: shortcut installation invokes AppInstallAll and writes
      * to PS5 DB even during discovery; never install it automatically. */
     batch_restore();
+    safe_config_load();
     printf("\n======= " VERSION " session start =======\n");
-    printf("[safe] shortcut install DISABLED; bulk registration DISABLED; read-only synchronization; automatic registration DISABLED (limit=%d); open http://<PS5 IP>:8770\n", AUTO_BOOT_BATCH_LIMIT);
+    printf("[safe] Phase 4L: upstream 0.4.0 read-only DLC/catalog/settings merged; individual CUSA06886 test only; bulk/groups/DLC install DISABLED; panel :8770\n");
     g_web = web_listen();
     notify(g_web >= 0 ? VERSION " lendo jogos (somente leitura); painel :8770" : VERSION " lendo jogos (somente leitura); painel indisponivel");
     unlink(STATE_DIR "/stop");

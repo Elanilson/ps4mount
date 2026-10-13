@@ -38,3 +38,10 @@ int app_batch_active(void);
 
 /* Safe catalog synchronization status; GET-only. */
 void app_sync_status_json(buf_t *out);
+void app_registration_plan_json(buf_t *out);
+int app_mount_audit_json(const char *tid, buf_t *out);
+
+/* PS4Mount 0.4.0 merge: metadata/settings ONLY; no bulk registration. */
+void app_settings_json(buf_t *out);
+int app_settings_set(const char *body, char *msg, size_t cap);
+void app_dlcs_json(buf_t *out);

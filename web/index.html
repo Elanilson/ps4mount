@@ -51,6 +51,9 @@ pre{white-space:pre-wrap;font-size:12px;max-height:60vh;overflow:auto;background
     <input id="q" type="search" placeholder="Search game or CUSA">
     <button id="batchpreview" hidden>Consultar lote (desativado nesta versao)</button>
     <button id="rescan" class="primary">Sincronizar (somente leitura)</button>
+    <button id="queueplan">Consultar fila (somente leitura)</button>
+    <button id="settingsbtn">Configurações</button>
+    <button id="dlcbtn">DLCs (leitura)</button>
     <button id="recoverbtn">USB recovery</button>
     <button id="logbtn">Log</button>
     <button id="stop" class="danger">Stop</button>
@@ -61,11 +64,24 @@ pre{white-space:pre-wrap;font-size:12px;max-height:60vh;overflow:auto;background
   <section aria-label="Sincronizacao" style="margin-bottom:14px;padding:12px;border:1px solid var(--line);border-radius:10px;background:var(--panel)">
     <div id="syncstatus" role="status" aria-live="polite">Aguardando leitura dos jogos...</div>
     <progress id="syncprogress" value="0" max="1" style="width:100%;height:16px"></progress>
-    <div class="warn" style="margin-top:8px">Sincronizacao SOMENTE LEITURA. Registro automatico desativado: falha anterior de montagem em CUSA06886 necessita inspecao.</div>
+    <div class="warn" style="margin-top:8px">Sincronizacao SOMENTE LEITURA. Registro automatico bloqueado. Novo teste isolado CUSA06886: diagnostique as montagens antes de registrar.</div>
   </section>
   <div class="grid" id="grid"></div>
   <div class="empty" id="empty" hidden>No games found. PKGs may be in any subfolder; rescan to refresh.</div>
 </main>
+<dialog id="settingsdlg"><h3>Configurações — integração original 0.4.0</h3>
+  <p class="warn">Somente leitura e planejamento. NÃO habilita registro em grupos nem instalação de DLCs. Abrir a página não registra nada.</p>
+  <label>Pastas para buscar PKGs, uma por linha ("/" = HD inteiro). Pastas PS4/ps4 sempre incluídas:<br>
+    <textarea id="scanpaths" rows="5" style="width:100%;background:#10131a;color:#eee"></textarea></label><br>
+  <label><input id="groupenabled" type="checkbox"> Agrupar títulos na PRÉVIA (não executa lote)</label><br>
+  <label>Tamanho do grupo na prévia: <select id="groupsize"><option>1</option><option>2</option><option>3</option><option>4</option><option selected>5</option></select></label><br>
+  <label><input id="dlccatalog" type="checkbox"> Indexar DLCs (SOMENTE LEITURA; sem instalar)</label>
+  <pre id="settingsstatus"></pre><div class="bar"><button id="savesettings" class="primary">Salvar preferências</button><button id="closesettings">Fechar</button></div>
+</dialog>
+<dialog id="dlcdlg"><h3>DLCs encontrados (somente leitura)</h3><pre id="dlcinfo"></pre>
+  <p class="warn">Associação por CUSA e SERVICE_ID_ADDCONT_ADD_n do original 0.4.0. Nenhum DLC será movido, montado ou instalado nesta versão.</p>
+  <form method="dialog"><button>Fechar</button></form>
+</dialog>
 <dialog id="batchdlg"><h3>Lote automatico no ELF — 3 ou 5 jogos</h3>
   <label>Quantidade por lote:
     <select id="batchlimit"><option value="3" selected>3 jogos — primeiro teste recomendado</option>
@@ -83,6 +99,8 @@ pre{white-space:pre-wrap;font-size:12px;max-height:60vh;overflow:auto;background
   <div class="bar"><button id="batchstart" class="danger" disabled>Iniciar lote no ELF</button>
     <button id="batchclose">Fechar</button></div>
 </dialog>
+<dialog id="queuedlg"><h3>Fila planejada (sem registro)</h3><pre id="queueinfo" style="max-height:55vh;overflow:auto"></pre><form method="dialog"><button>Fechar</button></form></dialog>
+<dialog id="auditdlg"><h3>Auditoria de montagem (somente leitura)</h3><pre id="auditinfo"></pre><p class="warn">A verificacao nao monta, libera ou registra. Se houver camada estrangeira, nao a remova sem identificar a origem.</p><form method="dialog"><button>Fechar</button></form></dialog>
 <dialog id="logdlg"><h3>Log</h3><pre id="log"></pre><form method="dialog"><button>Close</button></form></dialog>
 <dialog id="launchdlg"><h3>Fase 4A — verificação de montagem e registro (somente leitura)</h3><pre id="launchinfo"></pre><p class="warn">Este teste NÃO monta, registra ou executa jogos. Resultado positivo valida somente os requisitos locais verificados; a integração com o sistema ainda precisa de auditoria.</p><form method="dialog"><button>Close</button></form></dialog>
 <dialog id="probedlg"><h3>Teste de montagem real — SOMENTE LEITURA</h3>
@@ -157,8 +175,10 @@ function render() {
       act = '<button data-a="plan" data-t="' + g.title_id + '">Preview folder plan</button>' + act;
     if (g.state !== 'conflict' && g.state !== 'internal' && g.state !== 'queued')
       act = '<button data-a="probe" data-t="' + g.title_id + '">Temporary read-only mount (Phase 4B)</button>' + act;
-    if (g.state !== 'conflict' && g.state !== 'internal' && g.state !== 'queued' && g.state !== 'ready')
+    if (g.title_id === 'CUSA06886' && g.state !== 'conflict' && g.state !== 'internal' && g.state !== 'queued' && g.state !== 'ready')
       act = '<button data-a="register" data-t="' + g.title_id + '">Tentar registro individual (apos montagem)</button>' + act;
+    if (g.state !== 'conflict' && g.state !== 'internal' && g.state !== 'queued')
+      act = '<button data-a="mount-audit" data-t="' + g.title_id + '">Auditar montagem (leitura)</button>' + act;
     if (g.state !== 'conflict' && g.state !== 'internal' && g.state !== 'queued')
       act = '<button data-a="launch-check" data-t="' + g.title_id + '">Check launch prerequisites (READ-ONLY)</button>' + act;
     if (busy[g.title_id]) act = '<button disabled>Please wait…</button>';
@@ -178,7 +198,7 @@ function render() {
   });
   $('grid').innerHTML = html;
   $('empty').hidden = games.length > 0;
-  var s = '<span>PHASE 4J · sincronizacao sem registro automatico</span><span>' + games.length + ' game(s)</span>';
+  var s = '<span>PHASE 4K · auditoria sem patch, lote desativado</span><span>' + games.length + ' game(s)</span>';
   for (var k in counts) s += '<span>' + esc(labels[k] || k) + ': ' + counts[k] + '</span>';
   $('summary').innerHTML = s;
 }
@@ -193,6 +213,20 @@ $('grid').addEventListener('click', function (e) {
   if (!b) return;
   if (autoBusy || batchBusy) return toast('Ha uma operacao em andamento. Aguarde a conclusao.');
   var tid = b.getAttribute('data-t'), a = b.getAttribute('data-a');
+  if (a === 'mount-audit') {
+    api('/api/mount-audit?title_id=' + tid).then(function (x) {
+      $('auditinfo').textContent = ['CUSA: ' + x.title_id,
+        'Atualizacao presente: ' + x.has_patch,
+        '/user/app: ' + x.app_layer,
+        '/user/patch: ' + x.patch_layer,
+        'Acao de patch: ' + x.patch_action,
+        'Montagem de teste permitida: ' + x.safe_to_probe,
+        'Status: ' + x.message,
+        'Nenhuma montagem foi alterada.'].join('\n');
+      $('auditdlg').showModal();
+    }).catch(function(e) { toast('Falha na auditoria: ' + e.message); });
+    return;
+  }
   if (a === 'auto-prepare') return autoPrepareOne(tid);
   if (a === 'probe') {
     busy[tid] = 1; render();
@@ -573,6 +607,26 @@ function syncRefresh() {
     return s;
   }).catch(function(e) { $('syncstatus').textContent = 'Erro consultando status: ' + e.message; });
 }
+$('queueplan').onclick = function () {
+  api('/api/registration-plan').then(function (p) {
+    var lines = ['PLANEJAMENTO (SOMENTE LEITURA)',
+      'Fase: ' + p.phase, 'Jogos encontrados: ' + p.total,
+      'Elegiveis pendentes: ' + p.eligible,
+      'Registrados: ' + p.registered, 'Bloqueados: ' + p.blocked,
+      'Estado desconhecido: ' + p.unknown,
+      'Registro automatico: DESATIVADO',
+      'Lote anterior exige inspecao: ' + p.previous_batch_unresolved,
+      'Teste isolado: ' + p.single_title_test,
+      '', 'Nenhum CUSA desta lista sera registrado automaticamente.',
+      '', 'Pendentes:'];
+    (p.games || []).forEach(function (g, i) {
+      lines.push((i + 1) + '/' + p.games.length + ' - ' + g.title_id +
+                 ' - ' + g.name + (g.has_patch ? ' [update]' : ' [base only]'));
+    });
+    $('queueinfo').textContent = lines.join('\n');
+    $('queuedlg').showModal();
+  }).catch(function (e) { toast('Nao foi possivel consultar a fila: ' + e.message); });
+};
 $('rescan').onclick = function () {
   if (batchBusy) return toast('Lote em andamento');
   $('rescan').disabled = true;
@@ -590,6 +644,36 @@ $('stop').onclick = function () {
 };
 load();
 setInterval(load, 5000);
+
+// Phase 4L: Upstream settings and DLC metadata, no automatic mutation.
+$('settingsbtn').onclick=function(){
+  api('/api/settings').then(function(c){
+    $('scanpaths').value=(c.paths||['/']).join('\n');
+    $('groupenabled').checked=!!c.group_preview;
+    $('groupsize').value=String(c.group_size||5);
+    $('dlccatalog').checked=!!c.dlc_catalog;
+    $('settingsstatus').textContent='O registro em grupo e a instalacao de DLC continuam desativados.';
+    $('settingsdlg').showModal();
+  }).catch(function(e){toast(e.message);});
+};
+$('closesettings').onclick=function(){$('settingsdlg').close();};
+$('savesettings').onclick=function(){
+  var data='paths='+encodeURIComponent($('scanpaths').value)+'&group_preview='+($('groupenabled').checked?'1':'0')+
+    '&group_size='+encodeURIComponent($('groupsize').value)+'&dlc_catalog='+($('dlccatalog').checked?'1':'0');
+  $('savesettings').disabled=true;
+  fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:data}).then(function(r){
+    return r.json().then(function(j){if(!r.ok)throw Error(j.error||'Erro');return j;});
+  }).then(function(j){$('settingsstatus').textContent=j.message;}).catch(function(e){$('settingsstatus').textContent='Erro: '+e.message;}).then(function(){$('savesettings').disabled=false;});
+};
+$('dlcbtn').onclick=function(){
+  api('/api/dlcs').then(function(d){
+    var lines=['DLCs indexados: '+d.indexed,'Associados a jogos: '+d.matched,'Aguardando jogo: '+d.waiting,
+      'Acima do limite do catalogo: '+d.overflow,'Instalados por esta versao: 0',''];
+    (d.samples||[]).forEach(function(a){lines.push((a.game||'AGUARDANDO')+'  '+a.addon_id+'  '+a.kind+'  '+a.content_id);});
+    $('dlcinfo').textContent=lines.join('\n');
+    $('dlcdlg').showModal();
+  }).catch(function(e){toast(e.message);});
+};
 </script>
 </body>
 </html>

@@ -6,10 +6,30 @@
 #include <assert.h>
 
 static int unmount_calls, mount_calls;
+static int test_base_only_mode, patch_statfs_reads;
+/* Simulate a PS5 with a known RO app mount and an UNRELATED foreign layer at
+ * /user/patch/CUSA06886, without touching real host /user paths. */
+int lstat(const char *p, struct stat *st) {
+    if (test_base_only_mode &&
+        (!strcmp(p, "/user/app/CUSA06886") ||
+         !strcmp(p, "/user/patch/CUSA06886"))) {
+        memset(st, 0, sizeof(*st)); st->st_mode = S_IFDIR | 0755;
+        return 0;
+    }
+    return fstatat(AT_FDCWD, p, st, AT_SYMLINK_NOFOLLOW);
+}
 int statfs(const char *p, struct statfs *sf) {
     memset(sf, 0, sizeof(*sf));
     snprintf(sf->f_mntonname, sizeof(sf->f_mntonname), "%s", p);
-    snprintf(sf->f_fstypename, sizeof(sf->f_fstypename), "foreignfs");
+    if (test_base_only_mode && !strcmp(p, "/user/app/CUSA06886")) {
+        snprintf(sf->f_fstypename, sizeof(sf->f_fstypename), "nullfs");
+        snprintf(sf->f_mntfromname, sizeof(sf->f_mntfromname), "/mnt/usb0/CUSA06886");
+        sf->f_flags = MNT_RDONLY;
+    } else {
+        if (test_base_only_mode && !strcmp(p, "/user/patch/CUSA06886"))
+            patch_statfs_reads++;
+        snprintf(sf->f_fstypename, sizeof(sf->f_fstypename), "foreignfs");
+    }
     return 0;
 }
 int nmount(void *iov, unsigned int niov, int flags) {
@@ -18,10 +38,17 @@ int nmount(void *iov, unsigned int niov, int flags) {
 }
 int unmount(const char *path, int flags) {
     (void)path; (void)flags;
-    unmount_calls++; return -1;
+    unmount_calls++; return test_base_only_mode ? 0 : -1;
 }
 int getfsstat(struct statfs *buf, long size, int flags) {
-    (void)buf; (void)size; (void)flags;
+    (void)size; (void)flags;
+    if (test_base_only_mode) {
+        if (buf) {
+            memset(buf, 0, sizeof(*buf));
+            snprintf(buf->f_mntonname, sizeof(buf->f_mntonname), "/mnt/other");
+        }
+        return 1; /* no matching running sandbox */
+    }
     return -1;  /* unreadable running-state: must be fail-closed */
 }
 int main(void) {
@@ -117,6 +144,44 @@ int main(void) {
     g_managed[0].running = 1;
     assert(batch_autoboot_gate() == -2); /* active game */
     puts("PASS: Phase 4J retains crash/active-game gating, auto-boot disabled");
+    /* Phase 4K: a BASE-ONLY CUSA never even INSPECTS the foreign patch layer. */
+    test_base_only_mode = 1;
+    patch_statfs_reads = 0;
+    assert(mount_paths("/mnt/usb0/CUSA06886", "CUSA06886", 0, 0) == 0);
+    assert(patch_statfs_reads == 0);
+    /* A title WITH a patch still refuses that very same foreign layer. */
+    assert(mount_paths("/mnt/usb0/CUSA06886", "CUSA06886", 1, 0) == -1);
+    assert(patch_statfs_reads > 0);
+    patch_statfs_reads = 0;
+    managed_t *m = &g_managed[0];
+    memset(m, 0, sizeof(*m)); m->used=1; m->has_patch=0;
+    snprintf(m->tid, sizeof(m->tid), "CUSA06886");
+    snprintf(m->dir, sizeof(m->dir), "/mnt/usb0/CUSA06886");
+    unmount_title("CUSA06886");
+    assert(patch_statfs_reads == 0);
+    patch_statfs_reads = 0;
+    memset(&g_probe, 0, sizeof(g_probe));
+    g_probe.active=1; g_probe.has_patch=0;
+    snprintf(g_probe.tid, sizeof(g_probe.tid), "CUSA06886");
+    snprintf(g_probe.dir, sizeof(g_probe.dir), "/mnt/usb0/CUSA06886");
+    char phase4k_msg[256];
+    assert(probe_release_internal(phase4k_msg,sizeof(phase4k_msg))==0);
+    assert(patch_statfs_reads==0);
+    memset(&g_probe, 0, sizeof(g_probe));
+    g_probe.active=1; g_probe.has_patch=1;
+    snprintf(g_probe.tid, sizeof(g_probe.tid), "CUSA06886");
+    snprintf(g_probe.dir, sizeof(g_probe.dir), "/mnt/usb0/CUSA06886");
+    int count_before = unmount_calls;
+    assert(probe_release_internal(phase4k_msg,sizeof(phase4k_msg))==-1);
+    assert(patch_statfs_reads>0);
+    assert(unmount_calls==count_before); /* foreign layer blocks ANY unmount */
+    assert(AUTO_BOOT_BATCH_LIMIT==0 && !strcmp(ISOLATED_TEST_TID,"CUSA06886"));
+    g_batch.phase=BATCH_FAILED;
+    assert(prior_batch_unresolved());
+    g_batch.phase=BATCH_IDLE;
+    assert(!prior_batch_unresolved());
+    puts("PASS: Phase 4K base-only ignores foreign patch; updated games fail closed; prior failure remains locked");
+    test_base_only_mode = 0;
     assert(rmdir(target) == 0);
     assert(rmdir(root) == 0);
     puts("PASS: foreign mounts left untouched and unreadable running-state blocks mutations");

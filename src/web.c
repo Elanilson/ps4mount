@@ -165,6 +165,20 @@ void web_serve(int listen_fd) {
         return;
     }
     req[n] = 0;
+    /* For settings POST, the body may arrive after headers. Hard limit protects
+     * the PS5 web thread from oversized requests and memory growth. */
+    char *hdrend=strstr(req,"\r\n\r\n");
+    const char *cl=strstr(req,"Content-Length:");
+    if(!cl)cl=strstr(req,"content-length:");
+    long content_length=cl?strtol(cl+15,NULL,10):0;
+    if(content_length<0||content_length>2048){json_msg(fd,0,"Settings body too long");close(fd);return;}
+    while(content_length>0 && (size_t)n<sizeof(req)-1 &&
+          (!hdrend || n-(hdrend+4-req)<content_length)) {
+        ssize_t r=read(fd,req+n,sizeof(req)-1-(size_t)n);
+        if(r<=0)break;
+        n+=r;req[n]=0;hdrend=strstr(req,"\r\n\r\n");
+    }
+    char *body=hdrend?hdrend+4:req+n;
     char method[8] = "", path[256] = "", tid[10], msg[256];
     sscanf(req, "%7s %255s", method, path);
     int post = !strcmp(method, "POST");
@@ -173,9 +187,28 @@ void web_serve(int listen_fd) {
      * GETs, batch status and the existing PS5 game launch monitor remain usable. */
     if (post && app_batch_active() && strncmp(path,"/api/batch-",11)) {
         json_msg(fd,0,"Backend batch is running. Other write operations are blocked");
+    } else if(!post && !strcmp(path,"/api/settings")) {
+        buf_t z={0};app_settings_json(&z);
+        reply(fd,"200 OK","application/json; charset=utf-8",z.data,z.len);buf_free(&z);
+    } else if(post && !strcmp(path,"/api/settings")) {
+        if(!hdrend || content_length != n-(body-req))
+            json_msg(fd,0,"Incomplete settings request");
+        else {int rc=app_settings_set(body,msg,sizeof(msg));json_msg(fd,!rc,msg);}
+    } else if(!post && !strcmp(path,"/api/dlcs")) {
+        buf_t z={0};app_dlcs_json(&z);
+        reply(fd,"200 OK","application/json; charset=utf-8",z.data,z.len);buf_free(&z);
     } else if (!post && !strcmp(path,"/api/sync-status")) {
         buf_t b={0};app_sync_status_json(&b);
         reply(fd,"200 OK","application/json; charset=utf-8",b.data,b.len);buf_free(&b);
+    } else if (!post && !strcmp(path,"/api/registration-plan")) {
+        buf_t b={0};app_registration_plan_json(&b);
+        reply(fd,"200 OK","application/json; charset=utf-8",b.data,b.len);buf_free(&b);
+    } else if (!post && !strncmp(path,"/api/mount-audit?",17)) {
+        if(title_param(path,tid))json_msg(fd,0,"Invalid CUSA");
+        else {buf_t b={0};int rc=app_mount_audit_json(tid,&b);
+              if(rc)json_msg(fd,0,"Title not catalogued");
+              else reply(fd,"200 OK","application/json; charset=utf-8",b.data,b.len);
+              buf_free(&b);}
     } else if (!post && !strcmp(path,"/api/batch-status")) {
         buf_t b={0};app_batch_status_json(&b);
         reply(fd,"200 OK","application/json; charset=utf-8",b.data,b.len);buf_free(&b);

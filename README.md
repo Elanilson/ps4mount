@@ -1,3 +1,80 @@
+# PS4Mount 0.5.13 — Integração segura de funcionalidades do original 0.4.0
+
+Esta versão é baseada na nossa **0.5.12**, com leitura de DLCs, configurações de busca e prévia de grupos inspiradas na versão original de gasb07. **Não** instala DLCs, **não** executa grupos no sistema e **não** reativa `AppInstallAll`. Abrir/reabrir a página é uma operação de consulta. Para uma descrição exata das melhorias e das partes ainda pendentes, leia [`UPSTREAM_040_MERGE.md`](UPSTREAM_040_MERGE.md).
+
+**Teste inicial recomendado:** sincronize a biblioteca e inspecione a aba **DLCs (leitura)**; não inicie registros até validarmos a nova leitura no PS5. A única operação de registro individual ainda permitida no código continua limitada ao CUSA06886, como na 0.5.12.
+
+---
+
+# PS4Mount 0.5.12 — Phase 4K: base-only mount fix and isolated CUSA06886 audit
+
+**Based on the full 0.5.11 source ZIP, not a rewrite.** This release addresses
+what the real 0.5.10 PS5 log reported: `CUSA06886` has NO `patch.pkg`, but the
+original code still attempted to inspect/unmount `/user/patch/CUSA06886` in
+several paths; an unrelated/foreign mount made the writable transition fail.
+The log confirms that failure, **not** that every foreign patch layer is safe.
+
+### Changes
+
+- `mount_paths()`: when `has_patch==0`, mount/transition ONLY `/user/app/<CUSA>`;
+  do not inspect, mount or unmount `/user/patch/<CUSA>`.
+- Probe preview, probe mount, probe release and individual registration's
+  pre-write mountpoint checks now check the patch path ONLY if the catalog has
+  an approved update. Probe state stores whether a patch was expected.
+- `unmount_title()` respects the `has_patch` ownership flag. Existing real
+  patch games still refuse to touch any foreign mount layer (fail closed).
+- `GET /api/mount-audit?title_id=CUSA06886` reports the app layer, patch layer,
+  whether patch is needed, and mount-probe readiness, **without modifications**.
+  For a base-only game a foreign patch is labeled `UNUSED_UNTOUCHED`.
+- `GET /api/registration-plan` lists the catalog snapshot's pending eligible
+  CUSAs and counts, in read-only mode. **This does not authorize or start a
+  queue**; a title labeled eligible still needs all per-title preflight checks.
+- Only **CUSA06886** is allowed to reach the already-existing explicit
+  single-title register preview/POST. Even that is blocked if the prior batch
+  state is FAILED/INTERRUPTED/running. No other title can be registered by
+  this edition, and any 3/5 batch start request is explicitly refused.
+- Auto-start remains OFF (`AUTO_BOOT_BATCH_LIMIT=0`), `AppInstallAll` stays
+  unavailable, no direct SQLite writes, no automatic recovery or unmount of
+  foreign layers. Opening or refreshing the web panel makes GET requests only.
+
+### First console test (read only, recommended)
+
+1. Build the source via GitHub Actions, load the new ELF and connect the USB.
+   The scanner should report 147 indexed titles (the exact count depends on USB).
+2. Open `http://<PS5 IP>:8770`. The existing sync is read-only. Use
+   **Consultar fila (somente leitura)** to see pending CUSAs; opening the page
+   or queue plan does not register anything.
+3. Find **What Remains of Edith Finch (CUSA06886)** in the panel. Click
+   **Auditar montagem (leitura)**. Record `app_layer`, `patch_layer`,
+   `patch_action`, `safe_to_probe`, and the PS4Mount log.
+4. **STOP if `app_layer` is `owned_rw`, `foreign_or_unknown`, or the previous
+   batch is FAILED/INTERRUPTED.** Do not manually delete `/user/patch` mounts,
+   remove `.state` files, or repeatedly re-register. The previous failed
+   attempt may have staged system files or left a mount on the console.
+5. If it is clear, the read-only **Temporary read-only mount** preview can be
+   reviewed for the one title. This mounts temporarily: release it through
+   the same panel before stopping the ELF. Do not proceed to registration
+   before reviewing the new log and having a restorable console backup.
+
+The source retains the explicit single-title registration flow for CUSA06886,
+with the previous failed-batch lock preserved. Therefore the 0.5.12 test **may
+intentionally stop before registration**. This is the safe outcome when the
+previous 0.5.10 batch has unresolved partial filesystem/metadata state; do not
+bypass that lock just to get a success message. Registering all 125 pending
+eligible games remains **disabled** until the mount issue is diagnosed on-console
+and several isolated tests have succeeded with rollback planning.
+
+### Local validation
+
+`bash tests/run_host_tests.sh`: covers a simulated base-only app mount with a
+foreign patch layer, unchanged foreign mounts, update-bearing failure cases,
+failed-batch recovery, web queue preview and read-only page load. Static host
+checks do **not** demonstrate behavior on PS5 firmware. Requires the PS5 Payload
+SDK and GitHub Actions to compile a deployable ELF. Back up console/user data
+and your USB PKGs outside the console before any experimental registration.
+
+---
+
 # PS4Mount 0.5.11 — Sincronizacao segura com progresso (Phase 4J)
 
 **Diagnostico comprovado no log da 0.5.10:** somente 2 jogos foram verificados

@@ -34,3 +34,13 @@ node tests/test_phase4f_panel.cjs
 node tests/test_phase4h_batch.cjs
 
 python3 tests/test_autoboot_source.py
+
+# Phase 4K: audits and registration planning have no automatic writes.
+node tests/test_phase4k_ui.cjs
+
+# Phase 4L: upstream 0.4.0 config input hardening, settings UI and DLC metadata
+# are read-only; no add-on installation or mass registration allowed.
+cc -std=gnu11 -O1 -Wall -Wextra -Werror -Isrc \
+  tests/test_upstream_safe.c src/upstream_safe.c -o /tmp/ps4mount-upstream-safe-test
+/tmp/ps4mount-upstream-safe-test
+node tests/test_phase4l_merge.cjs

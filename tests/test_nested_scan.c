@@ -119,11 +119,26 @@ int main(void) {
     snprintf(p, sizeof(p), "%s/Update Much Older.pkg", updates); write_dummy(p, "gp CUSA01623 01.02");
     snprintf(p, sizeof(p), "%s/Foreign Update.pkg", updates); write_dummy(p, "gp CUSA01623 99.99");
     snprintf(p, sizeof(p), "%s/DLC.pkg", dlcs); write_dummy(p, "ac CUSA01623");
+    snprintf(p, sizeof(p), "%s/Waiting.pkg", dlcs); write_dummy(p, "ac CUSA99998");
     snprintf(p, sizeof(p), "%s/Another Game.pkg", other); write_dummy(p, "gd CUSA01234");
     snprintf(p, sizeof(p), "%s/Orphan Update.pkg", updates); write_dummy(p, "gp CUSA09999");
 
     g_title_count = 0; scan_nested(root, root, 0);
     for (int i = 0; i < g_title_count; ++i) resolve_updates(&g_titles[i]);
+    assert(g_dlc_count==2);
+    safe_dlc_resolve_root(root);
+    assert(g_dlc_matched==1 && g_dlc_waiting==1);
+    int direct_match=0;
+    for(int i=0;i<g_dlc_count;i++)
+        if(!strcmp(g_dlcs[i].title_id,"CUSA01623") && !strcmp(g_dlcs[i].game_id,"CUSA01623")) direct_match++;
+    assert(direct_match==1);
+    printf("PASS: DLC metadata read-only: base match and waiting add-on counted\n");
+    /* Two configured scan folders may overlap, but a file counts only once. */
+    scan_nested(root,updates,0);
+    scan_nested(root,dlcs,0);
+    assert(g_dlc_count==2);
+    assert(catalog_find("CUSA01623")->update_count==4);
+    printf("PASS: overlapping folders do not duplicate DLC or update candidate\n");
     title_t *t = catalog_find("CUSA01623"), *t2 = catalog_find("CUSA01234");
     assert(t && t2 && t->app_path[0] && t->patch_path[0]);
     assert(strstr(t->app_path, "Original Game.pkg"));
