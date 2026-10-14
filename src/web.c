@@ -223,6 +223,12 @@ void web_serve(int listen_fd) {
             else rc=app_pilot_redirect(tid,cid,msg,sizeof(msg));
             json_msg(fd,!rc,msg);
         }
+    } else if (post && !strncmp(path, "/api/reinstall-dlcs?", 20)) {
+        if (title_param(path, tid)) json_msg(fd, 0, "invalid title_id");
+        else {
+            int rc = app_force_reinstall_dlcs(tid, msg, sizeof(msg));
+            json_msg(fd, !rc, msg);
+        }
     } else if (post && !strncmp(path, "/api/install-dlcs?", 18)) {
         if (title_param(path, tid)) json_msg(fd, 0, "invalid title_id");
         else {

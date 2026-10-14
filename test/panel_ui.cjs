@@ -22,7 +22,7 @@ const entries = [
   {name:'Beta 2',title_id:'CUSA22222',state:'ready'},
 ];
 const games = () => entries.map(g => ({ ...g, state:g.title_id === tid ? state : g.state,
-  version:'01.00',size:0,source:'/mnt/usb0/ps4/'+g.title_id,dlc:0,has_patch:false }));
+  version:'01.00',size:0,source:'/mnt/usb0/ps4/'+g.title_id,dlc:g.dlc||0,has_patch:false }));
 function fetch(path, opts = {}) {
   requests.push(path);
   let payload;
@@ -32,6 +32,9 @@ function fetch(path, opts = {}) {
     progress = {...progress,phase:fastComplete ? 'complete':'queued',current:tid,detail:'Preparing selected game'};
     if(fastComplete) state = 'ready';
     payload = {message:'Mount queued'};
+  } else if(path === '/api/reinstall-dlcs?title_id='+tid) {
+    progress = {...progress,phase:fastComplete ? 'dlc_error':'dlc_queued',current:tid,detail:'Manual DLC reinstall queued'};
+    payload = {message:'Manual reinstall queued'};
   } else if(path === '/api/unmount?title_id='+tid) {
     state='inactive'; payload = {message:'Unmounted'};
   } else payload = {message:'ok'};
@@ -53,7 +56,7 @@ const flush = async()=>{ for(let i=0;i<6;i++) await new Promise(resolve=>setImme
   const button = (action) => ({getAttribute:k=>k==='data-t'?tid:action});
   get('grid').onClick({target:{closest:()=>button('mount')}});
   assert.equal(confirms,0,'Mount must not request confirmation');
-  assert(get('grid').innerHTML.includes('Montando e registrando DLCs'));
+  assert(get('grid').innerHTML.includes('Montando e verificando DLCs'));
   assert(get('grid').innerHTML.includes('class="card-progress"'));
   await flush();
   assert(get('grid').innerHTML.includes('Preparando jogo'));
@@ -85,6 +88,32 @@ const flush = async()=>{ for(let i=0;i<6;i++) await new Promise(resolve=>setImme
   assert.equal(confirms,1,'No mount confirmation, including a second attempt');
   assert(!get('grid').innerHTML.includes('card-progress'),'Fast completion must clear card');
   assert.equal(get('toast').style.display,undefined);
+  // Manual DLC button is independent of Mount; a terminal DLC phase must
+  // release the card even when the poll never observed the running phase.
+  entries[1].dlc = 1;
+  state = 'ready';
+  vm.runInContext('load()',context);
+  await flush();
+  assert(get('grid').innerHTML.includes('Reinstalar DLCs'));
+  fastComplete = true;
+  progress = {...progress,phase:'idle',current:''};
+  get('grid').onClick({target:{closest:()=>button('reinstall-dlcs')}});
+  assert.equal(confirms,2,'Manual force reinstall must ask confirmation');
+  assert(get('grid').innerHTML.includes('Reinstalando DLCs'));
+  await flush();
+  assert(requests.includes('/api/reinstall-dlcs?title_id='+tid));
+  assert(!get('grid').innerHTML.includes('Reinstalando DLCs…'),'Terminal DLC error must clear busy card on first poll');
+  assert(get('toast').textContent.includes('erro'));
+  // Normal queued manual reinstall: progress and then successful terminal state.
+  fastComplete = false;
+  get('grid').onClick({target:{closest:()=>button('reinstall-dlcs')}});
+  await flush();
+  assert(get('grid').innerHTML.includes('Aguardando processamento de DLCs'));
+  progress = {...progress,phase:'dlc_complete',current:tid};
+  vm.runInContext('loadProgress()',context);
+  await flush();
+  assert(!get('grid').innerHTML.includes('Reinstalando DLCs…'));
+  assert(get('toast').textContent.includes('finalizada'));
   // USB scan remains global and visible only while scanning.
   progress = {...progress,phase:'searching',scan_folders:7,scan_pkgs:12,scan_organized:3,scan_path:'/mnt/usb0'};
   vm.runInContext('loadProgress()',context);

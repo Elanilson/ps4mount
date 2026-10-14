@@ -413,3 +413,10 @@ acionado se `addcont.db` informar ausência do registro. Com registro existente,
 a rotina tenta reutilizar journal/USB; na ausência de arquivos válidos, registra
 erro sem reinstalar, sem esperar um stub de 0 bytes crescer. Veja
 `TESTE-0426-DUAS-ALTERACOES.md`.
+
+### v0.4.27 — progresso do painel e reinstalação manual de DLCs
+
+- O cartão de jogo libera o estado de processamento quando `/api/progress` informa `dlc_complete` ou `dlc_error`, mesmo em operações que terminaram antes do primeiro poll.
+- Novo botão **Reinstalar DLCs** por jogo com DLC, com confirmação do usuário. Executa instalação nativa forçada e offload sequencial dos PKGs do USB, mesmo para DLCs já registrados. **O botão Montar não utiliza o modo forçado.**
+- Uma reinstalação só pode ser considerada pronta para offload se houver novamente um PKG físico nativo completo e verificado; o stub antigo de 0 bytes não é prova de sucesso.
+- O fluxo de Desmontar da v0.4.26 permanece inalterado. Veja `TESTE-0427-REINSTALAR-DLCS.md`.

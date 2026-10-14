@@ -134,7 +134,11 @@ function render() {
     else if (g.state === 'ready') act = '<button class="danger" data-a="unmount" data-t="' + g.title_id + '">Desmontar</button>';
     else if (g.state === 'running') act = '<button disabled>Feche o jogo para desmontar</button>';
     var job = busy[g.title_id];
-    if (job) act = '<button disabled>' + (job.action === 'unmount' ? 'Desmontando…' : 'Montando e processando DLCs…') + '</button>';
+    if (job) act = '<button disabled>' +
+      (job.action === 'unmount' ? 'Desmontando…' :
+       job.action === 'reinstall-dlcs' ? 'Reinstalando DLCs…' : 'Montando e processando DLCs…') + '</button>';
+    else if (g.dlc > 0 && ['ready','inactive'].indexOf(g.state) >= 0)
+      act += '<button data-a="reinstall-dlcs" data-t="' + g.title_id + '" title="Instala novamente os DLCs usando PKGs do USB e redireciona para liberar SSD">Reinstalar DLCs</button>';
     html += '<div class="card"><div class="art" style="background-image:url(/icon/' + g.title_id + ')">' +
       '<span class="badge b-' + g.state + '">' + esc(labels[g.state] || g.state) + '</span></div>' +
       '<div class="info"><div class="name">' + esc(g.name) + '</div>' +
@@ -163,17 +167,16 @@ $('grid').addEventListener('click', function (e) {
   if (!b) return;
   var tid = b.getAttribute('data-t'), a = b.getAttribute('data-a');
   if (busy[tid]) return;
-  if (a === 'unmount' && !confirm('Desmontar ' + tid + '? O jogo sera removido da biblioteca do PS5. Os PKGs no USB nao serao apagados.')) return;
+  if (a === 'unmount' && !confirm('Desmontar ' + tid + '? O jogo permanece na biblioteca. Os DLCs e seus PKGs no USB serao mantidos.')) return;
+  if (a === 'reinstall-dlcs' && !confirm('Reinstalar todos os DLCs de ' + tid + ' a partir do USB, mesmo se ja estiverem registrados? Feche o jogo. O PS4Mount verificara o PKG nativo e tentara redirecionar para o USB, liberando o SSD.')) return;
   // Mount is a single click. Unmount retains its safety confirmation.
-  busy[tid] = {action: a, percent:-1, detail: a === 'mount' ? 'Montando e registrando DLCs…' : 'Desmontando jogo…'};
+  busy[tid] = {action: a, percent:-1,
+    detail: a === 'mount' ? 'Montando e verificando DLCs…' :
+      a === 'reinstall-dlcs' ? 'Preparando reinstalação nativa dos DLCs…' : 'Desmontando jogo…'};
   render();
   api('/api/' + a + '?title_id=' + tid, 'POST').then(function () {
-    if (a === 'mount') {
-      // POST means queued, NOT completed: retain card progress until /api/progress says so.
-      if (busy[tid] && busy[tid].detail === 'Montando e registrando DLCs…') {
-        busy[tid].detail = 'Montagem e registro dos DLCs na fila…';
-        render();
-      }
+    if (a === 'mount' || a === 'reinstall-dlcs') {
+      // POST only queues the job; the progress endpoint reports completion.
       loadProgress();
     } else {
       delete busy[tid];
@@ -181,7 +184,7 @@ $('grid').addEventListener('click', function (e) {
     }
   }).catch(function (err) {
     delete busy[tid];
-    toast('Erro ao ' + (a === 'mount' ? 'montar' : 'desmontar') + ' ' + tid + ': ' + err.message);
+    toast('Erro ao ' + (a === 'mount' ? 'montar' : a === 'reinstall-dlcs' ? 'reinstalar DLCs de' : 'desmontar') + ' ' + tid + ': ' + err.message);
     load();
   });
 });
@@ -238,19 +241,29 @@ function loadProgress() {
     var installingDlc = (['dlc_queued','installing_dlcs'].indexOf(p.phase) >= 0) && p.current;
     if (installingDlc) {
       serverDlc = p.current;
-      var dlcDetail = p.phase === 'dlc_queued' ? 'Aguardando registro e redirecionamento USB…' :
-        ((p.done || 0) + '/' + (p.total || '?') + ' DLC(s) processados · ' + (p.detail || (p.phase === 'installing_dlcs' ? 'Instalando no SSD…' : 'Revalidando DLC…')));
-      var current = busy[serverDlc], actionDlc = 'mount';
+      var dlcDetail = p.phase === 'dlc_queued' ? 'Aguardando processamento de DLCs…' :
+        ((p.done || 0) + '/' + (p.total || '?') + ' DLC(s) processados · ' + (p.detail || 'Verificando DLC…'));
+      var current = busy[serverDlc];
+      var actionDlc = current && current.action === 'reinstall-dlcs' ? 'reinstall-dlcs' : 'mount';
       if (!current || current.action !== actionDlc || current.detail !== dlcDetail || current.percent !== p.dlc_percent) {
         busy[serverDlc] = {action:actionDlc, detail:dlcDetail, percent:p.dlc_percent};
         render();
       }
-    } else if (serverDlc && (p.phase === 'dlc_complete' || p.phase === 'dlc_error' || p.phase === 'probe_complete')) {
-      delete busy[serverDlc];
-      if (p.phase === 'dlc_error') toast('Falha no registro ou redirecionamento de DLC: consulte o log.');
+    }
+    // A fast DLC job can finish BEFORE the browser's first progress poll.
+    // Completion must not depend on having seen an installing_dlcs phase.
+    var terminalDlc = ['dlc_complete','dlc_error'].indexOf(p.phase) >= 0;
+    if (terminalDlc) {
+      var completedTid = p.current || serverDlc || serverMount;
+      var completedJob = busy[completedTid];
+      if (completedJob && (completedJob.action === 'mount' || completedJob.action === 'reinstall-dlcs')) {
+        delete busy[completedTid];
+        if (p.phase === 'dlc_error') toast('DLC de ' + completedTid + ': operação finalizada com erro. Consulte o log.');
+        else if (completedJob.action === 'reinstall-dlcs') toast('Reinstalação dos DLCs de ' + completedTid + ' finalizada.');
+        load(); render();
+      }
       serverDlc = '';
       serverMount = '';
-      load(); render();
     }
     var mounting = (p.phase === 'queued' || p.phase === 'activating') && p.current;
     var changed = false;
