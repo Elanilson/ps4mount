@@ -62,6 +62,7 @@ form.settings .row{display:flex;gap:8px;justify-content:flex-end}
     <button id="rescan" class="primary">Buscar jogos no USB</button>
     <button id="settingsbtn">Configurações</button>
     <button id="logbtn">Log</button>
+    <button id="restoreisolation" hidden>Restaurar outros jogos</button>
     <button id="stop" class="danger">Encerrar ELF</button>
   </div>
 </header>
@@ -91,7 +92,7 @@ form.settings .row{display:flex;gap:8px;justify-content:flex-end}
 <dialog id="logdlg"><h3>Log</h3><pre id="log"></pre><form method="dialog"><button>Fechar</button></form></dialog>
 <div id="toast"></div>
 <script>
-var games = [], busy = {}, lastPhase = '', serverMount = '', serverDlc = '';
+var games = [], busy = {}, lastPhase = '', serverMount = '', serverDlc = '', isolation = {active:false, target:'', hidden:0};
 var stageLabels = {
   'Preparing selected game': 'Preparando jogo…',
   'Checking selected title': 'Verificando arquivos e registro…',
@@ -130,12 +131,18 @@ function render() {
     if (['removed', 'inactive', 'pending'].indexOf(g.state) >= 0) act = '<button class="primary" data-a="mount" data-t="' + g.title_id + '">Montar</button>';
     else if (g.state === 'ready') act = '<button class="danger" data-a="unmount" data-t="' + g.title_id + '">Desmontar</button>';
     else if (g.state === 'running') act = '<button disabled>Feche o jogo para desmontar</button>';
-    if (g.dlc > 0 && g.state === 'ready')
-      act += '<button data-a="register-dlcs" data-t="' + g.title_id + '" title="Teste de revalidacao direcionada do titulo; sem instalacao nativa e sem AppInstallAll. Nao garante registro dos DLCs.">Registrar DLCs (USB)</button>';
+    if (g.dlc > 0 && g.state === 'ready') {
+      if (!isolation.active)
+        act += '<button data-a="isolate-others" data-t="' + g.title_id + '" title="Ocultar links de PKG de outros jogos sem renomear montagens">Isolar outros</button>';
+      if (isolation.active && isolation.target === g.title_id)
+        act += '<button data-a="restore-others" data-t="' + g.title_id + '">Restaurar outros</button>';
+      if (!isolation.active || isolation.target === g.title_id)
+        act += '<button data-a="register-dlcs" data-t="' + g.title_id + '" title="AppInstallAll continua GLOBAL mesmo com isolamento">Registrar DLCs (GLOBAL)</button>';
+    }
     if (g.dlc > 0)
       act += '<button data-a="diagnose-db" data-t="' + g.title_id + '" title="Consultar SOMENTE LEITURA os registros do addcont.db deste jogo, sem instalacao nem alteracoes">Diagnosticar DB</button>';
     var job = busy[g.title_id];
-    if (job) act = '<button disabled>' + (job.action === 'unmount' ? 'Desmontando…' : job.action === 'register-dlcs' ? 'Revalidando DLCs no USB…' : 'Montando…') + '</button>';
+    if (job) act = '<button disabled>' + (job.action === 'unmount' ? 'Desmontando…' : job.action === 'register-dlcs' ? 'Registro GLOBAL em andamento…' : 'Montando…') + '</button>';
     html += '<div class="card"><div class="art" style="background-image:url(/icon/' + g.title_id + ')">' +
       '<span class="badge b-' + g.state + '">' + esc(labels[g.state] || g.state) + '</span></div>' +
       '<div class="info"><div class="name">' + esc(g.name) + '</div>' +
@@ -151,11 +158,12 @@ function render() {
   $('empty').hidden = games.length > 0;
   var s = '<span>' + games.length + ' jogo(s)</span>';
   for (var k in counts) s += '<span>' + esc(labels[k] || k) + ': ' + counts[k] + '</span>';
+  if (isolation.active) s += '<span>ISOLAMENTO DE TESTE: ' + esc(isolation.target || 'recuperacao pendente') + ' · ' + isolation.hidden + ' links ocultos · AppInstallAll continua GLOBAL</span>';
   $('summary').innerHTML = s;
 }
 
 function load() {
-  api('/api/games').then(function (j) { games = sortGames(j.games); $('ver').textContent = j.version; render(); })
+  Promise.all([api('/api/games'), api('/api/isolation')]).then(function (arr) { var j = arr[0]; isolation = arr[1]; $('restoreisolation').hidden = !isolation.active; games = sortGames(j.games); $('ver').textContent = j.version; render(); })
     .catch(function (e) { toast('Não foi possível ler os jogos: ' + e.message); });
 }
 
@@ -171,16 +179,23 @@ $('grid').addEventListener('click', function (e) {
     }).catch(function (err) { toast('Falha ao consultar addcont.db: ' + err.message); });
     return;
   }
-  if (a === 'register-dlcs' && !confirm('Revalidar os registros dos DLCs de ' + tid + '? A chamada apenas revalida o titulo via AppInstallTitleDir e NAO tem eficacia comprovada para registrar DLCs. Nao executa instalacao nativa nem AppInstallAll.')) return;
+  if (a === 'isolate-others' || a === 'restore-others') {
+    if (a === 'isolate-others' && !confirm('TESTE: ocultar os links de PKG dos OUTROS jogos no staging. Jogos devem estar FECHADOS. Nao renomeia montagens nem arquivos USB. Isso NAO GARANTE que AppInstallAll ignore os outros. Continuar?')) return;
+    api(a === 'restore-others' ? '/api/restore-others' : '/api/isolate-others?title_id=' + tid, 'POST')
+      .then(function (j) { toast(j.message); load(); })
+      .catch(function (e) { toast('Falha: ' + e.message); load(); });
+    return;
+  }
+  if (a === 'register-dlcs' && !confirm('ATENCAO: AppInstallAll e GLOBAL, MESMO COM ISOLAMENTO. Pode processar outros jogos e DLCs e afetar o PS5. Ja houve falha grave antes. Continuar?')) return;
   if (a === 'unmount' && !confirm('Desmontar ' + tid + '? O registro no PS5 será mantido; a restauração automática deste jogo será desativada.')) return;
   // Mount is a single click. Unmount retains its safety confirmation.
-  busy[tid] = {action: a, percent:-1, detail: a === 'mount' ? 'Solicitando montagem…' : a === 'register-dlcs' ? 'Solicitando revalidacao USB…' : 'Desmontando jogo…'};
+  busy[tid] = {action: a, percent:-1, detail: a === 'mount' ? 'Solicitando montagem…' : a === 'register-dlcs' ? 'Solicitando registro GLOBAL…' : 'Desmontando jogo…'};
   render();
   api('/api/' + a + '?title_id=' + tid, 'POST').then(function () {
     if (a === 'mount' || a === 'register-dlcs') {
       // POST means queued, NOT completed: retain card progress until /api/progress says so.
-      if (busy[tid] && (busy[tid].detail === 'Solicitando montagem…' || busy[tid].detail === 'Solicitando revalidacao USB…')) {
-        busy[tid].detail = a === 'register-dlcs' ? 'Revalidacao USB na fila…' : 'Montagem na fila…';
+      if (busy[tid] && (busy[tid].detail === 'Solicitando montagem…' || busy[tid].detail === 'Solicitando registro GLOBAL…')) {
+        busy[tid].detail = a === 'register-dlcs' ? 'Registro GLOBAL na fila…' : 'Montagem na fila…';
         render();
       }
       loadProgress();
@@ -190,12 +205,13 @@ $('grid').addEventListener('click', function (e) {
     }
   }).catch(function (err) {
     delete busy[tid];
-    toast('Erro ao ' + (a === 'mount' ? 'montar' : a === 'register-dlcs' ? 'revalidar DLCs de' : 'desmontar') + ' ' + tid + ': ' + err.message);
+    toast('Erro ao ' + (a === 'mount' ? 'montar' : a === 'register-dlcs' ? 'registrar DLCs GLOBAL de' : 'desmontar') + ' ' + tid + ': ' + err.message);
     load();
   });
 });
 $('q').addEventListener('input', render);
 $('rescan').onclick = function () { if (!confirm('Buscar PKGs em subpastas e organizá-los dentro do mesmo HD? Nenhum jogo será registrado nessa etapa.')) return; $('progress-wrap').hidden = false; $('progress-title').textContent = 'Solicitando busca no USB…'; $('progress-bar').removeAttribute('value'); $('progress-detail').textContent = 'Aguardando início da busca'; api('/api/rescan', 'POST').then(function () { loadProgress(); }).catch(function (e) { toast('Erro: ' + e.message); loadProgress(); }); };
+$('restoreisolation').onclick = function () { api('/api/restore-others', 'POST').then(function (j) { toast(j.message); load(); }).catch(function (e) { toast('Erro ao restaurar: ' + e.message); load(); }); };
 $('logbtn').onclick = function () { api('/api/log').then(function (j) { $('log').textContent = j.log; $('logdlg').showModal(); }); };
 $('settingsbtn').onclick = function () {
   api('/api/config').then(function (c) {
@@ -243,8 +259,8 @@ function loadProgress() {
     var installingDlc = (p.phase === 'dlc_register_queued' || p.phase === 'registering_dlcs') && p.current;
     if (installingDlc) {
       serverDlc = p.current;
-      var dlcDetail = p.phase === 'dlc_register_queued' ? 'Aguardando revalidacao dos DLCs…' :
-        ((p.done || 0) + '/' + (p.total || '?') + ' DLC(s) processados · ' + (p.detail || 'Revalidando DLC…'));
+      var dlcDetail = p.phase === 'dlc_register_queued' ? 'Aguardando registro GLOBAL…' :
+        (p.detail || 'AppInstallAll GLOBAL executando; sem porcentagem de progresso confiavel');
       var current = busy[serverDlc];
       if (!current || current.action !== 'register-dlcs' || current.detail !== dlcDetail || current.percent !== p.dlc_percent) {
         busy[serverDlc] = {action:'register-dlcs', detail:dlcDetail, percent:p.dlc_percent};

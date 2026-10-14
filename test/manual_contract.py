@@ -7,7 +7,7 @@ web=(root/'src/web.c').read_text()
 page=(root/'web/index.html').read_text()
 db=(root/'src/db.c').read_text()
 checks={
- 'global AppInstallAll is not callable': 'sceAppInstUtilAppInstallAll(' not in main,
+ 'global AppInstallAll only via explicit experiment': main.count('sceAppInstUtilAppInstallAll(NULL)') == 1 and 'original_global_worker' in main and 'g_dlc_register_request[0]) register_dlcs_queued()' in main,
  'boot restores persisted titles': 'restore_active_games();' in main,
  'boot never calls recursive scan': 'scan_all();' not in main and 'scan_root(' not in main,
  'manual USB discovery has a dedicated flag': 'g_discover_requested' in main and 'adopt_root_pkgs(root)' in main,

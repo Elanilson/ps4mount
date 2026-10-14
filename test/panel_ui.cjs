@@ -27,6 +27,7 @@ function fetch(path, opts = {}) {
   requests.push(path);
   let payload;
   if(path === '/api/games') payload = {version:'test',games:games()};
+  else if(path === '/api/isolation') payload = {active:false,hidden:0,target:'',error:false};
   else if(path === '/api/progress') payload = progress;
   else if(path === '/api/mount?title_id='+tid) {
     progress = {...progress,phase:fastComplete ? 'complete':'queued',current:tid,detail:'Preparing selected game'};

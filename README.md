@@ -374,3 +374,7 @@ folder); this is not a read-only scan. It does not copy game PKGs to PS5 interna
 storage. Group registration, DLC install, automatic scans and web UI remain
 upstream behavior. Directory symlinks and other filesystem devices are not
 followed, and managed title folders are skipped during discovery.
+
+## Experimental original AppInstallAll (v0.4.13)
+
+Use **Registrar DLCs (GLOBAL)** only after reading [TESTE-REGISTRO-ORIGINAL-GLOBAL-0413.md](TESTE-REGISTRO-ORIGINAL-GLOBAL-0413.md). This may affect all prepared titles and previously caused instability. This mode is NOT title scoped and requires a deliberate click. Mount stays no-copy and does not trigger global registration automatically.

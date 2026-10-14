@@ -12,7 +12,7 @@ assert u.index('release_owned_layer(id, "addcont")') < u.index('release_owned_la
 assert 'other_active_title_uses_dlc' in u
 assert 'collect_bundle_mount_ids(tid, root, &t);' in r
 assert 'release_title_bundle(&t)' in r
-assert 'sceAppInstUtilAppInstallAll(' not in s
+assert s.count('sceAppInstUtilAppInstallAll(NULL)') == 1 and 'original_global_worker' in s and 'Registrar DLCs (GLOBAL)' in (Path(__file__).resolve().parent.parent/'web/index.html').read_text()
 assert '#define MAX_DLC_TIDS MAX_DLC' in s
 assert 'db_dlc_registration(ids, t->ndlc, states)' in s
 print('DLC bundle source contracts: OK')
