@@ -383,3 +383,8 @@ followed, and managed title folders are skipped during discovery.
 ## Teste 17 DLCs RE7 via USB (v0.4.16)
 
 Ver `TESTE-17-DLCS-SSD-USB-0416.md`. Substitui o teste de apenas um DLC por preflight integral dos 17 e restauração em lote, sem escrita no banco de dados.
+
+
+### Teste sequencial 0.4.17
+
+Veja [TESTE-SEQUENCIAL-0417.md](TESTE-SEQUENCIAL-0417.md). O fluxo verifica, monta e confirma um DLC por vez (ate 17) sem AppInstallAll e mantendo a instalacao nativa intacta.

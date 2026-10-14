@@ -135,7 +135,7 @@ function render() {
     if (g.dlc > 0 && g.state === 'ready')
       act += '<button data-a="install-dlcs" data-t="' + g.title_id + '" title="Instalacao nativa REAL; copia os PKGs para o SSD. Nao usa AppInstallAll.">Instalar DLCs (NATIVO / SSD)</button>';
     if (g.title_id === 'CUSA03842') {
-      act += '<button data-a="test-dlc-usb" data-t="' + g.title_id + '" title="TESTE de 17 DLCs nativos do RE7: compara PKGs completos e monta links USB por cima das pastas no SSD, sem apagar os originais.">Testar 17 DLCs no USB</button>';
+      act += '<button data-a="test-dlc-usb" data-t="' + g.title_id + '" title="TESTE sequencial: para cada DLC, compara PKG nativo com USB, monta e so entao avanca ao proximo; rollback se falhar.">Testar 17 DLCs no USB</button>';
       act += '<button data-a="restore-dlc-native" data-t="' + g.title_id + '" title="Desfaz todas as montagens temporarias dos DLCs de RE7 para exibir as instalacoes originais no SSD.">Restaurar 17 DLCs no SSD</button>';
     }
     if (g.dlc > 0)
@@ -178,7 +178,7 @@ $('grid').addEventListener('click', function (e) {
     return;
   }
   if (a === 'test-dlc-usb' || a === 'restore-dlc-native') {
-    var intro = a === 'test-dlc-usb' ? 'TESTE: comparar 17 PKGs do Resident Evil 7 (SSD x USB) e, se TODOS forem identicos, mascarar TEMPORARIAMENTE os 17 DLCs nativos com nullfs? Le a totalidade dos PKGs, pode demorar. Nao libera espaco nem altera registros. Feche o jogo.' : 'Desmontar os overlays dos 17 DLCs para mostrar os arquivos nativos intactos do SSD? Feche Resident Evil 7 antes.';
+    var intro = a === 'test-dlc-usb' ? 'TESTE SEQUENCIAL: verificar e montar 1 DLC por vez, ate 17. Se alguma etapa falhar, tentar restaurar as montagens anteriores. O jogo deve estar fechado. SSD e banco nao serao modificados.' : 'Desmontar os overlays dos 17 DLCs para mostrar os arquivos nativos intactos do SSD? Feche Resident Evil 7 antes.';
     if (!confirm(intro)) return;
     api('/api/' + a + '?title_id=' + tid, 'POST').then(function (j) {
       toast(j.message); loadProgress(); load();
@@ -247,8 +247,8 @@ function loadProgress() {
       $('progress-bar').max = Math.max(p.redirect_running ? p.redirect_total : p.total, 1);
       if (p.redirect_running) {
         $('progress-bar').value = p.redirect_done;
-        $('progress-title').textContent = (p.redirect_stage === 2 ? 'Montando' : 'Verificando PKGs completos de') + ' DLCs do Resident Evil 7 — ' + p.redirect_done + '/' + p.redirect_total;
-        $('progress-detail').textContent = p.redirect_stage === 2 ? 'Aplicando overlays reversiveis no SSD' : 'Comparando SSD x USB; pacotes grandes podem levar algum tempo';
+        $('progress-title').textContent = (p.redirect_stage === 2 ? 'Montando DLC ' : 'Verificando DLC ') + (p.redirect_current || 1) + '/' + p.redirect_total + ' — ' + (p.redirect_done || 0) + ' concluído(s)';
+        $('progress-detail').textContent = p.redirect_stage === 2 ? 'Aplicando nullfs para este DLC no SSD' : 'Comparando este PKG (SSD x USB) antes de montar; alguns sao grandes';
       } else if (p.phase === 'searching') {
         $('progress-bar').removeAttribute('value'); // total not known
         $('progress-title').textContent = 'Buscando jogos no USB… · ' + p.scan_folders + ' pastas · ' + p.scan_pkgs + ' PKGs examinados · ' + p.scan_organized + ' organizados';

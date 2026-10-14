@@ -41,7 +41,7 @@
 #include "web.h"
 #include "icon_data.h"
 
-#define VERSION "PS4Mount 0.4.16-all-dlcs-redirect-test"
+#define VERSION "PS4Mount 0.4.17-sequential-redirect-test"
 #define LOCK_PORT 9032
 #define SCAN_SECONDS 10 /* legacy value; polling for PKGs is disabled */
 #define STATE_DIR "/data/ps4mount"
@@ -2769,10 +2769,10 @@ failed:
 
 
 
-/* Reversible experiment for the 17 previously native-installed RE7 DLCs.
- * Compare ALL native/USB PKGs before overlaying ANY target; publish progress
- * while comparing multi-GB packages in a background thread. No SQLite writes,
- * AppInstallAll, native package installation, or deletion of SSD contents. */
+/* Reversible, SEQUENTIAL experiment for 17 natively-installed RE7 DLCs.
+ * Each DLC is compared and immediately mounted before the next is processed.
+ * Failure rolls back only this test's successfully mounted overlays.
+ * No database writes, native installation, AppInstallAll or deletion. */
 #define REDIRECT_TID "CUSA03842"
 #define REDIRECT_COUNT 17
 #define REDIRECT_NATIVE_ROOT "/mnt/ext1/user/addcont/" REDIRECT_TID
@@ -2790,6 +2790,7 @@ static const char *g_redirect_labels[REDIRECT_COUNT] = {
 static int g_redirect_job_active;
 static int g_redirect_stage;
 static int g_redirect_done;
+static int g_redirect_current;
 
 static void redirect_paths(int i, char *native, size_t nn, char *source, size_t sn) {
     snprintf(native, nn, REDIRECT_NATIVE_ROOT "/%s", g_redirect_labels[i]);
@@ -2859,8 +2860,8 @@ static void redirect_status(int stage, int done) {
     __atomic_store_n(&g_redirect_stage, stage, __ATOMIC_RELEASE);
 }
 
-/* Compare full content, including packages over 4GiB (not merely their size or
- * metadata). This can read tens of gigabytes; the web panel stays responsive. */
+/* Exact byte comparison, including PKGs >4GiB. Buffers live on heap because
+ * allocating two 64KiB arrays on a PS5 worker thread can exhaust its stack. */
 static int redirect_same_file_bytes(const char *native, const char *usb) {
     struct stat a, b;
     if (stat(native, &a) || stat(usb, &b) || !S_ISREG(a.st_mode) ||
@@ -2872,10 +2873,18 @@ static int redirect_same_file_bytes(const char *native, const char *usb) {
         if (fd2 >= 0) close(fd2);
         return -1;
     }
-    unsigned char x[65536], y[65536];
+    const size_t chunk = 64 * 1024;
+    unsigned char *both = malloc(chunk * 2);
+    if (!both) {
+        printf("[dlc-redirect] COMPARE FAILED: unable to allocate %zu-byte buffers\n", chunk * 2);
+        close(fd1);
+        close(fd2);
+        return -1;
+    }
+    unsigned char *x = both, *y = both + chunk;
     int rc = 0;
     for (;;) {
-        ssize_t n = read(fd1, x, sizeof(x));
+        ssize_t n = read(fd1, x, chunk);
         if (n < 0) { if (errno == EINTR) continue; rc = -1; break; }
         if (!n) break;
         size_t done = 0;
@@ -2887,6 +2896,7 @@ static int redirect_same_file_bytes(const char *native, const char *usb) {
         }
         if (rc || memcmp(x, y, (size_t)n)) { rc = -1; break; }
     }
+    free(both);
     close(fd1);
     close(fd2);
     return rc;
@@ -2970,150 +2980,173 @@ int app_restore_native_dlc(const char *tid, char *msg, size_t cap) {
     return failed ? -1 : 0;
 }
 
-/* Worker thread: never modifies addcont.db, never calls the native installer.
- * First verify all 17 against the original SSD before changing any mount. */
+/* Worker is started only after the 17 DB registrations are checked on the
+ * main thread. All 17 USB IDs are mapped first without mounting anything.
+ * Then for each item: compare -> stage -> mount -> verify -> next item.
+ * A failure reverses mounts owned by this run, in reverse order. */
 static void *redirect_all_worker(void *ignored) {
     (void)ignored;
-    title_src_t t = {0};
-    char root[32];
-    char usb[REDIRECT_COUNT][PATH_MAX];
+    title_src_t *t = NULL;
+    char (*usb)[PATH_MAX] = NULL;
+    char root[32] = {0};
     int mounted[REDIRECT_COUNT] = {0};
     int failed = 0, opened = 0;
-    memset(usb, 0, sizeof(usb));
+    printf("[dlc-redirect] WORKER START sequential test %d DLCs; no SSD writes\n", REDIRECT_COUNT);
+    fflush(stdout);
     redirect_status(1, 0);
+    __atomic_store_n(&g_redirect_current, 0, __ATOMIC_RELEASE);
+    /* Avoid large worker stack frames (also protects the PKG reader). */
+    t = calloc(1, sizeof(*t));
+    usb = calloc(REDIRECT_COUNT, sizeof(*usb));
+    if (!t || !usb) {
+        printf("[dlc-redirect] FAILED allocating worker state\n");
+        failed = 1;
+        goto out;
+    }
     if (find_root(REDIRECT_TID, root, sizeof(root)) ||
         strncmp(root, "/mnt/usb", 8) || !is_mountpoint(root) ||
-        src_open(&t, root, REDIRECT_TID)) {
-        printf("[dlc-redirect] FAILED: original RE7 USB not found / cannot read PKGs\n");
+        src_open(t, root, REDIRECT_TID)) {
+        printf("[dlc-redirect] FAILED: RE7 USB missing/unreadable; no overlays\n");
         failed = 1;
         goto out;
     }
     opened = 1;
-    if (t.ndlc != REDIRECT_COUNT) {
+    printf("[dlc-redirect] WORKER USB opened root=%s found=%d expected=%d\n",
+           root, t->ndlc, REDIRECT_COUNT);
+    if (t->ndlc != REDIRECT_COUNT) {
         printf("[dlc-redirect] FAILED: expected %d USB DLCs, found %d\n",
-               REDIRECT_COUNT, t.ndlc);
+               REDIRECT_COUNT, t->ndlc);
         failed = 1;
         goto out;
     }
     for (int i = 0; i < REDIRECT_COUNT; i++) {
         static const char prefix[] = "EP0102-CUSA03842_00-";
-        /* IDs in t.dlc are fully validated by src_open, one per label. */
         int which = -1;
-        for (int j = 0; j < t.ndlc; j++)
-            if (!strncmp(t.dlc[j].pkg.content_id, prefix, sizeof(prefix)-1) &&
-                !strcmp(t.dlc[j].pkg.content_id + 20, g_redirect_labels[i])) {
+        for (int j = 0; j < t->ndlc; j++)
+            if (!strncmp(t->dlc[j].pkg.content_id, prefix, sizeof(prefix)-1) &&
+                !strcmp(t->dlc[j].pkg.content_id + sizeof(prefix)-1, g_redirect_labels[i])) {
                 which = j;
                 break;
             }
         if (which < 0) {
-            printf("[dlc-redirect] FAILED missing or unexpected USB DLC: %s\n", g_redirect_labels[i]);
+            printf("[dlc-redirect] FAILED USB DLC not found %d/%d %s; no overlays\n",
+                   i+1, REDIRECT_COUNT, g_redirect_labels[i]);
             failed = 1;
             goto out;
         }
-        snprintf(usb[i], sizeof(usb[i]), "%s", t.dlc[which].path);
+        snprintf(usb[i], sizeof(usb[i]), "%s", t->dlc[which].path);
     }
     for (int i = 0; i < REDIRECT_COUNT; i++) {
-        char native[PATH_MAX], source[PATH_MAX], pkg[PATH_MAX];
-        redirect_paths(i, native, sizeof(native), source, sizeof(source));
-        snprintf(pkg, sizeof(pkg), "%s/ac.pkg", native);
+        char native[PATH_MAX], source[PATH_MAX], pkg[PATH_MAX], link[PATH_MAX];
+        char actual[PATH_MAX];
         struct stat st;
+        const char *meta[] = {"ac.json", "ac.pbm", "ac.pbm.backup"};
+        redirect_paths(i, native, sizeof(native), source, sizeof(source));
+        __atomic_store_n(&g_redirect_current, i + 1, __ATOMIC_RELEASE);
+        redirect_status(1, i);
+        printf("[dlc-redirect] STEP %d/%d %s: VERIFY START\n",
+               i + 1, REDIRECT_COUNT, g_redirect_labels[i]);
+        fflush(stdout);
+        snprintf(pkg, sizeof(pkg), "%s/ac.pkg", native);
         if (lstat(pkg, &st) || !S_ISREG(st.st_mode) ||
             layers_on(native) || dead_layer(native) ||
             owned_layer_count(native, source) != 0 || redirect_title_running() ||
             !is_mountpoint(root)) {
-            printf("[dlc-redirect] PREFLIGHT REFUSED %s: native/USB/mount invalid\n",
-                   g_redirect_labels[i]);
+            printf("[dlc-redirect] STEP %d/%d FAILED native/USB/mount preflight: %s\n",
+                   i+1, REDIRECT_COUNT, g_redirect_labels[i]);
             failed = 1;
             goto out;
         }
-        printf("[dlc-redirect] COMPARE %d/%d %s native vs USB (full bytes)\n",
-               i + 1, REDIRECT_COUNT, g_redirect_labels[i]);
         if (redirect_same_file_bytes(pkg, usb[i])) {
-            printf("[dlc-redirect] MISMATCH %s; no overlays were mounted\n", g_redirect_labels[i]);
+            printf("[dlc-redirect] STEP %d/%d MISMATCH/IO ERROR: %s\n",
+                   i+1, REDIRECT_COUNT, g_redirect_labels[i]);
             failed = 1;
             goto out;
         }
-        printf("[dlc-redirect] MATCH %d/%d %s\n", i + 1, REDIRECT_COUNT, g_redirect_labels[i]);
-        redirect_status(1, i+1);
-    }
-    /* All 17 have verified byte-for-byte. Prepare staging directories first;
-     * this can't affect installed DLCs because nothing is mounted yet. */
-    for (int i = 0; i < REDIRECT_COUNT; i++) {
-        char native[PATH_MAX], source[PATH_MAX], link[PATH_MAX];
-        redirect_paths(i, native, sizeof(native), source, sizeof(source));
+        printf("[dlc-redirect] STEP %d/%d MATCH: %s\n",
+               i+1, REDIRECT_COUNT, g_redirect_labels[i]);
+        redirect_status(2, i);
+        printf("[dlc-redirect] STEP %d/%d %s: STAGING + MOUNT START\n",
+               i+1, REDIRECT_COUNT, g_redirect_labels[i]);
+        fflush(stdout);
         mkdirs(source, 0770);
-        const char *meta[] = {"ac.json", "ac.pbm", "ac.pbm.backup"};
         for (int j = 0; j < 3; j++) {
             if (redirect_copy_meta(native, source, meta[j])) {
-                printf("[dlc-redirect] FAILED staging metadata %s/%s\n", g_redirect_labels[i], meta[j]);
+                printf("[dlc-redirect] STEP %d/%d FAILED staging %s/%s\n",
+                       i+1, REDIRECT_COUNT, g_redirect_labels[i], meta[j]);
                 failed = 1;
                 goto out;
             }
         }
         snprintf(link, sizeof(link), "%s/ac.pkg", source);
-        struct stat st;
         if (!lstat(link, &st) && !S_ISLNK(st.st_mode)) {
-            printf("[dlc-redirect] FAILED foreign staging ac.pkg at %s\n", link);
+            printf("[dlc-redirect] STEP %d/%d FAILED foreign staging link %s\n",
+                   i+1, REDIRECT_COUNT, link);
             failed = 1;
             goto out;
         }
         if ((!lstat(link, &st) && unlink(link)) || symlink(usb[i], link)) {
-            printf("[dlc-redirect] FAILED preparing USB link for %s\n", g_redirect_labels[i]);
+            printf("[dlc-redirect] STEP %d/%d FAILED staging USB symlink %s\n",
+                   i+1, REDIRECT_COUNT, g_redirect_labels[i]);
             failed = 1;
             goto out;
         }
-    }
-    redirect_status(2, 0);
-    for (int i = 0; i < REDIRECT_COUNT; i++) {
-        char native[PATH_MAX], source[PATH_MAX], pkg[PATH_MAX], actual[PATH_MAX];
-        redirect_paths(i, native, sizeof(native), source, sizeof(source));
         if (redirect_title_running() || !is_mountpoint(root) ||
             layers_on(native) || dead_layer(native)) {
-            printf("[dlc-redirect] FAILED mount safety check %s\n", g_redirect_labels[i]);
+            printf("[dlc-redirect] STEP %d/%d FAILED mount safety check %s\n",
+                   i+1, REDIRECT_COUNT, g_redirect_labels[i]);
             failed = 1;
             goto out;
         }
         if (nullfs_mount(source, native)) {
-            printf("[dlc-redirect] FAILED nullfs %s\n", g_redirect_labels[i]);
+            printf("[dlc-redirect] STEP %d/%d FAILED nullfs %s errno=%d\n",
+                   i+1, REDIRECT_COUNT, g_redirect_labels[i], errno);
             failed = 1;
             goto out;
         }
-        mounted[i] = 1; /* rollback even if verification below fails */
-        snprintf(pkg, sizeof(pkg), "%s/ac.pkg", native);
+        mounted[i] = 1; /* always roll back if the following check fails */
         ssize_t n = readlink(pkg, actual, sizeof(actual)-1);
         if (n > 0) actual[n] = 0;
         if (n <= 0 || strcmp(actual, usb[i]) || top_layer(native, source) != 1 ||
             owned_layer_count(native, source) != 1) {
-            printf("[dlc-redirect] FAILED verification for overlay %s\n", g_redirect_labels[i]);
+            printf("[dlc-redirect] STEP %d/%d FAILED overlay validation %s\n",
+                   i+1, REDIRECT_COUNT, g_redirect_labels[i]);
             failed = 1;
             goto out;
         }
-        printf("[dlc-redirect] ACTIVE %d/%d %s ac.pkg -> %s; SSD file HIDDEN, not deleted\n",
+        printf("[dlc-redirect] ACTIVE %d/%d %s ac.pkg -> %s; SSD remains intact\n",
                i+1, REDIRECT_COUNT, g_redirect_labels[i], actual);
-        redirect_status(2, i+1);
+        redirect_status(1, i+1);
+        fflush(stdout);
     }
     redirect_status(3, REDIRECT_COUNT);
-    printf("[dlc-redirect] ALL ACTIVE 17/17; DB unchanged; originals on SSD preserved\n");
+    __atomic_store_n(&g_redirect_current, REDIRECT_COUNT, __ATOMIC_RELEASE);
+    printf("[dlc-redirect] ALL ACTIVE 17/17; DB unchanged; original SSD files preserved\n");
 out:
     if (failed) {
         int rollback_failed = 0;
+        printf("[dlc-redirect] ERROR: restoring overlays already mounted in this run\n");
         for (int i = REDIRECT_COUNT-1; i >= 0; --i) {
             if (!mounted[i]) continue;
             char native[PATH_MAX], source[PATH_MAX];
             redirect_paths(i, native, sizeof(native), source, sizeof(source));
             if (top_layer(native, source) != 1 || owned_layer_count(native, source) != 1 ||
                 unmount(native, 0)) {
-                printf("[dlc-redirect] ROLLBACK FAILED %s; manually restore after closing game\n", g_redirect_labels[i]);
+                printf("[dlc-redirect] ROLLBACK FAILED %s; restore only when game closed\n", g_redirect_labels[i]);
                 rollback_failed++;
             } else {
                 printf("[dlc-redirect] ROLLBACK %s native SSD visible\n", g_redirect_labels[i]);
             }
         }
-        printf("[dlc-redirect] FAILED; overlay rollback failures=%d; check log BEFORE playing\n",
+        printf("[dlc-redirect] FAILED; rollback_failures=%d; verify log before playing\n",
                rollback_failed);
         redirect_status(4, 0);
     }
-    if (opened) src_close(&t);
+    if (opened) src_close(t);
+    free(t);
+    free(usb);
+    printf("[dlc-redirect] WORKER EXIT status=%s\n", failed ? "FAILED" : "OK");
+    fflush(stdout);
     __atomic_store_n(&g_redirect_job_active, 0, __ATOMIC_RELEASE);
     return NULL;
 }
@@ -3160,8 +3193,26 @@ int app_redirect_native_dlc(const char *tid, char *msg, size_t cap) {
     }
     __atomic_store_n(&g_redirect_job_active, 1, __ATOMIC_RELEASE);
     redirect_status(1, 0);
+    __atomic_store_n(&g_redirect_current, 0, __ATOMIC_RELEASE);
+    pthread_attr_t attr;
+    int rc = pthread_attr_init(&attr);
+    if (!rc) {
+        int stack_rc = pthread_attr_setstacksize(&attr, 512 * 1024);
+        if (stack_rc) {
+            printf("[dlc-redirect] FAILED configuring worker stack rc=%d\n", stack_rc);
+            pthread_attr_destroy(&attr);
+            rc = stack_rc;
+        }
+    }
+    if (rc) {
+        __atomic_store_n(&g_redirect_job_active, 0, __ATOMIC_RELEASE);
+        redirect_status(4, 0);
+        snprintf(msg, cap, "Nao foi possivel preparar thread (pthread %d)", rc);
+        return -1;
+    }
     pthread_t worker;
-    int rc = pthread_create(&worker, NULL, redirect_all_worker, NULL);
+    rc = pthread_create(&worker, &attr, redirect_all_worker, NULL);
+    pthread_attr_destroy(&attr);
     if (rc) {
         __atomic_store_n(&g_redirect_job_active, 0, __ATOMIC_RELEASE);
         redirect_status(4, 0);
@@ -3169,8 +3220,8 @@ int app_redirect_native_dlc(const char *tid, char *msg, size_t cap) {
         return -1;
     }
     pthread_detach(worker);
-    printf("[dlc-redirect] QUEUED verify + overlay all 17 native DLCs of %s; SSD untouched\n", tid);
-    snprintf(msg, cap, "Comparando 17 DLCs SSD x USB em segundo plano; acompanhe progresso");
+    printf("[dlc-redirect] QUEUED SEQUENTIAL verify+mount each of 17 native DLCs of %s; SSD untouched\n", tid);
+    snprintf(msg, cap, "Verificando e montando 1 DLC por vez (17); acompanhe progresso");
     return 0;
 }
 
@@ -3185,10 +3236,11 @@ void app_progress_json(buf_t *out) {
     json_str(out, g_scan_location);
     buf_printf(out, ",\"dlc_percent\":%d,\"dlc_content\":", g_dlc_percent);
     json_str(out, g_dlc_content);
-    buf_printf(out, ",\"redirect_running\":%d,\"redirect_stage\":%d,\"redirect_done\":%d,\"redirect_total\":%d",
+    buf_printf(out, ",\"redirect_running\":%d,\"redirect_stage\":%d,\"redirect_done\":%d,\"redirect_current\":%d,\"redirect_total\":%d",
                __atomic_load_n(&g_redirect_job_active, __ATOMIC_ACQUIRE),
                __atomic_load_n(&g_redirect_stage, __ATOMIC_ACQUIRE),
-               __atomic_load_n(&g_redirect_done, __ATOMIC_ACQUIRE), REDIRECT_COUNT);
+               __atomic_load_n(&g_redirect_done, __ATOMIC_ACQUIRE),
+               __atomic_load_n(&g_redirect_current, __ATOMIC_ACQUIRE), REDIRECT_COUNT);
     buf_printf(out, "}");
 }
 
