@@ -14,7 +14,7 @@ const get = (id) => elements[id] ||= {
 };
 get('q').value = '';
 const tid = 'CUSA11111';
-let confirms = 0, requests = [], state = 'pending', fastComplete = false,
+let confirms = 0, requests = [], state = 'pending', fastComplete = false, librarySetting = false,
   progress = {phase:'idle',total:0,done:0,ok:0,failed:0,current:'',detail:'',scan_folders:0,scan_pkgs:0,scan_organized:0,scan_path:''};
 const entries = [
   {name:'Beta 10',title_id:'CUSA33333',state:'pending'},
@@ -26,7 +26,11 @@ const games = () => entries.map(g => ({ ...g, state:g.title_id === tid ? state :
 function fetch(path, opts = {}) {
   requests.push(path);
   let payload;
-  if(path === '/api/games') payload = {version:'test',games:games()};
+  if(path === '/api/config' && opts.method === 'POST') {
+    librarySetting = opts.body === 'remove_from_library=1';
+    payload = {ok:true,message:'saved'};
+  } else if(path === '/api/config') payload = {remove_from_library:librarySetting};
+  else if(path === '/api/games') payload = {version:'test',games:games()};
   else if(path === '/api/progress') payload = progress;
   else if(path === '/api/mount?title_id='+tid) {
     progress = {...progress,phase:fastComplete ? 'complete':'queued',current:tid,detail:'Preparing selected game'};
@@ -95,5 +99,18 @@ const flush = async()=>{ for(let i=0;i<6;i++) await new Promise(resolve=>setImme
   vm.runInContext('loadProgress()',context);
   await flush();
   assert.equal(get('progress-wrap').hidden,true);
+  // Library removal option is off by default; changing it must persist via API.
+  assert.equal(get('remove-library').checked,false);
+  get('remove-library').checked=true;
+  get('remove-library').onchange();
+  await flush();
+  assert.equal(librarySetting,true);
+  assert(requests.includes('/api/config'));
+  assert.equal(get('remove-library').disabled,false);
+  get('remove-library').checked=false;
+  get('remove-library').onchange();
+  await flush();
+  assert.equal(librarySetting,false);
+  assert.equal(get('remove-library').checked,false);
   console.log('Panel UI: 15+ behavioral assertions passed');
 })().catch(e=>{console.error(e);process.exitCode=1;});

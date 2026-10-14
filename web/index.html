@@ -18,6 +18,13 @@ button:hover,button:focus{border-color:var(--accent);outline:none}
 button.primary{background:var(--accent);border-color:var(--accent)}
 button.danger{background:#3a1f1d;border-color:#5c2c28}
 button:disabled{opacity:.45;cursor:default}
+.library-switch{display:inline-flex;align-items:center;gap:8px;font-size:13px;color:var(--fg);cursor:pointer;white-space:nowrap}
+.library-switch input{position:absolute;opacity:0;width:1px;height:1px}
+.library-track{width:35px;height:20px;border-radius:20px;background:#535c6b;position:relative;border:1px solid var(--line)}
+.library-track:before{content:"";position:absolute;width:14px;height:14px;top:2px;left:2px;border-radius:50%;background:white;transition:transform .15s}
+.library-switch input:checked+.library-track{background:var(--accent)}
+.library-switch input:checked+.library-track:before{transform:translateX(15px)}
+.library-switch input:focus-visible+.library-track{outline:2px solid var(--fg);outline-offset:2px}
 main{padding:20px;max-width:1400px;margin:0 auto}
 .summary{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:18px;color:var(--muted)}
 .summary span{background:var(--panel);border:1px solid var(--line);border-radius:999px;padding:4px 12px}
@@ -62,6 +69,11 @@ form.settings .row{display:flex;gap:8px;justify-content:flex-end}
   <h1>PS4Mount <small id="ver"></small></h1>
   <div class="bar">
     <input id="q" type="search" placeholder="Buscar nome ou CUSA">
+    <label class="library-switch" title="Desligado: preserva o registro e a montagem USB dos DLCs. Ligado: desinstala o jogo da biblioteca e pode remover registros de DLC.">
+      <input id="remove-library" type="checkbox" role="switch" aria-label="Remover da biblioteca ao desmontar">
+      <span class="library-track" aria-hidden="true"></span>
+      Remover da biblioteca ao desmontar
+    </label>
     <button id="rescan" class="primary">Buscar jogos no USB</button>
     <button id="settingsbtn">Configurações</button>
     <button id="logbtn">Log</button>
@@ -95,6 +107,7 @@ form.settings .row{display:flex;gap:8px;justify-content:flex-end}
 <div id="toast"></div>
 <script>
 var games = [], busy = {}, lastPhase = '', serverMount = '', serverDlc = '', redirectWasRunning = false;
+var removeFromLibrary = false, removeSwitchSaving = false;
 var stageLabels = {
   'Preparing selected game': 'Preparando jogo…',
   'Checking selected title': 'Verificando arquivos e registro…',
@@ -158,12 +171,37 @@ function load() {
     .catch(function (e) { toast('Não foi possível ler os jogos: ' + e.message); });
 }
 
+function loadRemoveSwitch() {
+  api('/api/config').then(function (cfg) {
+    if (removeSwitchSaving) return;
+    removeFromLibrary = !!cfg.remove_from_library;
+    $('remove-library').checked = removeFromLibrary;
+  }).catch(function (e) { toast('Nao foi possivel ler a preferencia: ' + e.message); });
+}
+$('remove-library').onchange = function () {
+  if (removeSwitchSaving) return;
+  var desired = this.checked;
+  removeSwitchSaving = true;
+  this.disabled = true;
+  fetch('/api/config', {method:'POST', cache:'no-store', headers:{'Content-Type':'application/x-www-form-urlencoded'},
+    body:'remove_from_library=' + (desired ? '1' : '0')})
+    .then(function (r) { return r.json().then(function (j) { if (!r.ok || !j.ok) throw new Error(j.error || r.status); return j; }); })
+    .then(function () { removeFromLibrary = desired; toast(desired ? 'Desmontar vai remover da biblioteca.' : 'Desmontar vai preservar biblioteca e DLCs.'); })
+    .catch(function (e) { $('remove-library').checked = removeFromLibrary; toast('Nao foi possivel salvar: ' + e.message); })
+    .then(function () { removeSwitchSaving = false; $('remove-library').disabled = false; });
+};
 $('grid').addEventListener('click', function (e) {
   var b = e.target.closest('button[data-a]');
   if (!b) return;
   var tid = b.getAttribute('data-t'), a = b.getAttribute('data-a');
   if (busy[tid]) return;
-  if (a === 'unmount' && !confirm('Desmontar ' + tid + '? O jogo sera removido da biblioteca do PS5. Os PKGs no USB nao serao apagados.')) return;
+  if (a === 'unmount' && removeSwitchSaving) { toast('Aguarde salvar a preferência de desmontagem.'); return; }
+  if (a === 'unmount') {
+    var warning = removeFromLibrary
+      ? 'Desmontar e REMOVER ' + tid + ' da biblioteca? Isso pode apagar o registro dos DLCs; eles serao reinstalados se necessario na proxima montagem.'
+      : 'Desmontar ' + tid + '? O jogo continuara na biblioteca; os DLCs e seus registros serao preservados.';
+    if (!confirm(warning)) return;
+  }
   // Mount is a single click. Unmount retains its safety confirmation.
   busy[tid] = {action: a, percent:-1, detail: a === 'mount' ? 'Montando e registrando DLCs…' : 'Desmontando jogo…'};
   render();
@@ -287,6 +325,7 @@ function loadProgress() {
   });
 }
 load();
+loadRemoveSwitch();
 loadProgress();
 setInterval(loadProgress, 1500);
 setInterval(load, 30000);
