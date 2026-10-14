@@ -48,3 +48,5 @@ python3 test/db_diagnostics_contract.py
 
 
 
+
+python3 test/preserve_dlcs_contract.py

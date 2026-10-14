@@ -41,7 +41,7 @@
 #include "web.h"
 #include "icon_data.h"
 
-#define VERSION "PS4Mount 0.4.21-offload-recovery"
+#define VERSION "PS4Mount 0.4.22-preserve-dlcs"
 #define LOCK_PORT 9032
 #define SCAN_SECONDS 10 /* legacy value; polling for PKGs is disabled */
 #define STATE_DIR "/data/ps4mount"
@@ -72,7 +72,6 @@ static config_t g_cfg = {1, 5, 1, {""}, 1};
 typedef struct { char useless[45]; char message[3075]; } notify_request_t;
 int sceUserServiceInitialize(void *);
 int sceAppInstUtilInitialize(void);
-int sceAppInstUtilAppUnInstall(const char *);
 
 #include "ps5_appinst_pkg.h"
 #include "uninstall_event.h"
@@ -1894,37 +1893,6 @@ int app_add(const char *tid, char *msg, size_t cap) {
     return 0;
 }
 
-/* Original v0.5.0 strategy: targeted unregister in a worker thread to avoid
- * freezing the control panel. Timeout deliberately blocks another uninstall. */
-static volatile int g_one_uninstall_busy;
-static volatile int g_one_uninstall_rc;
-static char g_one_uninstall_tid[10];
-static void *uninstall_one_worker(void *arg) {
-    (void)arg;
-    g_one_uninstall_rc = sceAppInstUtilAppUnInstall(g_one_uninstall_tid);
-    __atomic_store_n(&g_one_uninstall_busy,0,__ATOMIC_RELEASE);
-    return NULL;
-}
-static int uninstall_title_one(const char *tid) {
-    if (__atomic_load_n(&g_one_uninstall_busy,__ATOMIC_ACQUIRE)) return -1;
-    snprintf(g_one_uninstall_tid,sizeof(g_one_uninstall_tid),"%s",tid);
-    __atomic_store_n(&g_one_uninstall_busy,1,__ATOMIC_RELEASE);
-    pthread_t thread;
-    if (pthread_create(&thread,NULL,uninstall_one_worker,NULL)) {
-        __atomic_store_n(&g_one_uninstall_busy,0,__ATOMIC_RELEASE);
-        printf("[oneclick] uninstall thread creation failed; no unsafe inline fallback\n");
-        return -1;
-    }
-    pthread_detach(thread);
-    for (int i=0;i<600;i++) {
-        if (!__atomic_load_n(&g_one_uninstall_busy,__ATOMIC_ACQUIRE))
-            return g_one_uninstall_rc;
-        pump_events(100);
-    }
-    printf("[oneclick] uninstall %s still pending after 60s; no overlapping retry\n",tid);
-    return -1;
-}
-
 /* Never unmount unknown/foreign layers and never uninstall via Disable. */
 static int write_state_atomic(const char *path, const char *tid) {
     char tmp[128];
@@ -1969,71 +1937,35 @@ static int other_active_title_uses_dlc(const char *tid, const char *dtid) {
     return 0;
 }
 
-/* Unmount must not require parsing every PKG again. Directories plus the active
- * manager cache identify the bundle even when a DLC file became unreadable. */
-static void collect_bundle_mount_ids(const char *tid, const char *root, title_src_t *t) {
-    snprintf(t->app.title_id, sizeof(t->app.title_id), "%s", tid);
-    char path[PATH_MAX];
-    snprintf(path, sizeof(path), "%s/ps4/%s/addcont", root, tid);
-    DIR *d = opendir(path);
-    struct dirent *e;
-    if (d) {
-        while ((e = readdir(d)) && t->ndlc_tids < MAX_DLC_TIDS) {
-            if (strlen(e->d_name) != 9 || strncmp(e->d_name, "CUSA", 4)) continue;
-            int valid = 1;
-            for (int k = 4; k < 9; ++k)
-                valid &= e->d_name[k] >= '0' && e->d_name[k] <= '9';
-            if (!valid) continue;
-            snprintf(t->dlc_tids[t->ndlc_tids++], 10, "%s", e->d_name);
-        }
-        closedir(d);
-    }
-    const managed_t *m = managed_by(tid, NULL);
-    for (int i = 0; m && i < m->ndlc_tids; ++i) {
-        int found = 0;
-        for (int j = 0; j < t->ndlc_tids; ++j)
-            if (!strcmp(t->dlc_tids[j], m->dlc_tids[i])) found = 1;
-        if (!found && t->ndlc_tids < MAX_DLC_TIDS)
-            snprintf(t->dlc_tids[t->ndlc_tids++], 10, "%s", m->dlc_tids[i]);
-    }
-}
-
-/* Release external DLCs, patch and base as one manually controlled operation.
- * No DB registrations or install metadata are deleted. */
-static int release_title_bundle(const title_src_t *t) {
-    const char *tid = t->app.title_id;
+/* Soft disable only the base and patch. Native DLC registration and offload
+ * overlay must remain intact, including their journal and zero-byte stub.
+ * Uninstalling the base via AppUnInstall cascades DLC unregistration on FW 11.40.
+ * IMPORTANT: this deliberately keeps the base title registered in the PS5
+ * library; the icon may still be visible but must not be launched unmounted. */
+static int release_base_patch_only(const char *tid) {
+    const char *kinds[]={"patch","app"};
     char target[64], hold[PATH_MAX];
-    /* Complete preflight first: never knowingly leave a partial group because
-     * a foreign or unreadable layer was discovered after unmounting the app. */
-    for (int i = 0; i < t->ndlc_tids + 2; ++i) {
-        const char *kind = i < t->ndlc_tids ? "addcont" :
-                           (i == t->ndlc_tids ? "patch" : "app");
-        const char *id = i < t->ndlc_tids ? t->dlc_tids[i] : tid;
-        if (!strcmp(kind, "addcont") && other_active_title_uses_dlc(tid, id)) continue;
-        snprintf(target, sizeof(target), "/user/%s/%s", kind, id);
-        hold_path(hold, sizeof(hold), kind, id);
-        if (dead_layer(target) || owned_layer_count(target, hold) < 0 ||
-            top_layer(target, hold) < 0) {
-            printf("[bundle][unmount] %s: unsafe/unreadable target %s; group unchanged\n", tid, target);
+    /* Preflight both targets before touching either one. Never remove a
+     * foreign/hidden layer or force release after USB disconnection. */
+    for (int i=0;i<2;i++) {
+        snprintf(target,sizeof(target),"/user/%s/%s",kinds[i],tid);
+        hold_path(hold,sizeof(hold),kinds[i],tid);
+        int count=owned_layer_count(target,hold);
+        int top=top_layer(target,hold);
+        if (dead_layer(target) || count<0 || top<0 ||
+            (count>0 && top!=1)) {
+            printf("[oneclick][keep-dlcs] %s unsafe base/patch layer %s; no mounts released\n",tid,target);
             return -1;
         }
     }
-    for (int i = 0; i < t->ndlc_tids; ++i) {
-        const char *id = t->dlc_tids[i];
-        if (other_active_title_uses_dlc(tid, id)) {
-            printf("[bundle][unmount] %s: add-on %s still required by another mounted game\n", tid, id);
-            continue;
-        }
-        if (release_owned_layer(id, "addcont")) return -1;
+    if (release_owned_layer(tid,"patch") || release_owned_layer(tid,"app")) {
+        printf("[oneclick][keep-dlcs] %s base/patch release incomplete; inspect before retry\n",tid);
+        return -1;
     }
-    if (release_owned_layer(tid, "patch") || release_owned_layer(tid, "app")) return -1;
-    printf("[bundle][unmount] %s: app, patch and %d add-on folder(s) handled\n", tid, t->ndlc_tids);
+    printf("[oneclick][keep-dlcs] %s base+patch unmounted; add-on mounts and DB registrations preserved\n",tid);
     return 0;
 }
 
-static int offload_unmount_title(const char *tid);
-static int uninstall_title_one(const char *tid);
-static int uninstall_title_one(const char *tid);
 int app_remove(const char *tid, char *msg, size_t cap) {
     if (redirect_locked()) {
         snprintf(msg, cap, "Restore temporary native DLC overlay first");
@@ -2054,8 +1986,6 @@ int app_remove(const char *tid, char *msg, size_t cap) {
         snprintf(msg, cap, "%s not found on connected USB", tid);
         return -1;
     }
-    title_src_t t = {0};
-    collect_bundle_mount_ids(tid, root, &t);
     /* Persist disabled intent BEFORE releasing mounts. An I/O error must not
      * leave the game unexpectedly active again after the next reboot. */
     char path[64];
@@ -2064,30 +1994,20 @@ int app_remove(const char *tid, char *msg, size_t cap) {
         snprintf(msg, cap, "Could not persist disabled status for %s", tid);
         return -1;
     }
-    if (release_title_bundle(&t)) {
-        snprintf(msg, cap, "Could not safely release %s bundle; restore disabled, inspect mounts", tid);
+    if (release_base_patch_only(tid)) {
+        snprintf(msg,cap,"Could not safely release %s base/patch; DLCs untouched",tid);
         return -1;
     }
-    /* A system unregistration must not see a dangling native DLC nullfs mount.
-     * Zero-byte stubs remain as installation metadata; USB bytes are untouched. */
-    if (offload_unmount_title(tid)) {
-        snprintf(msg,cap,"Could not release DLC USB redirections for %s",tid);
-        return -1;
-    }
-    /* Upstream 0.5.0 behavior: remove *only this title* from the library. */
-    int urc = db_is_registered(tid) ? uninstall_title_one(tid) : 0;
-    if (urc) {
-        printf("[oneclick] %s targeted uninstall error=0x%08x\n",tid,(unsigned)urc);
-        snprintf(msg,cap,"PS5 refused targeted removal of %s (0x%08x)",tid,(unsigned)urc);
-        return -1;
-    }
+    /* Deliberately DO NOT call sceAppInstUtilAppUnInstall: it removes DLC
+     * records. DO NOT release /user/addcont or native offload nullfs. */
+    printf("[oneclick][keep-dlcs] %s DLC registry, native USB overlay and offload journal retained\n",tid);
     snprintf(path, sizeof(path), STATE_DIR "/%s.active", tid);
     unlink(path);
     managed_t *m = managed_by(tid, NULL);
     if (m) m->used = 0;
-    printf("[oneclick] %s removed from PS5 library; original USB PKGs untouched\n", tid);
+    printf("[oneclick] %s base+patch deactivated; game remains registered in PS5 library; DLCs preserved\n", tid);
     g_catalog_dirty = 1;
-    snprintf(msg, cap, "%s removed from the library; USB PKGs preserved", tid);
+    snprintf(msg, cap, "%s base+patch unmounted; DLCs and PS5 registrations kept (game icon may remain)",tid);
     return 0;
 }
 
@@ -2274,8 +2194,6 @@ static int offload_one(const dlc_src_t *dlc, const char *tid);
 static int offload_wait_native_ready(const dlc_src_t *dlc, const char *tid, int status_unavailable);
 static int offload_resume_title(const char *tid);
 static void offload_resume_all(void);
-static int offload_unmount_title(const char *tid);
-static int uninstall_title_one(const char *tid);
 
 static void report_dlc_registration(const title_src_t *t) {
     if (!t->ndlc) return;
@@ -2809,14 +2727,25 @@ static void install_dlcs_queued(void) {
     printf("[dlc-install] %s found=%d already_in_db=%d attempting_all=%d\n",
            tid, t.ndlc, already, todo);
     if (!todo) goto done;
-    /* External overlays would otherwise hide the installer's destination. */
-    for (int i = 0; i < t.ndlc_tids; ++i) {
-        if (other_active_title_uses_dlc(tid, t.dlc_tids[i]) ||
-            dlc_installer_release_external_layer(t.dlc_tids[i])) {
-            printf("[dlc-install] %s could not safely clear add-on overlay %s\n", tid, t.dlc_tids[i]);
-            fatal = 1;
-            goto done;
+    /* Keep existing add-on mounts intact when every selected DLC is already
+     * registered: remounting the base must not disturb a valid USB offload.
+     * Only clear external add-on layers when a NATIVE installer is needed. */
+    int needs_native_installer=0;
+    for(int i=0;i<t.ndlc;i++) {
+        if ((!only_cid[0] || !strcmp(t.dlc[i].pkg.content_id,only_cid)) &&
+            states[i]!=1) needs_native_installer=1;
+    }
+    if (needs_native_installer) {
+        for (int i=0; i<t.ndlc_tids; ++i) {
+            if (other_active_title_uses_dlc(tid,t.dlc_tids[i]) ||
+                dlc_installer_release_external_layer(t.dlc_tids[i])) {
+                printf("[dlc-install] %s could not safely clear add-on overlay %s\n",tid,t.dlc_tids[i]);
+                fatal=1;
+                goto done;
+            }
         }
+    } else {
+        printf("[oneclick][keep-dlcs] %s all selected DLCs registered; no installer and no add-on unmount\n",tid);
     }
     for (int i = 0; i < t.ndlc; ++i) {
         if (only_cid[0] && strcmp(t.dlc[i].pkg.content_id, only_cid)) continue;
@@ -3450,28 +3379,14 @@ static void offload_resume_all(void) {
         if(!existing)snprintf(tids[n++],10,"%s",tid);
     }
     closedir(d);
-    for(int i=0;i<n;i++)if(active_status(tids[i]) && !title_running(tids[i]))
+    for (int i=0;i<n;i++) if (!title_running(tids[i])) {
+        /* The game may be manually unmounted but its DLC stays registered.
+         * offload_resume_title itself checks each DLC database registration. */
+        printf("[offload] restore USB DLC overlay for %s (base may be disabled)\n",tids[i]);
         offload_resume_title(tids[i]);
+    }
     free(tids);
 }
-static int offload_unmount_title(const char *tid) {
-    DIR *d=opendir(STATE_DIR);if(!d)return 0;
-    struct dirent *e;int failed=0;
-    while((e=readdir(d))) {
-        if(strncmp(e->d_name,"offload_",8) || strlen(e->d_name)!=48 || strcmp(e->d_name+44,".txt"))continue;
-        char path[PATH_MAX];snprintf(path,sizeof(path),STATE_DIR "/%s",e->d_name);
-        offload_record_t rec;if(offload_read(path,&rec)) {failed=1;continue;}
-        if(strncmp(rec.cid+7,tid,9))continue;
-        int top=top_layer(rec.native,rec.stage), count=owned_layer_count(rec.native,rec.stage);
-        if(top==1 && count==1) {
-            if(unmount(rec.native,0))failed=1;
-            else printf("[offload] %s layer released; native stub still zero; journal kept\n",rec.cid);
-        } else if(top || count)failed=1;
-    }
-    closedir(d);
-    return failed?-1:0;
-}
-
 int app_restore_native_dlc(const char *tid, char *msg, size_t cap) {
     if (strcmp(tid, REDIRECT_TID)) {
         snprintf(msg, cap, "Teste restrito a " REDIRECT_TID);
