@@ -1,16 +1,3 @@
-## PS4Mount v0.4.24 — switch para remover da biblioteca (padrão desligado)
-
-Esta versão parte **exatamente do código-fonte da v0.4.21 enviado pelo usuário**. Os testes do MARVEL na v0.4.21 comprovaram instalação nativa, registro, comparação de PKGs, redirecionamento USB e liberação da cópia nativa; a v0.4.24 ainda depende de teste real no PS5.
-
-O switch **Remover da biblioteca ao desmontar**, visível no cabeçalho do painel, inicia **desligado** e fica persistido no config local.
-
-- **Desligado:** `Desmontar` libera apenas jogo base e atualização; DLCs, registros do banco, journals e suas montagens USB permanecem. O jogo **permanece visível na biblioteca do PS5**, embora desmontado.
-- **Ligado:** `Desmontar` usa o fluxo direcionado da v0.4.21, incluindo desmontagem dos DLCs necessária à desinstalação e `sceAppInstUtilAppUnInstall()`. Isso pode remover os registros dos DLCs; na montagem seguinte serão reinstalados **somente** se não constarem no banco.
-- **Montar:** DLC registrado com journal válido revalida e recupera a montagem pelo USB sem aguardar o `ac.pkg` físico de 0 byte se tornar um PKG cheio. DLC ausente do DB ativa o instalador nativo e o offload de maneira condicional.
-- A recuperação dos journals de DLC também ocorre quando o jogo base está marcado como desmontado.
-
-Use o roteiro [TESTE-0424-SWITCH-E-DLC.md](TESTE-0424-SWITCH-E-DLC.md). **Testes de contrato, UI e sintaxe C locais aprovados; ELF com SDK PS5 e validação no console pendentes.**
-
 ## Alterações locais v0.4.21 — recuperação de status e offload
 
 Corrige o fluxo após `GetInstallStatus=0x80a30003` comprovado no log do MARVEL: aguarda registro e arquivo nativo estável, compara bytes com o USB e só então permite excluir a cópia nativa sob `nullfs`. Inclui logs `logical_bytes` e `allocated_bytes_estimate`. **Experimental, compilação PS5 e teste de hardware pendentes.** Veja [TESTE-0421-RECUPERAR-OFFLOAD.md](TESTE-0421-RECUPERAR-OFFLOAD.md).
