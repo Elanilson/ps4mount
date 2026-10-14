@@ -41,7 +41,7 @@
 #include "web.h"
 #include "icon_data.h"
 
-#define VERSION "PS4Mount 0.4.27-manual-dlc-refresh"
+#define VERSION "PS4Mount 0.4.28-dlc-usb-port"
 #define LOCK_PORT 9032
 #define SCAN_SECONDS 10 /* legacy value; polling for PKGs is disabled */
 #define STATE_DIR "/data/ps4mount"
@@ -3165,6 +3165,134 @@ static int offload_write(const offload_record_t *r) {
     int dfd=open(STATE_DIR,O_RDONLY);if (dfd>=0){fsync(dfd);close(dfd);}
     return 0;
 }
+/* A persisted offload keeps an absolute USB path. A disk moved between
+ * USB ports keeps the same /ps4/... tree, so rebase only that prefix; do NOT
+ * discover other packages, replace native PKGs, or touch the DLC database.
+ *
+ * Recovery rules:
+ *  - Accept the original USB path while it contains the right content ID.
+ *  - Otherwise require exactly ONE other connected /mnt/usbN with the same
+ *    relative path and an actual PKG carrying the saved content ID.
+ *  - Retarget only PS4Mount's own stage symlink, never a foreign/stacked mount.
+ *  - Atomically replace the symlink and then the journal (write-ahead journal
+ *    for the original offload remains in place). A crash between the two writes
+ *    is recoverable because either the old or new link is accepted.
+ *
+ * This intentionally does not re-install, unmount, or delete a native file. */
+static int offload_usb_pkg_matches(const char *path, const char *cid) {
+    struct stat st;
+    if (lstat(path,&st) || !S_ISREG(st.st_mode) || st.st_size <= 0) return 0;
+    pkg_t pkg={0};
+    if (pkg_open(&pkg,path)) return 0;
+    /* Same identity check as the existing offload_reconnect() path. */
+    int ok=!strcmp(pkg.content_id,cid);
+    pkg_close(&pkg);
+    return ok;
+}
+static int offload_usb_same_tree(const char *a, const char *b) {
+    /* A change of USB port must preserve EVERYTHING after /mnt/usbN. */
+    return !strncmp(a,"/mnt/usb",8) && a[8]>='0' && a[8]<='7' && a[9]=='/' &&
+           !strncmp(b,"/mnt/usb",8) && b[8]>='0' && b[8]<='7' && b[9]=='/' &&
+           !strcmp(a+9,b+9);
+}
+static int offload_update_stage_link(const char *link, const char *source) {
+    char tmp[PATH_MAX];
+    int n=snprintf(tmp,sizeof(tmp),"%s.port-%ld-%ld.tmp",link,(long)getpid(),(long)time(NULL));
+    if (n<0 || (size_t)n>=sizeof(tmp) || symlink(source,tmp)) return -1;
+    if (rename(tmp,link)) { unlink(tmp); return -1; }
+    return 0;
+}
+static int offload_resolve_usb_port(offload_record_t *r) {
+    if (!offload_record_valid(r)) return -1;
+    /* The original source is preferred whenever it still contains this DLC. */
+    char candidate[PATH_MAX]={0};
+    if (offload_usb_pkg_matches(r->usb,r->cid)) {
+        snprintf(candidate,sizeof(candidate),"%s",r->usb);
+    } else {
+        if (strncmp(r->usb,"/mnt/usb",8) || r->usb[8]<'0' || r->usb[8]>'7' ||
+            r->usb[9]!='/') return -1;
+        const char *relative=r->usb+9;
+        int found=0;
+        for (int i=0;i<8;i++) {
+            char root[32],path[PATH_MAX];
+            snprintf(root,sizeof(root),"/mnt/usb%d",i);
+            int n=snprintf(path,sizeof(path),"%s%s",root,relative);
+            if (n<0 || (size_t)n>=sizeof(path) || !strcmp(path,r->usb)) continue;
+            /* Avoid an expensive full mount-table query on empty ports. */
+            if (!offload_usb_pkg_matches(path,r->cid) || !is_mountpoint(root)) continue;
+            snprintf(candidate,sizeof(candidate),"%s",path);
+            if (++found>1) break;
+        }
+        if (found!=1) {
+            printf("[offload][usb-port] %s cannot relocate: %d matching USB candidates; journal unchanged\n",
+                   r->cid,found);
+            return -1;
+        }
+    }
+
+    /* If the journal and the stage symlink still match, no writes, unmounts or
+     * other filesystem work. This is the normal path for existing users. */
+    char link[PATH_MAX],current[PATH_MAX];
+    snprintf(link,sizeof(link),"%s/ac.pkg",r->stage);
+    ssize_t len=readlink(link,current,sizeof(current)-1);
+    if (len<=0 || (size_t)len>=sizeof(current)-1) {
+        printf("[offload][usb-port] %s missing/unexpected stage link; no changes\n",r->cid);
+        return -1;
+    }
+    current[len]=0;
+    if (!strcmp(current,candidate) && !strcmp(candidate,r->usb)) return 0;
+
+    /* An interrupted relocation may have left either the old journal or old
+     * stage link. Only accept another USB *port* for the identical DLC tree;
+     * a working, foreign link must not be silently changed. */
+    if (strcmp(current,r->usb) && strcmp(current,candidate) &&
+        (!offload_usb_same_tree(current,r->usb) || offload_usb_pkg_matches(current,r->cid))) {
+        printf("[offload][usb-port] %s stage link mismatch; no changes\n",r->cid);
+        return -1;
+    }
+    char tid[10]; snprintf(tid,sizeof(tid),"%.9s",r->cid+7);
+    if (title_running(tid)) {
+        printf("[offload][usb-port] %s title running; relocation postponed\n",r->cid);
+        return -1;
+    }
+    int top=top_layer(r->native,r->stage);
+    int count=owned_layer_count(r->native,r->stage);
+    int dead=dead_layer(r->native);
+    if (top<0 || count<0 || dead || (top==1 && count!=1) || (top==0 && count!=0)) {
+        printf("[offload][usb-port] %s unknown/stacked native layer; journal unchanged\n",r->cid);
+        return -1;
+    }
+    /* If no overlay exists, only a physical zero-byte stub is eligible for
+     * remount. Never touch a full native PKG or a partially installed DLC. */
+    if (top==0) {
+        char native_pkg[PATH_MAX]; struct stat st;
+        snprintf(native_pkg,sizeof(native_pkg),"%s/ac.pkg",r->native);
+        if (lstat(native_pkg,&st) || !S_ISREG(st.st_mode) || st.st_size!=0) {
+            printf("[offload][usb-port] %s native stub not empty/present; journal unchanged\n",r->cid);
+            return -1;
+        }
+    }
+    int changed=strcmp(current,candidate)!=0;
+    if (changed && offload_update_stage_link(link,candidate)) return -1;
+    if (strcmp(r->usb,candidate)) {
+        offload_record_t updated=*r;
+        snprintf(updated.usb,sizeof(updated.usb),"%s",candidate);
+        if (offload_write(&updated)) {
+            /* A crash or journal-write error is recoverable. Try rollback now;
+             * the next run can also reconcile either ordering of the writes. */
+            if (changed && offload_update_stage_link(link,current))
+                printf("[offload][usb-port] %s link rollback failed; retry on next run\n",r->cid);
+            return -1;
+        }
+        printf("[offload][usb-port] %s moved %s -> %s; stage link and journal updated\n",
+               r->cid,r->usb,candidate);
+        *r=updated;
+    } else {
+        printf("[offload][usb-port] %s recovered stage link to saved USB path: %s\n",r->cid,candidate);
+    }
+    return 0;
+}
+
 /* Move the huge file to a sibling, not under native/, so it remains accessible
  * even after native/ is covered by nullfs. Never cross filesystems. */
 static int offload_held(const offload_record_t *r, char *held,size_t cap) {
@@ -3181,7 +3309,7 @@ static int offload_confirm_overlay(const offload_record_t *r) {
     return strcmp(target,r->usb) || top_layer(r->native,r->stage)!=1 ||
            owned_layer_count(r->native,r->stage)!=1 ? -1 : 0;
 }
-static int offload_reconnect(const offload_record_t *r,int finish_held) {
+static int offload_reconnect(offload_record_t *r,int finish_held) {
     char pkg[PATH_MAX],held[PATH_MAX];
     struct stat st;
     snprintf(pkg,sizeof(pkg),"%s/ac.pkg",r->native);
@@ -3197,6 +3325,9 @@ static int offload_reconnect(const offload_record_t *r,int finish_held) {
         printf("[offload] %s interrupted staging rolled back to full native PKG\n",r->cid);
         return -1;
     }
+    /* Preserve the original interrupted-offload rollback BEFORE relocating
+     * a saved USB path; never relink over an unfinished native transaction. */
+    if (offload_resolve_usb_port(r)) return -1;
     if (stat(r->usb,&st) || !S_ISREG(st.st_mode) || !st.st_size) {
         printf("[offload] %s USB PKG unavailable or empty: %s\n",r->cid,r->usb);
         return -1;
@@ -3284,7 +3415,7 @@ static int offload_prepare_native_reinstall(const dlc_src_t *dlc) {
     }
     offload_record_t rec;
     if (offload_read(journal,&rec) || strcmp(rec.cid,dlc->pkg.content_id) ||
-        strcmp(rec.usb,dlc->path)) return -1;
+        offload_resolve_usb_port(&rec) || strcmp(rec.usb,dlc->path)) return -1;
     int top=top_layer(rec.native,rec.stage);
     int count=owned_layer_count(rec.native,rec.stage);
     if (top<0 || count<0) return -1;
@@ -3331,7 +3462,8 @@ static int offload_wait_native_ready(const dlc_src_t *dlc, const char *tid, int 
     offload_journal_path(cid,journal,sizeof(journal));
     if (exists(journal)) {
         offload_record_t rec;
-        if (offload_read(journal,&rec) || strcmp(rec.usb,dlc->path)) {
+        if (offload_read(journal,&rec) || offload_resolve_usb_port(&rec) ||
+            strcmp(rec.usb,dlc->path)) {
             printf("[offload] %s cannot resume invalid/different-USB journal\n",cid);
             return -1;
         }
@@ -3404,7 +3536,8 @@ static int offload_one(const dlc_src_t *dlc,const char *tid) {
     if (!offload_cid_valid(cid) || strncmp(cid+7,tid,9) || title_running(tid))return -1;
     offload_journal_path(cid,journal,sizeof(journal));
     if (exists(journal)) {
-        if (offload_read(journal,&rec) || strcmp(rec.usb,dlc->path)) {
+        if (offload_read(journal,&rec) || offload_resolve_usb_port(&rec) ||
+            strcmp(rec.usb,dlc->path)) {
             printf("[offload] %s invalid/stale journal or different USB device; no deletion\n",cid);
             return -1;
         }
@@ -3516,7 +3649,8 @@ static int offload_reuse_registered(const dlc_src_t *dlc,const char *tid) {
          * full-byte comparison checks before freeing SSD space. */
     } else {
         offload_record_t rec;
-        if (offload_read(journal,&rec) || strcmp(rec.cid,cid) || strcmp(rec.usb,dlc->path)) {
+        if (offload_read(journal,&rec) || strcmp(rec.cid,cid) ||
+            offload_resolve_usb_port(&rec) || strcmp(rec.usb,dlc->path)) {
             printf("[oneclick][dlc-reuse] %s journal invalid or USB changed; not reinstalling\n",cid);
             return -1;
         }
