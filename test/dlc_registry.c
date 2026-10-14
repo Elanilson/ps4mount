@@ -19,6 +19,8 @@ int main(void) {
     sql(db, "CREATE TABLE tbl_addcontinfo (contentId TEXT PRIMARY KEY, state INTEGER)");
     sql(db, "INSERT INTO tbl_addcontinfo VALUES ('UP0001-CUSA10000_00-ADDON00000000001', 1)");
     sqlite3_close(db);
+    assert(db_log_addcont_title("CUSA10000") == 1);
+    assert(db_log_addcont_title("CUSA22222") == 0);
     const char *ids[2] = {"UP0001-CUSA10000_00-ADDON00000000001", "UP0001-CUSA10000_00-ADDON00000000002"};
     int states[2];
     db_dlc_registration(ids, 2, states);

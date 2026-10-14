@@ -41,7 +41,7 @@
 #include "web.h"
 #include "icon_data.h"
 
-#define VERSION "PS4Mount 0.4.11-usb-dlc-register-test"
+#define VERSION "PS4Mount 0.4.12-db-diagnostics"
 #define LOCK_PORT 9032
 #define SCAN_SECONDS 10 /* legacy value; polling for PKGs is disabled */
 #define STATE_DIR "/data/ps4mount"
@@ -2409,6 +2409,28 @@ failed:
     notify("PS4Mount: %s mount FAILED. Check the log", tid);
 }
 
+
+/* Read-only, CUSA-scoped inspection of the PS5 addcont.db. This does not
+ * install/revalidate a title, unmount anything, or write to the system DBs.
+ * Useful to compare native-installed Resident Evil 7 add-ons with absent
+ * God of War Ragnarök add-on rows. */
+int app_diagnose_db(const char *tid, char *msg, size_t cap) {
+    if (g_discover_requested || g_restore_running || g_activate_request[0] ||
+        g_dlc_register_request[0] || !strcmp(g_progress.phase, "registering_dlcs") ||
+        !strcmp(g_progress.phase, "activating") || !strcmp(g_progress.phase, "searching")) {
+        snprintf(msg, cap, "An operation is running. Retry when idle");
+        return -1;
+    }
+    printf("[db-inspect] %s: app.db title registered=%d (read-only snapshot)\n",
+           tid, db_is_registered(tid));
+    int rc = db_log_addcont_title(tid);
+    if (rc == -1) {
+        snprintf(msg, cap, "DB read failed; inspect log for %s", tid);
+        return -1;
+    }
+    snprintf(msg, cap, "Diagnostic logged for %s: %d matching DB row(s)", tid, rc);
+    return 0;
+}
 
 /* Independent Retry button. The same targeted no-copy revalidation is also
  * attempted on Mount. We NEVER uninstall and NEVER run a package installer. */

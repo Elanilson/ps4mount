@@ -13,6 +13,7 @@ void app_progress_json(buf_t *out);
 int app_add(const char *tid, char *msg, size_t cap);
 int app_remove(const char *tid, char *msg, size_t cap);
 int app_register_dlcs(const char *tid, char *msg, size_t cap);
+int app_diagnose_db(const char *tid, char *msg, size_t cap);
 int app_rescan(void);
 void app_stop(void);
 void app_config_json(buf_t *out);

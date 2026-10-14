@@ -132,6 +132,8 @@ function render() {
     else if (g.state === 'running') act = '<button disabled>Feche o jogo para desmontar</button>';
     if (g.dlc > 0 && g.state === 'ready')
       act += '<button data-a="register-dlcs" data-t="' + g.title_id + '" title="Teste de revalidacao direcionada do titulo; sem instalacao nativa e sem AppInstallAll. Nao garante registro dos DLCs.">Registrar DLCs (USB)</button>';
+    if (g.dlc > 0)
+      act += '<button data-a="diagnose-db" data-t="' + g.title_id + '" title="Consultar SOMENTE LEITURA os registros do addcont.db deste jogo, sem instalacao nem alteracoes">Diagnosticar DB</button>';
     var job = busy[g.title_id];
     if (job) act = '<button disabled>' + (job.action === 'unmount' ? 'Desmontando…' : job.action === 'register-dlcs' ? 'Revalidando DLCs no USB…' : 'Montando…') + '</button>';
     html += '<div class="card"><div class="art" style="background-image:url(/icon/' + g.title_id + ')">' +
@@ -162,6 +164,13 @@ $('grid').addEventListener('click', function (e) {
   if (!b) return;
   var tid = b.getAttribute('data-t'), a = b.getAttribute('data-a');
   if (busy[tid]) return;
+  if (a === 'diagnose-db') {
+    api('/api/diagnose-db?title_id=' + tid, 'POST').then(function (result) {
+      toast(result.message || 'Diagnostico do banco concluido');
+      $('logbtn').click();
+    }).catch(function (err) { toast('Falha ao consultar addcont.db: ' + err.message); });
+    return;
+  }
   if (a === 'register-dlcs' && !confirm('Revalidar os registros dos DLCs de ' + tid + '? A chamada apenas revalida o titulo via AppInstallTitleDir e NAO tem eficacia comprovada para registrar DLCs. Nao executa instalacao nativa nem AppInstallAll.')) return;
   if (a === 'unmount' && !confirm('Desmontar ' + tid + '? O registro no PS5 será mantido; a restauração automática deste jogo será desativada.')) return;
   // Mount is a single click. Unmount retains its safety confirmation.

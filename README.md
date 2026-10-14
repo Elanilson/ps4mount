@@ -1,5 +1,7 @@
 # PS4Mount 0.4.11 — Teste de revalidação DLC via USB
 
+**v0.4.12 — Diagnóstico de registros:** o novo botão **Diagnosticar DB** consulta apenas os registros de DLC do CUSA selecionado em `addcont.db` (somente leitura), e registra tabelas, colunas e valores técnicos para comparação. Não instala PKGs nem modifica bancos de dados. Consulte `DIAGNOSTICO-DB-0412.md`.
+
 **Esta edição é experimental.** Ao clicar em **Montar**, o programa prepara/monta jogo, update e DLCs no USB e tenta revalidar o título por `sceAppInstUtilAppInstallTitleDir(tid, "/user/app/", NULL)`. O botão **Registrar DLCs (USB)** repete essa tentativa para o jogo já montado. Essa API é direcionada ao **jogo base**: **não há comprovação** de que registre DLCs novos. O resultado do banco `addcont.db` é comparado antes e depois.
 
 Não chama `sceAppInstUtilInstallByPackage` ou `sceAppInstUtilAppInstallAll`; não desinstala DLCs, não copia PKGs para o armazenamento interno. Metadados e links pequenos permanecem no armazenamento interno, como no original. Os DLCs instalados anteriormente de forma nativa **permanecem no armazenamento interno** e podem continuar sendo lidos dali.
