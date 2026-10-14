@@ -47,3 +47,8 @@ python3 test/all_dlcs_contract.py
 python3 test/db_diagnostics_contract.py
 
 python3 test/native_redirect_contract.py
+python3 test/gow_pilot_contract.py
+
+${CC:-cc} -std=c11 -Wall -Wextra -Werror -Isrc -o build/test/dlc_probe test/dlc_probe.c src/dlc_probe.c
+build/test/dlc_probe
+python3 test/targeted_probe_contract.py

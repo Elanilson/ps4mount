@@ -82,6 +82,18 @@ static int title_param(const char *path, char *tid) {
     return strncmp(tid, "CUSA", 4) ? -1 : 0;
 }
 
+static int cid_param(const char *path, char *cid) {
+    const char *p=strstr(path,"content_id=");if (!p) return -1;
+    p+=11;
+    for (int i=0;i<36;i++) {
+        char c=p[i];
+        if (!((c>='A' && c<='Z') || (c>='0' && c<='9') || c=='_' || c=='-')) return -1;
+        cid[i]=c;
+    }
+    cid[36]=0;
+    return (p[36] && p[36]!='&' && p[36]!=' ') ? -1 : 0;
+}
+
 static void send_log(int fd) {
     buf_t b = {0}, j = {0};
     int f = open(LOG_PATH, O_RDONLY);
@@ -158,7 +170,10 @@ void web_serve(int listen_fd) {
     } else if (!strncmp(path, "/icon/", 6)) {
         buf_t b = {0};
         snprintf(tid, sizeof(tid), "%.9s", path + 6);
-        if (!app_icon(tid, &b))
+        /* A raw path must not reach the icon reader as a title ID. */
+        char normalized[64];
+        snprintf(normalized, sizeof(normalized), "title_id=%s", path+6);
+        if (strlen(path+6) == 9 && !title_param(normalized, tid) && !app_icon(tid, &b))
             reply(fd, "200 OK", "image/png", b.data, b.len);
         else
             reply(fd, "404 Not Found", "text/plain", "no icon\n", 8);
@@ -177,12 +192,54 @@ void web_serve(int listen_fd) {
             int rc = app_diagnose_db(tid, msg, sizeof(msg));
             json_msg(fd, !rc, msg);
         }
+    } else if (!post && !strncmp(path,"/api/probe-dlcs?",16)) {
+        if (title_param(path,tid)) json_msg(fd,0,"invalid title_id");
+        else {
+            buf_t b={0};
+            if (!app_probe_options(tid,&b)) reply(fd,"200 OK","application/json; charset=utf-8",b.data,b.len);
+            else json_msg(fd,0,"DLC sources not found on USB");
+            buf_free(&b);
+        }
+    } else if (post && !strncmp(path,"/api/probe-dlc?",15)) {
+        char cid[37];
+        const char *p = strstr(path,"method=");
+        int method = p ? atoi(p+7) : 0;
+        if (title_param(path,tid) || cid_param(path,cid) || !p || method < 1 || method > 5)
+            json_msg(fd,0,"invalid title/content/method");
+        else {
+            int rc=app_probe_dlc(tid,cid,method,msg,sizeof(msg));
+            json_msg(fd,!rc,msg);
+        }
     } else if (post && !strncmp(path, "/api/register-dlcs", 18)) {
         if (title_param(path, tid))
             json_msg(fd, 0, "invalid title_id");
         else {
             int rc = app_register_dlcs(tid, msg, sizeof(msg));
             json_msg(fd, !rc, msg);
+        }
+    } else if (!post && !strncmp(path,"/api/pilot-dlcs?",16)) {
+        if (title_param(path,tid)) json_msg(fd,0,"invalid title_id");
+        else {
+            buf_t b={0};
+            if (!app_pilot_options(tid,&b)) reply(fd,"200 OK","application/json; charset=utf-8",b.data,b.len);
+            else json_msg(fd,0,"DLCs do USB indisponiveis");
+            buf_free(&b);
+        }
+    } else if (post && !strncmp(path,"/api/pilot-restore?",19)) {
+        if (title_param(path,tid)) json_msg(fd,0,"invalid title_id");
+        else {
+            int rc=app_pilot_restore_current(tid,msg,sizeof(msg));
+            json_msg(fd,!rc,msg);
+        }
+    } else if (post && (!strncmp(path,"/api/pilot-install?",19) ||
+                        !strncmp(path,"/api/pilot-redirect?",20))) {
+        char cid[37];
+        if (title_param(path,tid) || cid_param(path,cid)) json_msg(fd,0,"invalid title_id/content_id");
+        else {
+            int rc;
+            if (!strncmp(path,"/api/pilot-install?",19)) rc=app_install_dlc_one(tid,cid,msg,sizeof(msg));
+            else rc=app_pilot_redirect(tid,cid,msg,sizeof(msg));
+            json_msg(fd,!rc,msg);
         }
     } else if (post && !strncmp(path, "/api/install-dlcs?", 18)) {
         if (title_param(path, tid)) json_msg(fd, 0, "invalid title_id");

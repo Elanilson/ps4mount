@@ -15,7 +15,7 @@ assert 'sceAppInstUtilInstallByPackage(' in s and 'sceAppInstUtilAppInstallAll('
 assert 'ps4mount_uninstall_result(p, &uninstall_rc)' in delete
 assert 'if (uninstall_rc != 0)' in delete
 assert 'STATE_DIR "/%s.removed", id' not in delete, 'DLC delete event must not create legacy removal markers'
-assert 'rm_tree(hold);' not in delete[delete.index('} else if (strlen(id) == 36)'):delete.index('if (g_deleting)',delete.index('} else if (strlen(id) == 36)'))]
+assert 'rm_tree(hold);' not in delete[delete.index('} else if (strlen(id) == 36 && g_deleting)'):delete.index('/* the delete is done', delete.index('} else if (strlen(id) == 36 && g_deleting)'))]
 assert 'data-a="register-dlcs"' in ui
 assert 'id="s-dlc"' not in ui
 assert 'sceAppInstUtilAppInstallAll(' not in s

@@ -1,3 +1,5 @@
+**v0.4.19**: experimentos direcionados M1–M5 de registro de um DLC sem instalacao nativa; veja [TESTES-REGISTRO-DLC-0419.md](TESTES-REGISTRO-DLC-0419.md). Nenhum metodo experimental comprovado no PS5.
+
 # PS4Mount v0.4.15 — DLC nativo ↔ USB (experimento reversível)
 
 **Base:** v0.4.12 (sem `AppInstallAll` global e sem o isolamento de links da v0.4.14).
@@ -388,3 +390,7 @@ Ver `TESTE-17-DLCS-SSD-USB-0416.md`. Substitui o teste de apenas um DLC por pref
 ### Teste sequencial 0.4.17
 
 Veja [TESTE-SEQUENCIAL-0417.md](TESTE-SEQUENCIAL-0417.md). O fluxo verifica, monta e confirma um DLC por vez (ate 17) sem AppInstallAll e mantendo a instalacao nativa intacta.
+
+## v0.4.18 — piloto God of War (1 DLC)
+
+Veja `TESTE-GOW-1-DLC-0418.md`. Instalacao nativa selecionada, redirecionamento reversivel individual, preservacao do PKG e recuperacao via journal. O teste nao libera espaco e nao usa AppInstallAll.

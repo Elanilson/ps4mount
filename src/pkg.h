@@ -7,6 +7,7 @@
 #include <stdint.h>
 
 #define PKG_MAX_ENTRIES 512
+#define PKG_MAX_ENTRY_SIZE (64u << 20) /* upstream 0.5.0: bound untrusted PKG entry allocation */
 
 typedef struct {
     uint32_t id, flags1, flags2, offset, size;
