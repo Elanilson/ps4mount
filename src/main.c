@@ -41,7 +41,7 @@
 #include "web.h"
 #include "icon_data.h"
 
-#define VERSION "PS4Mount 0.4.28-dlc-usb-port"
+#define VERSION "PS4Mount 0.4.30-manual-pointing-TEST"
 #define LOCK_PORT 9032
 #define SCAN_SECONDS 10 /* legacy value; polling for PKGs is disabled */
 #define STATE_DIR "/data/ps4mount"
@@ -1644,6 +1644,9 @@ static char g_dlc_register_request[10];
 static char g_dlc_install_request[10];
 /* Only an explicit panel action enables overwrite of already registered DLCs. */
 static int g_dlc_force_reinstall = 0;
+/* A user-triggered job: install and pointing are distinct actions. */
+static int g_dlc_manual_pointing = 0;
+static char g_dlc_action[24] = "mount";
 static char g_dlc_install_only_cid[37];
 /* Independent one-DLC/one-method experiment, processed in main loop. */
 
@@ -1661,6 +1664,7 @@ static int g_appinst_ready = 0;
 static void register_dlcs_queued(void);
 static void install_dlcs_queued(void);
 static int offload_prepare_native_reinstall(const dlc_src_t *dlc);
+static int offload_registered_without_automatic_offload(const dlc_src_t *dlc, const char *tid);
 static int redirect_mounted(void);
 static int redirect_locked(void);
 static int pilot_locked(void);
@@ -2250,9 +2254,10 @@ static int hold_link_is(const char *kind, const char *tid, const char *name, con
  * registered entitlement; do not call AppInstallAll or install packages to
  * internal storage as a hidden side effect of the Mount button. */
 /* One-click native registration -> USB offload helpers (implemented below). */
-static int offload_one(const dlc_src_t *dlc, const char *tid);
+static int offload_one(const dlc_src_t *dlc, const char *tid, int fast_after_install);
 static int offload_reuse_registered(const dlc_src_t *dlc, const char *tid);
 static int offload_wait_native_ready(const dlc_src_t *dlc, const char *tid, int status_unavailable, int require_new_native_pkg);
+static int offload_native_ready_fast(const dlc_src_t *dlc, const char *tid, int status_unavailable);
 static int offload_resume_title(const char *tid);
 static void offload_resume_all(void);
 static int offload_unmount_title(const char *tid);
@@ -2586,7 +2591,7 @@ out:
 /* Explicit per-title request. Never invoked by Mount, USB scan or restoration.
  * Installation is a native PKG operation; data MAY be copied to internal storage.
  * Unlike external mounts, internal add-on installations are not removed on Unmount. */
-int app_install_dlcs(const char *tid, char *msg, size_t cap) {
+static int queue_dlc_job(const char *tid, char *msg, size_t cap, int needs_installer) {
     char root[32];
     if (g_dlc_install_request[0] || g_dlc_register_request[0] || g_activate_request[0] || g_discover_requested ||
         g_restore_running || !strcmp(g_progress.phase, "installing_dlcs") ||
@@ -2599,7 +2604,7 @@ int app_install_dlcs(const char *tid, char *msg, size_t cap) {
         snprintf(msg, cap, "Restore the RE7 USB overlay before native DLC installation");
         return -1;
     }
-    if (!g_appinst_ready) {
+    if (needs_installer && !g_appinst_ready) {
         snprintf(msg, cap, "PS5 AppInstUtil initialization failed; see startup log");
         return -1;
     }
@@ -2620,9 +2625,14 @@ int app_install_dlcs(const char *tid, char *msg, size_t cap) {
     g_dlc_content[0] = 0;
     g_progress = (progress_t){"dlc_queued", 0, 0, 0, 0, "", "Aguardando instalacao individual dos DLCs"};
     snprintf(g_progress.current, sizeof(g_progress.current), "%s", tid);
+    snprintf(g_dlc_action, sizeof(g_dlc_action), "mount");
     printf("[dlc-install] %s queued (individual PKGs, never AppInstallAll)\n", tid);
     snprintf(msg, cap, "Individual DLC installation queued for %s", tid);
     return 0;
+}
+
+int app_install_dlcs(const char *tid, char *msg, size_t cap) {
+    return queue_dlc_job(tid, msg, cap, 1);
 }
 
 /* Explicit user-requested reinstall. Never used by automatic Mount or restore.
@@ -2630,8 +2640,21 @@ int app_install_dlcs(const char *tid, char *msg, size_t cap) {
 int app_force_reinstall_dlcs(const char *tid, char *msg, size_t cap) {
     if (app_install_dlcs(tid, msg, cap)) return -1;
     g_dlc_force_reinstall = 1;
-    printf("[dlc-force] %s manually requested native reinstall + verified USB offload\n",tid);
-    snprintf(msg,cap,"Reinstalacao dos DLCs de %s enfileirada; use o progresso do painel",tid);
+    snprintf(g_dlc_action, sizeof(g_dlc_action), "reinstall-dlcs");
+    printf("[dlc-force] %s manual native reinstall requested; NO automatic SSD offload\n",tid);
+    snprintf(msg,cap,"Reinstalacao nativa de %s enfileirada; use Apontamento apos conclusao no PS5",tid);
+    return 0;
+}
+
+/* Explicit opt-in. Runs NO installer and never implicitly follows a Mount.
+ * User confirms that all native DLC installations have completed on PS5. */
+int app_manual_point_dlcs(const char *tid, char *msg, size_t cap) {
+    if (queue_dlc_job(tid, msg, cap, 0)) return -1;
+    g_dlc_manual_pointing = 1;
+    snprintf(g_dlc_action, sizeof(g_dlc_action), "point-dlcs");
+    progress_set("dlc_queued", "Apontamento manual solicitado; sem comparacao de arquivos");
+    printf("[dlc-point] %s queued by user; native installer will NOT be called\n",tid);
+    snprintf(msg,cap,"Apontamento manual de %s enfileirado; sem instalacao nativa",tid);
     return 0;
 }
 
@@ -2756,7 +2779,9 @@ static void install_dlcs_queued(void) {
     snprintf(tid, sizeof(tid), "%s", g_dlc_install_request);
     g_dlc_install_request[0] = 0;
     int force_reinstall = g_dlc_force_reinstall;
-    g_dlc_force_reinstall = 0; /* force applies to this single queued job only */
+    int manual_pointing = g_dlc_manual_pointing;
+    g_dlc_force_reinstall = 0;
+    g_dlc_manual_pointing = 0;
     char only_cid[37];
     snprintf(only_cid, sizeof(only_cid), "%s", g_dlc_install_only_cid);
     g_dlc_install_only_cid[0] = 0;
@@ -2801,11 +2826,11 @@ static void install_dlcs_queued(void) {
     g_progress.done = g_progress.failed = g_progress.ok = 0;
     printf("[dlc-install] %s found=%d already_in_db=%d attempting_all=%d force=%d\n",
            tid, t.ndlc, already, todo, force_reinstall);
+    if (manual_pointing) printf("[dlc-point] %s manual mode: no installer, no stability wait, no byte comparison\n",tid);
     if (!todo) goto done;
-    /* Only an UNREGISTERED DLC (or an explicitly forced reinstall) needs
-     * a native installer destination. Normal Mount NEVER releases an already
-     * registered DLC overlay. */
-    for (int i = 0; i < t.ndlc_tids; ++i) {
+    /* Apontamento never prepares the native INSTALLER, and never releases
+     * external title-folder layers. Only native installer jobs do so. */
+    for (int i = 0; !manual_pointing && i < t.ndlc_tids; ++i) {
         int needs_native = 0;
         for (int j = 0; j < t.ndlc; ++j) {
             if ((states[j] == 0 || force_reinstall) &&
@@ -2830,16 +2855,29 @@ static void install_dlcs_queued(void) {
         int state = -1;
         db_dlc_registration(&id, 1, &state);
         snprintf(g_progress.detail, sizeof(g_progress.detail), "%s DLC %d/%d: %.36s",
+                 manual_pointing ? "Apontando manualmente" :
                  force_reinstall ? "Reinstalando manualmente" :
                  state == 1 ? "Reutilizando" : state == 0 ? "Instalando" : "Verificando",
                  g_progress.done + 1, todo, g_dlc_content);
         int rc = 0;
         int installer_status_unavailable = 0;
-        if (state == 1 && !force_reinstall) {
-            /* Normal Mount: only reuse/offload, NEVER call native installer. */
+        if (manual_pointing) {
+            if (state != 1) {
+                printf("[dlc-point] %s NOT REGISTERED (db=%d); cannot release native file\n",id,state);
+                rc = -1;
+            } else {
+                progress_set("installing_dlcs", "Apontamento manual: preparando USB e liberando SSD");
+                /* Fast path checks identity, native/source paths and sizes but
+                 * intentionally skips the slow full byte comparison. */
+                rc = offload_one(&t.dlc[i],tid,1);
+                printf("[dlc-point] %s %s\n",id,rc?"FAILED (native preserved/rollback attempted)":"DONE");
+            }
+        } else if (state == 1 && !force_reinstall) {
+            /* Mount never offloads a newly installed native package. A valid
+             * existing offload journal can still be reconnected as before. */
             printf("[oneclick][dlc-reuse] %s DB=1; no native installer\n",id);
-            progress_set("installing_dlcs", "DLC registrado: verificando USB sem reinstalar");
-            rc = offload_reuse_registered(&t.dlc[i], tid);
+            progress_set("installing_dlcs", "DLC registrado: reutilizando; apontamento somente manual");
+            rc = offload_registered_without_automatic_offload(&t.dlc[i], tid);
         } else if (state == 0 || (state == 1 && force_reinstall)) {
             if (force_reinstall) {
                 progress_set("installing_dlcs", "Reinstalacao manual: liberando somente DLCs controlados pelo PS4Mount");
@@ -2859,13 +2897,15 @@ static void install_dlcs_queued(void) {
                            id, state, installer_status_unavailable);
             }
             if (!rc) {
-                progress_set("installing_dlcs", "Verificando arquivo nativo e estabilidade da instalacao");
-                if (offload_wait_native_ready(&t.dlc[i], tid, installer_status_unavailable, force_reinstall)) {
-                    printf("[dlc-install] %s offload deferred: native installation/file state not confirmed\n", id);
-                    rc = -2; /* Native task may still be running. */
+                /* This short probe is ONLY for sequencing multiple native
+                 * installations if FW 11.40 stops reporting their status.
+                 * It never moves, truncates or deletes the native ac.pkg. */
+                progress_set("installing_dlcs", "Instalacao nativa: aguardando registro antes do proximo DLC");
+                if (offload_native_ready_fast(&t.dlc[i], tid, installer_status_unavailable)) {
+                    printf("[dlc-install] %s native completion uncertain; no offload performed\n", id);
+                    rc = -2;
                 } else {
-                    progress_set("installing_dlcs", "Arquivo verificado; redirecionando e liberando SSD");
-                    rc = offload_one(&t.dlc[i],tid);
+                    printf("[dlc-install] %s REGISTERED NATIVE; SSD file preserved; user must click Apontamento\n", id);
                 }
             }
         } else {
@@ -2900,12 +2940,17 @@ done:
     g_dlc_content[0] = 0;
     g_catalog_dirty = 1;
     if (fatal || g_progress.failed) {
-        progress_set("dlc_error", "Instalacao incompleta; consulte o log de DLCs");
-        printf("[dlc-install] %s finished with errors: success=%d failed=%d fatal=%d\n",
-               tid, g_progress.ok, g_progress.failed, fatal);
+        progress_set("dlc_error", manual_pointing ?
+                     "Apontamento incompleto; ac.pkg nativo preservado quando possivel" :
+                     "Instalacao incompleta; consulte o log de DLCs");
+        printf("[%s] %s finished with errors: success=%d failed=%d fatal=%d\n",
+               manual_pointing?"dlc-point":"dlc-install",tid,g_progress.ok,g_progress.failed,fatal);
     } else {
-        progress_set("dlc_complete", "DLCs registrados, apontados ao USB e SSD liberado (consulte log)");
-        printf("[dlc-install] %s finished: %d/%d registered\n", tid, g_progress.ok, todo);
+        progress_set("dlc_complete", manual_pointing ?
+                     "Apontamento concluido; USB ativo e arquivo nativo em 0 bytes" :
+                     "Instalacao/registro concluido; use Apontamento para liberar SSD");
+        printf("[%s] %s finished: %d/%d completed\n",
+               manual_pointing?"dlc-point":"dlc-install",tid,g_progress.ok,todo);
     }
     return;
 failed:
@@ -2913,8 +2958,10 @@ failed:
     g_dlc_percent = -1;
     g_dlc_content[0] = 0;
     g_progress.failed++;
-    progress_set("dlc_error", "Nao foi possivel iniciar instalacao de DLCs");
-    printf("[dlc-install] %s unable to start\n", tid);
+    progress_set("dlc_error", manual_pointing ?
+                 "Nao foi possivel iniciar apontamento" :
+                 "Nao foi possivel iniciar instalacao de DLCs");
+    printf("[%s] %s unable to start\n", manual_pointing?"dlc-point":"dlc-install", tid);
 }
 
 
@@ -3085,8 +3132,10 @@ static int redirect_copy_meta(const char *native, const char *source, const char
 /* --- One-click native DLC registration -> persistent USB offload ---------
  * This is independent of the historical RE7 and GoW reversible experiments.
  * No AppInstallAll and no direct SQLite modification. Each DLC is treated alone.
- * The native ac.pkg is replaced by an empty stub only after byte comparison,
- * journaling and successful USB nullfs mount, then its held copy is unlinked.
+ * The native ac.pkg is replaced by an empty stub after journal persistence
+ * and successful USB nullfs mount, then its held copy is unlinked. Native
+ * installs have an experimental size/metadata-only fast path; reused full
+ * PKGs still use the original byte comparison.
  * The journal is NOT deleted after success: it is required after a PS5 reboot.
  */
 typedef struct {
@@ -3462,8 +3511,8 @@ static int offload_wait_native_ready(const dlc_src_t *dlc, const char *tid, int 
     offload_journal_path(cid,journal,sizeof(journal));
     if (exists(journal)) {
         offload_record_t rec;
-        if (offload_read(journal,&rec) || offload_resolve_usb_port(&rec) ||
-            strcmp(rec.usb,dlc->path)) {
+        if (offload_read(journal,&rec) || strcmp(rec.cid,cid) ||
+            offload_resolve_usb_port(&rec) || strcmp(rec.usb,dlc->path)) {
             printf("[offload] %s cannot resume invalid/different-USB journal\n",cid);
             return -1;
         }
@@ -3529,7 +3578,57 @@ static int offload_wait_native_ready(const dlc_src_t *dlc, const char *tid, int 
     return -1;
 }
 
-static int offload_one(const dlc_src_t *dlc,const char *tid) {
+/* Experimental fast completion path, used ONLY after a NEW native install.
+ * No 15-s stability loop, no byte-by-byte compare. When GetInstallStatus is
+ * untracked (0x80a30003 on FW 11.40), the fallback below is only a heuristic:
+ * DB registration + complete-size native file + metadata on two consecutive
+ * observations; it is NOT an authoritative system completion signal.
+ * Never treat return code 0 from InstallByPackage or DB=1 alone as completion.
+ * Crucially, old 0-byte stubs and live/foreign overlays cannot pass. */
+static int offload_native_ready_fast(const dlc_src_t *dlc, const char *tid, int status_unavailable) {
+    const char *cid=dlc->pkg.content_id;
+    char native[PATH_MAX], pkg[PATH_MAX], name[PATH_MAX];
+    struct stat usb, cur, prev={0}, md;
+    if (stat(dlc->path,&usb) || !S_ISREG(usb.st_mode) || usb.st_size<=0)
+        return -1;
+    int prev_ready=0;
+    for (int attempt=0;attempt<(status_unavailable?12:1);attempt++) {
+        if (g_stop || title_running(tid)) return -1;
+        int state=-1;
+        db_dlc_registration(&cid,1,&state);
+        int ready=(state==1 && !offload_locate_native(tid,cid+20,native,sizeof(native)));
+        if (ready) {
+            snprintf(pkg,sizeof(pkg),"%s/ac.pkg",native);
+            ready=(!lstat(pkg,&cur) && S_ISREG(cur.st_mode) &&
+                   cur.st_size==usb.st_size && !layers_on(native) && !dead_layer(native));
+        }
+        const char *meta[]={"ac.json","ac.pbm","ac.pbm.backup"};
+        for (int j=0;ready && j<3;j++) {
+            snprintf(name,sizeof(name),"%s/%s",native,meta[j]);
+            if (lstat(name,&md) || !S_ISREG(md.st_mode) || md.st_size<=0) ready=0;
+        }
+        if (ready && !status_unavailable) {
+            printf("[dlc-fast] %s system status terminal; native size/metadata present, no stability wait\n",cid);
+            return 0;
+        }
+        if (ready && prev_ready && cur.st_dev==prev.st_dev &&
+            cur.st_ino==prev.st_ino && cur.st_size==prev.st_size &&
+            cur.st_mtime==prev.st_mtime && cur.st_ctime==prev.st_ctime) {
+            printf("[dlc-fast] %s WARNING: status=0x80a30003, fallback DB+native size/metadata confirmed twice; NO content comparison\n",cid);
+            return 0;
+        }
+        prev_ready=ready;
+        if (ready) prev=cur;
+        if (attempt==0 || attempt==5)
+            printf("[dlc-fast] %s %s attempt=%d db=%d ready=%d\n",cid,
+                   status_unavailable?"STATUS_UNTRACKED":"STATUS_TERMINAL",attempt+1,state,ready);
+        if (status_unavailable) pump_events(1000);
+    }
+    printf("[dlc-fast] %s completion could not be inferred safely; SSD preserved\n",cid);
+    return -1;
+}
+
+static int offload_one(const dlc_src_t *dlc,const char *tid,int fast_after_install) {
     const char *cid=dlc->pkg.content_id;
     char journal[PATH_MAX],pkg[PATH_MAX],held[PATH_MAX],root[32];
     offload_record_t rec={0};struct stat st;
@@ -3563,17 +3662,32 @@ static int offload_one(const dlc_src_t *dlc,const char *tid) {
     snprintf(pkg,sizeof(pkg),"%s/ac.pkg",rec.native);
     offload_held(&rec,held,sizeof(held));
     if (!lstat(held,&st)) {printf("[offload] %s stale held file: manual recovery needed\n",cid);return -1;}
-    if (redirect_same_file_bytes(pkg,rec.usb)) {
-        printf("[offload] %s SSD/USB PKG differs or IO error; preserving SSD\n",cid);
-        return -1;
+    struct stat matched, source;
+    if (fast_after_install) {
+        /* EXPERIMENTAL MANUAL APONTAMENTO: the user has confirmed native
+         * completion. No time-consuming byte comparison/stability polling.
+         * Never skip identity, file type, source size or mount ownership. */
+        if (lstat(pkg,&matched) || stat(rec.usb,&source) ||
+            !S_ISREG(matched.st_mode) || !S_ISREG(source.st_mode) ||
+            matched.st_size<=0 || matched.st_size!=source.st_size ||
+            layers_on(rec.native) || dead_layer(rec.native)) {
+            printf("[dlc-point] %s native/source size or mount mismatch; SSD preserved\n",cid);
+            return -1;
+        }
+        printf("[dlc-point] %s full byte comparison SKIPPED by manual request: size=%llu\n",
+               cid,(unsigned long long)matched.st_size);
+    } else {
+        if (redirect_same_file_bytes(pkg,rec.usb)) {
+            printf("[offload] %s SSD/USB PKG differs or IO error; preserving SSD\n",cid);
+            return -1;
+        }
+        if (lstat(pkg,&matched) || !S_ISREG(matched.st_mode) || matched.st_size<=0) {
+            printf("[offload] %s native PKG changed after comparison; preserving SSD\n",cid);
+            return -1;
+        }
+        printf("[offload] %s NATIVE/USB MATCH size=%llu native=%s; preparing redirect\n",
+               cid,(unsigned long long)matched.st_size,rec.native);
     }
-    struct stat matched;
-    if (lstat(pkg,&matched) || !S_ISREG(matched.st_mode) || matched.st_size<=0) {
-        printf("[offload] %s native PKG changed after comparison; preserving SSD\n",cid);
-        return -1;
-    }
-    printf("[offload] %s NATIVE/USB MATCH size=%llu native=%s; preparing redirect\n",
-           cid,(unsigned long long)matched.st_size,rec.native);
     mkdirs(rec.stage,0770);
     const char *meta[]={"ac.json","ac.pbm","ac.pbm.backup"};
     for (int i=0;i<3;i++) if (redirect_copy_meta(rec.native,rec.stage,meta[i]))return -1;
@@ -3667,9 +3781,40 @@ static int offload_reuse_registered(const dlc_src_t *dlc,const char *tid) {
         printf("[oneclick][dlc-reuse] %s cannot verify existing offload; no installer\n",cid);
         return -1;
     }
-    int rc=offload_one(dlc,tid);
+    int rc=offload_one(dlc,tid,0);
     printf("[oneclick][dlc-reuse] %s %s; native install skipped\n",cid,rc?"FAILED":"ACTIVE");
     return rc;
+}
+
+/* Preserve registered DLC mounts as-is. In particular, an installed
+ * native ac.pkg without an active offload is NOT automatically erased by Mount.
+ * The separate Apontamento button is the only new entry to offload_one(...,1). */
+static int offload_registered_without_automatic_offload(const dlc_src_t *dlc, const char *tid) {
+    const char *cid=dlc->pkg.content_id;
+    char journal[PATH_MAX],native[PATH_MAX],pkg[PATH_MAX];
+    struct stat st;
+    offload_journal_path(cid,journal,sizeof(journal));
+    if (exists(journal)) {
+        offload_record_t rec;
+        if (offload_read(journal,&rec) || strcmp(rec.cid,cid) ||
+            offload_resolve_usb_port(&rec) || strcmp(rec.usb,dlc->path)) return -1;
+        snprintf(pkg,sizeof(pkg),"%s/ac.pkg",rec.native);
+        if (top_layer(rec.native,rec.stage)==0 && !lstat(pkg,&st) &&
+            S_ISREG(st.st_mode) && st.st_size>0) {
+            printf("[oneclick][dlc-reuse] %s registered native PKG waiting for manual Apontamento\n",cid);
+            return 0;
+        }
+        return offload_reuse_registered(dlc,tid); /* already offloaded: reconnect */
+    }
+    if (!offload_locate_native(tid,cid+20,native,sizeof(native))) {
+        snprintf(pkg,sizeof(pkg),"%s/ac.pkg",native);
+        if (!lstat(pkg,&st) && S_ISREG(st.st_mode) && st.st_size>0) {
+            printf("[oneclick][dlc-reuse] %s native DLC registered; awaiting manual Apontamento (no journal)\n",cid);
+            return 0;
+        }
+    }
+    printf("[oneclick][dlc-reuse] %s no active journal or native package; no installer/no deletion\n",cid);
+    return -1;
 }
 
 static int offload_resume_title(const char *tid) {
@@ -4320,6 +4465,7 @@ void app_progress_json(buf_t *out) {
     buf_printf(out, ",\"scan_folders\":%d,\"scan_pkgs\":%d,\"scan_organized\":%d,\"scan_path\":",
                g_scan_folders, g_scan_examined, g_scan_organized);
     json_str(out, g_scan_location);
+    buf_printf(out, ",\"dlc_action\":"); json_str(out, g_dlc_action);
     buf_printf(out, ",\"dlc_percent\":%d,\"dlc_content\":", g_dlc_percent);
     json_str(out, g_dlc_content);
     buf_printf(out, ",\"redirect_running\":%d,\"redirect_stage\":%d,\"redirect_done\":%d,\"redirect_current\":%d,\"redirect_total\":%d",

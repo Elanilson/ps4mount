@@ -39,6 +39,7 @@ python3 test/dlc_bundle_contract.py
 
 # Verify the no-copy USB revalidation path and read-only registry checks.
 python3 test/one_click_contract.py
+python3 test/manual_pointing_contract.py
 
 # Regression test: a failed system delete must not suppress later USB DLC mounts.
 ${CC:-cc} -std=c11 -Wall -Wextra -Werror -Isrc -o build/test/uninstall_event test/uninstall_event.c

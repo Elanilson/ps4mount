@@ -10,7 +10,7 @@ install=s[s.index('static void register_dlcs_queued(void) {'):s.index('void app_
 delete=s[s.index('static void handle_klog_line('):s.index('/* Serves the panel',s.index('static void handle_klog_line('))]
 assert 'STATE_DIR "/%s.removed"' not in dlc_open and 'if (exists(rm))' not in dlc_open, 'DLC discovery must never gate on .removed'
 assert 'dlc_open(t);' in src_open and 'if (g_cfg.dlc)' not in src_open
-assert 'offload_one(&t.dlc[i],tid)' in install
+assert 'offload_one(&t.dlc[i],tid,1)' in install
 assert 'sceAppInstUtilInstallByPackage(' in s and 'sceAppInstUtilAppInstallAll(' not in s
 assert 'ps4mount_uninstall_result(p, &uninstall_rc)' in delete
 assert 'if (uninstall_rc != 0)' in delete

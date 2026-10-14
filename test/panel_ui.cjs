@@ -33,8 +33,11 @@ function fetch(path, opts = {}) {
     if(fastComplete) state = 'ready';
     payload = {message:'Mount queued'};
   } else if(path === '/api/reinstall-dlcs?title_id='+tid) {
-    progress = {...progress,phase:fastComplete ? 'dlc_error':'dlc_queued',current:tid,detail:'Manual DLC reinstall queued'};
+    progress = {...progress,phase:fastComplete ? 'dlc_error':'dlc_queued',dlc_action:'reinstall-dlcs',current:tid,detail:'Manual DLC reinstall queued'};
     payload = {message:'Manual reinstall queued'};
+  } else if(path === '/api/point-dlcs?title_id='+tid) {
+    progress = {...progress,phase:fastComplete ? 'dlc_complete':'dlc_queued',dlc_action:'point-dlcs',current:tid,detail:'Manual pointing queued'};
+    payload = {message:'Manual pointing queued'};
   } else if(path === '/api/unmount?title_id='+tid) {
     state='inactive'; payload = {message:'Unmounted'};
   } else payload = {message:'ok'};
@@ -99,10 +102,10 @@ const flush = async()=>{ for(let i=0;i<6;i++) await new Promise(resolve=>setImme
   progress = {...progress,phase:'idle',current:''};
   get('grid').onClick({target:{closest:()=>button('reinstall-dlcs')}});
   assert.equal(confirms,2,'Manual force reinstall must ask confirmation');
-  assert(get('grid').innerHTML.includes('Reinstalando DLCs'));
+  assert(get('grid').innerHTML.includes('Instalando DLCs'));
   await flush();
   assert(requests.includes('/api/reinstall-dlcs?title_id='+tid));
-  assert(!get('grid').innerHTML.includes('Reinstalando DLCs…'),'Terminal DLC error must clear busy card on first poll');
+  assert(!get('grid').innerHTML.includes('Instalando DLCs…'),'Terminal DLC error must clear busy card on first poll');
   assert(get('toast').textContent.includes('erro'));
   // Normal queued manual reinstall: progress and then successful terminal state.
   fastComplete = false;
@@ -112,8 +115,22 @@ const flush = async()=>{ for(let i=0;i<6;i++) await new Promise(resolve=>setImme
   progress = {...progress,phase:'dlc_complete',current:tid};
   vm.runInContext('loadProgress()',context);
   await flush();
-  assert(!get('grid').innerHTML.includes('Reinstalando DLCs…'));
-  assert(get('toast').textContent.includes('finalizada'));
+  assert(!get('grid').innerHTML.includes('Instalando DLCs…'));
+  assert(get('toast').textContent.includes('concluída'));
+  // Apontamento is a distinct confirmed manual operation, not another install.
+  assert(get('grid').innerHTML.includes('Apontamento'));
+  progress = {...progress,phase:'idle',current:''};
+  get('grid').onClick({target:{closest:()=>button('point-dlcs')}});
+  assert.equal(confirms,4,'Manual pointing requires its own risk confirmation');
+  assert(get('grid').innerHTML.includes('Apontando DLCs'));
+  await flush();
+  assert(requests.includes('/api/point-dlcs?title_id='+tid));
+  assert(get('grid').innerHTML.includes('Aguardando processamento de DLCs'));
+  progress = {...progress,phase:'dlc_complete',dlc_action:'point-dlcs',current:tid};
+  vm.runInContext('loadProgress()',context);
+  await flush();
+  assert(!get('grid').innerHTML.includes('Apontando DLCs…'));
+  assert(get('toast').textContent.includes('Apontamento'));
   // USB scan remains global and visible only while scanning.
   progress = {...progress,phase:'searching',scan_folders:7,scan_pkgs:12,scan_organized:3,scan_path:'/mnt/usb0'};
   vm.runInContext('loadProgress()',context);

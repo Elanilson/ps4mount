@@ -136,9 +136,11 @@ function render() {
     var job = busy[g.title_id];
     if (job) act = '<button disabled>' +
       (job.action === 'unmount' ? 'Desmontando…' :
-       job.action === 'reinstall-dlcs' ? 'Reinstalando DLCs…' : 'Montando e processando DLCs…') + '</button>';
+       job.action === 'reinstall-dlcs' ? 'Instalando DLCs…' :
+       job.action === 'point-dlcs' ? 'Apontando DLCs…' : 'Montando e processando DLCs…') + '</button>';
     else if (g.dlc > 0 && ['ready','inactive'].indexOf(g.state) >= 0)
-      act += '<button data-a="reinstall-dlcs" data-t="' + g.title_id + '" title="Instala novamente os DLCs usando PKGs do USB e redireciona para liberar SSD">Reinstalar DLCs</button>';
+      act += '<button data-a="reinstall-dlcs" data-t="' + g.title_id + '" title="Reinstala nativamente a partir dos PKGs do USB; NAO libera o SSD">Reinstalar DLCs</button>' +
+             '<button data-a="point-dlcs" data-t="' + g.title_id + '" title="Somente apos concluir a instalacao no PS5: aponta o DLC para USB e libera a copia nativa">Apontamento</button>';
     html += '<div class="card"><div class="art" style="background-image:url(/icon/' + g.title_id + ')">' +
       '<span class="badge b-' + g.state + '">' + esc(labels[g.state] || g.state) + '</span></div>' +
       '<div class="info"><div class="name">' + esc(g.name) + '</div>' +
@@ -168,14 +170,16 @@ $('grid').addEventListener('click', function (e) {
   var tid = b.getAttribute('data-t'), a = b.getAttribute('data-a');
   if (busy[tid]) return;
   if (a === 'unmount' && !confirm('Desmontar ' + tid + '? O jogo permanece na biblioteca. Os DLCs e seus PKGs no USB serao mantidos.')) return;
-  if (a === 'reinstall-dlcs' && !confirm('Reinstalar todos os DLCs de ' + tid + ' a partir do USB, mesmo se ja estiverem registrados? Feche o jogo. O PS4Mount verificara o PKG nativo e tentara redirecionar para o USB, liberando o SSD.')) return;
+  if (a === 'reinstall-dlcs' && !confirm('Reinstalar os DLCs de ' + tid + ' usando o instalador nativo? O SSD NAO sera liberado automaticamente. Depois de receber a notificacao de conclusao do PS5, use Apontamento. Feche o jogo.')) return;
+  if (a === 'point-dlcs' && !confirm('ATENCAO: voce confirmou que TODAS as instalacoes dos DLCs de ' + tid + ' TERMINARAM no PS5? Apontamento nao compara bytes nem espera estabilidade. Ele remove a copia nativa depois de ativar o USB, o que pode causar perda de DLC se a instalacao ainda estiver em andamento.')) return;
   // Mount is a single click. Unmount retains its safety confirmation.
   busy[tid] = {action: a, percent:-1,
     detail: a === 'mount' ? 'Montando e verificando DLCs…' :
-      a === 'reinstall-dlcs' ? 'Preparando reinstalação nativa dos DLCs…' : 'Desmontando jogo…'};
+      a === 'reinstall-dlcs' ? 'Preparando reinstalação nativa dos DLCs…' :
+      a === 'point-dlcs' ? 'Preparando apontamento USB manual…' : 'Desmontando jogo…'};
   render();
   api('/api/' + a + '?title_id=' + tid, 'POST').then(function () {
-    if (a === 'mount' || a === 'reinstall-dlcs') {
+    if (a === 'mount' || a === 'reinstall-dlcs' || a === 'point-dlcs') {
       // POST only queues the job; the progress endpoint reports completion.
       loadProgress();
     } else {
@@ -184,7 +188,7 @@ $('grid').addEventListener('click', function (e) {
     }
   }).catch(function (err) {
     delete busy[tid];
-    toast('Erro ao ' + (a === 'mount' ? 'montar' : a === 'reinstall-dlcs' ? 'reinstalar DLCs de' : 'desmontar') + ' ' + tid + ': ' + err.message);
+    toast('Erro ao ' + (a === 'mount' ? 'montar' : a === 'reinstall-dlcs' ? 'reinstalar DLCs de' : a === 'point-dlcs' ? 'apontar DLCs de' : 'desmontar') + ' ' + tid + ': ' + err.message);
     load();
   });
 });
@@ -244,7 +248,7 @@ function loadProgress() {
       var dlcDetail = p.phase === 'dlc_queued' ? 'Aguardando processamento de DLCs…' :
         ((p.done || 0) + '/' + (p.total || '?') + ' DLC(s) processados · ' + (p.detail || 'Verificando DLC…'));
       var current = busy[serverDlc];
-      var actionDlc = current && current.action === 'reinstall-dlcs' ? 'reinstall-dlcs' : 'mount';
+      var actionDlc = p.dlc_action === 'point-dlcs' ? 'point-dlcs' : p.dlc_action === 'reinstall-dlcs' ? 'reinstall-dlcs' : 'mount';
       if (!current || current.action !== actionDlc || current.detail !== dlcDetail || current.percent !== p.dlc_percent) {
         busy[serverDlc] = {action:actionDlc, detail:dlcDetail, percent:p.dlc_percent};
         render();
@@ -256,10 +260,11 @@ function loadProgress() {
     if (terminalDlc) {
       var completedTid = p.current || serverDlc || serverMount;
       var completedJob = busy[completedTid];
-      if (completedJob && (completedJob.action === 'mount' || completedJob.action === 'reinstall-dlcs')) {
+      if (completedJob && (completedJob.action === 'mount' || completedJob.action === 'reinstall-dlcs' || completedJob.action === 'point-dlcs')) {
         delete busy[completedTid];
         if (p.phase === 'dlc_error') toast('DLC de ' + completedTid + ': operação finalizada com erro. Consulte o log.');
-        else if (completedJob.action === 'reinstall-dlcs') toast('Reinstalação dos DLCs de ' + completedTid + ' finalizada.');
+        else if (completedJob.action === 'reinstall-dlcs') toast('Instalação nativa de ' + completedTid + ' concluída. Após a notificação do PS5, use Apontamento.');
+        else if (completedJob.action === 'point-dlcs') toast('Apontamento de ' + completedTid + ' concluído.');
         load(); render();
       }
       serverDlc = '';
