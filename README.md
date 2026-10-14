@@ -1,6 +1,10 @@
-> **Versão 0.4.10:** jogo base, update e todos os DLCs validos do USB sao sempre considerados em Montar/Desmontar, inclusive se existirem marcadores antigos `.removed` ou registros de DLC anteriores. O botao **Instalar DLCs** solicita individualmente a instalacao de **todos** os DLCs validos do jogo, sem pular itens ja registrados. A API nativa pode responder que o DLC ja esta instalado e pode consumir espaco interno. Montagem USB nao equivale a registro efetivo de DLC no PS5. Consulte [TODOS-DLCS-0410.md](TODOS-DLCS-0410.md).
+# PS4Mount 0.4.11 — Teste de revalidação DLC via USB
 
-> **Versão experimental 0.4.9:** instalação individual de DLCs pelo instalador nativo do PS5. Veja [TESTE-DLC-INDIVIDUAL-049.md](TESTE-DLC-INDIVIDUAL-049.md). `Instalar DLCs` é uma operação explícita separada de `Montar`; pode consumir armazenamento interno e não é revertida ao desmontar.
+**Esta edição é experimental.** Ao clicar em **Montar**, o programa prepara/monta jogo, update e DLCs no USB e tenta revalidar o título por `sceAppInstUtilAppInstallTitleDir(tid, "/user/app/", NULL)`. O botão **Registrar DLCs (USB)** repete essa tentativa para o jogo já montado. Essa API é direcionada ao **jogo base**: **não há comprovação** de que registre DLCs novos. O resultado do banco `addcont.db` é comparado antes e depois.
+
+Não chama `sceAppInstUtilInstallByPackage` ou `sceAppInstUtilAppInstallAll`; não desinstala DLCs, não copia PKGs para o armazenamento interno. Metadados e links pequenos permanecem no armazenamento interno, como no original. Os DLCs instalados anteriormente de forma nativa **permanecem no armazenamento interno** e podem continuar sendo lidos dali.
+
+**Teste recomendado:** CUSA34384 (3 DLCs ausentes no banco no log anterior). Resident Evil 7 já teve 17/17 registrados pela instalação nativa, portanto não prova registro novo pelo mecanismo USB. Consulte [TESTE-REGISTRO-USB-0411.md](TESTE-REGISTRO-USB-0411.md).
 
 ## Mudanças na 0.4.7 (bundle de DLCs)
 

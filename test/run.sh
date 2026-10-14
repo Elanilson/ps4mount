@@ -3,11 +3,19 @@
 set -e
 cd "$(dirname "$0")/.."
 mkdir -p build/test
-{
-    (cd tools && xxd -i -n k_pdb_template pdb_app_template.bin)
-    (cd tools && xxd -i -n k_pdb_patch_template pdb_patch_template.bin)
-    (cd tools && xxd -i -n k_pdb_addcont_template pdb_addcont_template.bin)
-} | sed 's/^unsigned/static const unsigned/' > build/test/pdb_template.h  # included by build.c and unit.c
+# Generate templates with Python so host tests do not require xxd.
+python3 - <<'PYGEN' > build/test/pdb_template.h
+from pathlib import Path
+for file, name in [('pdb_app_template.bin', 'k_pdb_template'),
+                   ('pdb_patch_template.bin', 'k_pdb_patch_template'),
+                   ('pdb_addcont_template.bin', 'k_pdb_addcont_template')]:
+    data = (Path('tools') / file).read_bytes()
+    print(f'static const unsigned char {name}[] = {{')
+    for i in range(0, len(data), 16):
+        print('  ' + ', '.join(f'0x{x:02x}' for x in data[i:i+16]) + ',')
+    print('};')
+    print(f'static const unsigned int {name}_len = {len(data)};')
+PYGEN
 ${CC:-cc} -O1 -g -Wall -Wextra -Ibuild/test -Isrc -o build/test/unit test/unit.c src/build.c src/crypto.c src/pkg.c
 build/test/unit
 
@@ -29,10 +37,8 @@ ${CC:-cc} -O0 -D_DEFAULT_SOURCE -DSQLITE_THREADSAFE=0 \
 build/test/dlc_registry
 python3 test/dlc_bundle_contract.py
 
-# PS5 package installer ABI and native-task integration contracts.
-${CC:-cc} -std=c11 -Wall -Wextra -Werror -Isrc -o build/test/native_pkg_abi test/native_pkg_abi.c
-build/test/native_pkg_abi
-python3 test/native_dlc_contract.py
+# Verify the no-copy USB revalidation path and read-only registry checks.
+python3 test/usb_dlc_register_contract.py
 
 # Regression test: a failed system delete must not suppress later USB DLC mounts.
 ${CC:-cc} -std=c11 -Wall -Wextra -Werror -Isrc -o build/test/uninstall_event test/uninstall_event.c
