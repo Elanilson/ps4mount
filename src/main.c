@@ -41,7 +41,7 @@
 #include "web.h"
 #include "icon_data.h"
 
-#define VERSION "PS4Mount 0.4.20-one-click-offload"
+#define VERSION "PS4Mount 0.4.21-offload-recovery"
 #define LOCK_PORT 9032
 #define SCAN_SECONDS 10 /* legacy value; polling for PKGs is disabled */
 #define STATE_DIR "/data/ps4mount"
@@ -2271,6 +2271,7 @@ static int hold_link_is(const char *kind, const char *tid, const char *name, con
  * internal storage as a hidden side effect of the Mount button. */
 /* One-click native registration -> USB offload helpers (implemented below). */
 static int offload_one(const dlc_src_t *dlc, const char *tid);
+static int offload_wait_native_ready(const dlc_src_t *dlc, const char *tid, int status_unavailable);
 static int offload_resume_title(const char *tid);
 static void offload_resume_all(void);
 static int offload_unmount_title(const char *tid);
@@ -2678,8 +2679,9 @@ static int dlc_status_terminal(const char *s) {
            !strcmp(s, "installed") || !strcmp(s, "done");
 }
 
-/* Returns 0 only when the native installer reports a successful terminal
- * state. The independent database check is performed by the caller. */
+/* 0=terminal success, 1=status service cannot find this task (recheck on-disk),
+ * -1=explicit failure, -2=other uncertain task. Database + native file must
+ * still be verified by the caller before any offload. */
 static int dlc_native_install_one(const dlc_src_t *dlc) {
     struct stat st;
     if (stat(dlc->path, &st) || !S_ISREG(st.st_mode) || st.st_size <= 0) {
@@ -2709,14 +2711,29 @@ static int dlc_native_install_one(const dlc_src_t *dlc) {
                cid, dlc->pkg.content_id);
         return -2; /* accepted task, but mismatched ID: do not start another */
     }
+    int untracked_retries = 0;
     for (int second = 0; second < 1800; ++second) {
         ps5_install_status_t status = {0};
         rc = sceAppInstUtilGetInstallStatus(cid, &status);
         status.status[sizeof(status.status)-1] = 0;
         if (rc) {
+            if ((unsigned)rc == 0x80a30003U) {
+                /* On FW 11.40 the native installer can report this even
+                 * though the same Content ID appears in addcont.db later.
+                 * Retry briefly; a missing task is NOT a completed install. */
+                if (++untracked_retries < 5) {
+                    printf("[dlc-install] %s status untracked 0x80a30003 (%d/5), retrying\n",
+                           cid, untracked_retries);
+                    pump_events(1000);
+                    continue;
+                }
+                printf("[dlc-install] %s status unavailable 0x80a30003; verifying native file and DB before offload\n", cid);
+                return 1;
+            }
             printf("[dlc-install] status query %s failed rc=0x%08x; task outcome unknown\n", cid, (unsigned)rc);
             return -2;
         }
+        untracked_retries = 0;
         if (status.total_size > 0) {
             unsigned long long pct = status.downloaded_size * 100ULL / status.total_size;
             g_dlc_percent = (int)(pct > 100 ? 100 : pct);
@@ -2812,19 +2829,34 @@ static void install_dlcs_queued(void) {
         int state = -1;
         db_dlc_registration(&id, 1, &state);
         int rc = 0;
+        int installer_status_unavailable = 0;
         if (state == 1) {
-            printf("[oneclick] %s already registered, skipping installer\n", id);
+            printf("[oneclick] %s already registered, skipping installer; checking USB offload\n", id);
         } else if (state == 0) {
             rc = dlc_native_install_one(&t.dlc[i]);
+            installer_status_unavailable = (rc == 1);
+            if (installer_status_unavailable) rc = 0; /* NOT success; conditional verification below */
             if (!rc) {
                 wait_db_quiet(2,15);
                 db_dlc_registration(&id,1,&state);
-                if (state != 1) rc = -1;
+                if (state != 1) {
+                    printf("[dlc-install] %s DB not yet registered: state=%d; status_unknown=%d\n",
+                           id, state, installer_status_unavailable);
+                    /* For 0x80a30003 only, allow the readiness monitor to
+                     * wait for a DB row and full native file. A terminal API
+                     * success without a DB row also needs the same checks. */
+                }
             }
         } else rc = -1; /* never delete a file if the DB is unreadable */
         if (!rc) {
-            progress_set("installing_dlcs", "Registro confirmado; redirecionando e liberando SSD");
-            rc = offload_one(&t.dlc[i],tid);
+            progress_set("installing_dlcs", "Verificando arquivo nativo e estabilidade da instalacao");
+            if (offload_wait_native_ready(&t.dlc[i], tid, installer_status_unavailable)) {
+                printf("[dlc-install] %s offload deferred: native installation/file state not confirmed\n", id);
+                rc = -2; /* possible active native task: avoid unsafe remount */
+            } else {
+                progress_set("installing_dlcs", "Arquivo verificado; redirecionando e liberando SSD");
+                rc = offload_one(&t.dlc[i],tid);
+            }
         }
         if (rc) g_progress.failed++;
         else g_progress.ok++;
@@ -3209,6 +3241,87 @@ static int offload_locate_native(const char *tid,const char *label,char *dst,siz
     }
     return -1;
 }
+/* Fallback for FW 11.40 GetInstallStatus=0x80a30003. A DB row by itself
+ * does not prove the installer finished copying. Require 15 consecutive
+ * one-second stable observations of the exact native PKG size and timestamps,
+ * plus required metadata and an unchanged registration. Offload still performs
+ * the authoritative byte-for-byte SSD-vs-USB comparison before moving files.
+ * An existing zero-byte stub is handled by journal recovery, not installation. */
+static int offload_wait_native_ready(const dlc_src_t *dlc, const char *tid, int status_unavailable) {
+    const char *cid = dlc->pkg.content_id;
+    char journal[PATH_MAX], native[PATH_MAX], pkg[PATH_MAX], metadata[PATH_MAX];
+    struct stat usb, current, previous = {0}, m;
+    int stable = 0, logged = -1;
+    if (stat(dlc->path,&usb) || !S_ISREG(usb.st_mode) || usb.st_size <= 0) return -1;
+    offload_journal_path(cid,journal,sizeof(journal));
+    if (exists(journal)) {
+        offload_record_t rec;
+        if (offload_read(journal,&rec) || strcmp(rec.usb,dlc->path)) {
+            printf("[offload] %s cannot resume invalid/different-USB journal\n",cid);
+            return -1;
+        }
+        snprintf(pkg,sizeof(pkg),"%s/ac.pkg",rec.native);
+        if (top_layer(rec.native,rec.stage)==1 && !offload_confirm_overlay(&rec)) {
+            printf("[offload] %s USB overlay already active; validating journal\n",cid);
+            return 0;
+        }
+        if (top_layer(rec.native,rec.stage)==0 && !lstat(pkg,&current) &&
+            S_ISREG(current.st_mode) && current.st_size==0) {
+            printf("[offload] %s existing empty native stub and journal; validating remount\n",cid);
+            return 0; /* offload_one performs the journal/USB/DB checks */
+        }
+        /* If the original PKG was recreated, wait for it to settle. */
+    }
+    for (int sec=0; sec<180; sec++) {
+        if (g_stop || title_running(tid)) return -1;
+        int registered=-1;
+        db_dlc_registration(&cid,1,&registered);
+        int present = registered==1 &&
+            !offload_locate_native(tid,cid+20,native,sizeof(native));
+        if (present) {
+            snprintf(pkg,sizeof(pkg),"%s/ac.pkg",native);
+            present = !lstat(pkg,&current) && S_ISREG(current.st_mode) &&
+                      current.st_size==usb.st_size && !layers_on(native) && !dead_layer(native);
+        }
+        const char *names[]={"ac.json","ac.pbm","ac.pbm.backup"};
+        for(int j=0; present && j<3; j++) {
+            snprintf(metadata,sizeof(metadata),"%s/%s",native,names[j]);
+            if (lstat(metadata,&m) || !S_ISREG(m.st_mode) || m.st_size<=0) present=0;
+        }
+        if (present && stable &&
+            current.st_dev==previous.st_dev && current.st_ino==previous.st_ino &&
+            current.st_size==previous.st_size && current.st_mtime==previous.st_mtime &&
+            current.st_ctime==previous.st_ctime) stable++;
+        else stable=present?1:0;
+        if (present) previous=current;
+        if (sec / 10 != logged) {
+            logged=sec/10;
+            printf("[dlc-verify] %s %s sec=%d db=%d native_complete=%d stable=%d/15 size=%llu expected=%llu\n",
+                   cid,status_unavailable?"STATUS_FALLBACK":"NORMAL",sec,registered,present,stable,
+                   (unsigned long long)(present?current.st_size:0),
+                   (unsigned long long)usb.st_size);
+        }
+        if (stable>=15) {
+            /* There is no reliable native-task completion event on this FW.
+             * Recheck after a quiet interval; cannot guarantee OS cache flush. */
+            wait_db_quiet(3,12);
+            int after=-1;db_dlc_registration(&cid,1,&after);
+            struct stat check;
+            if(after==1 && !lstat(pkg,&check) && S_ISREG(check.st_mode) &&
+               check.st_dev==current.st_dev && check.st_ino==current.st_ino &&
+               check.st_size==usb.st_size && check.st_mtime==current.st_mtime &&
+               check.st_ctime==current.st_ctime && !layers_on(native)) {
+                printf("[dlc-verify] %s READY: DB=1, native file+metadata stable, native=%s; byte compare next\n",cid,native);
+                return 0;
+            }
+            stable=0;
+        }
+        pump_events(1000);
+    }
+    printf("[dlc-verify] %s TIMEOUT: native file/metadata/DB not stable; SSD preserved\n",cid);
+    return -1;
+}
+
 static int offload_one(const dlc_src_t *dlc,const char *tid) {
     const char *cid=dlc->pkg.content_id;
     char journal[PATH_MAX],pkg[PATH_MAX],held[PATH_MAX],root[32];
@@ -3246,7 +3359,13 @@ static int offload_one(const dlc_src_t *dlc,const char *tid) {
         printf("[offload] %s SSD/USB PKG differs or IO error; preserving SSD\n",cid);
         return -1;
     }
-    printf("[offload] %s NATIVE/USB MATCH; preparing redirect\n",cid);
+    struct stat matched;
+    if (lstat(pkg,&matched) || !S_ISREG(matched.st_mode) || matched.st_size<=0) {
+        printf("[offload] %s native PKG changed after comparison; preserving SSD\n",cid);
+        return -1;
+    }
+    printf("[offload] %s NATIVE/USB MATCH size=%llu native=%s; preparing redirect\n",
+           cid,(unsigned long long)matched.st_size,rec.native);
     mkdirs(rec.stage,0770);
     const char *meta[]={"ac.json","ac.pbm","ac.pbm.backup"};
     for (int i=0;i<3;i++) if (redirect_copy_meta(rec.native,rec.stage,meta[i]))return -1;
@@ -3278,7 +3397,9 @@ static int offload_one(const dlc_src_t *dlc,const char *tid) {
         printf("[offload] %s mounted, but held-file unlink failed; retry on next mount\n",cid);
         return -1;
     }
-    printf("[offload] DONE %s SSD bytes released, native stub 0 bytes, real PKG served by USB\n",cid);
+    printf("[offload] DONE %s SSD original unlinked: logical_bytes=%llu allocated_bytes_estimate=%llu native_stub=0 usb=%s\n",
+           cid,(unsigned long long)matched.st_size,
+           (unsigned long long)matched.st_blocks*512ULL,rec.usb);
     return 0;
 rollback:
     printf("[offload] %s operation failed; attempting rollback errno=%d\n",cid,errno);

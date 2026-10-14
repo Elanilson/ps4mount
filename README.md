@@ -1,3 +1,7 @@
+## Alterações locais v0.4.21 — recuperação de status e offload
+
+Corrige o fluxo após `GetInstallStatus=0x80a30003` comprovado no log do MARVEL: aguarda registro e arquivo nativo estável, compara bytes com o USB e só então permite excluir a cópia nativa sob `nullfs`. Inclui logs `logical_bytes` e `allocated_bytes_estimate`. **Experimental, compilação PS5 e teste de hardware pendentes.** Veja [TESTE-0421-RECUPERAR-OFFLOAD.md](TESTE-0421-RECUPERAR-OFFLOAD.md).
+
 ## Alterações locais v0.4.20 (proposta experimental)
 
 Interface por jogo: **Montar / Desmontar**. Montar faz registro do jogo + instalação nativa individual dos DLCs ainda não registrados + comparação e offload para USB, substituindo o ac.pkg nativo por entrada vazia de 0 bytes sob nullfs. Desmontar remove o jogo da biblioteca por chamada direcionada. **Ainda não comprovado no PS5**; veja [TESTE-0420-UM-CLIQUE.md](TESTE-0420-UM-CLIQUE.md).
