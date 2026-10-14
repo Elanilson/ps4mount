@@ -13,12 +13,12 @@ void app_progress_json(buf_t *out);
 int app_add(const char *tid, char *msg, size_t cap);
 int app_remove(const char *tid, char *msg, size_t cap);
 int app_register_dlcs(const char *tid, char *msg, size_t cap);
-void app_isolation_json(buf_t *out);
-int app_isolate_others(const char *tid, char *msg, size_t cap);
-int app_restore_others(char *msg, size_t cap);
+int app_install_dlcs(const char *tid, char *msg, size_t cap);
+int app_redirect_native_dlc(const char *tid, char *msg, size_t cap);
+int app_restore_native_dlc(const char *tid, char *msg, size_t cap);
 int app_diagnose_db(const char *tid, char *msg, size_t cap);
 int app_rescan(void);
-int app_stop(void);
+void app_stop(void);
 void app_config_json(buf_t *out);
 /* body: form-encoded settings; 0 when saved, msg says why not. */
 int app_config_set(const char *body, char *msg, size_t cap);

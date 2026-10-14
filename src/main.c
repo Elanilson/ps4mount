@@ -40,9 +40,8 @@
 #include "scan_walk.h"
 #include "web.h"
 #include "icon_data.h"
-#include "isolation.h"
 
-#define VERSION "PS4Mount 0.4.14-isolation-test"
+#define VERSION "PS4Mount 0.4.15-native-redirect-test"
 #define LOCK_PORT 9032
 #define SCAN_SECONDS 10 /* legacy value; polling for PKGs is disabled */
 #define STATE_DIR "/data/ps4mount"
@@ -75,12 +74,11 @@ int sceUserServiceInitialize(void *);
 int sceAppInstUtilInitialize(void);
 int sceAppInstUtilAppUnInstall(const char *);
 
+#include "ps5_appinst_pkg.h"
 #include "uninstall_event.h"
 int sceKernelSendNotificationRequest(int, notify_request_t *, size_t, int);
-/* Base title registration remains targeted. The optional, user-triggered original
- * AppInstallAll experiment is GLOBAL, never title-scoped, and is never invoked
- * during a normal Mount / automatic restoration. */
-int sceAppInstUtilAppInstallAll(void *);
+/* Targeted registration only. No fallback to global AppInstallAll: a prior full-library
+ * attempt caused a console panic. Resolve BEFORE writing any title metadata. */
 typedef int (*app_install_title_dir_fn)(const char *, const char *, void *);
 static app_install_title_dir_fn one_title_install_api(void) {
     uint32_t handle = 0;
@@ -1642,6 +1640,7 @@ static void handle_klog_line(const char *line) {
 static int g_discover_requested;
 static char g_activate_request[10];
 static char g_dlc_register_request[10];
+static char g_dlc_install_request[10];
 static int g_restore_running;
 typedef struct {
     const char *phase;
@@ -1653,153 +1652,9 @@ static progress_t g_progress = {"idle", 0, 0, 0, 0, "", "Waiting for action"};
 static int g_dlc_percent = -1;    /* -1 means indeterminate */
 static char g_dlc_content[48];
 static int g_appinst_ready = 0;
-static int g_catalog_dirty = 1;
 static void register_dlcs_queued(void);
-/* One request at a time. Busy is held until the main loop has verified results.
- * The worker never reads the SQLite database (compiled single-thread mode). */
-static volatile int g_original_global_busy, g_original_global_finished;
-static volatile int g_original_global_rc;
-static char g_original_global_tid[10];
-static int g_original_global_count, g_original_global_before[MAX_DLC];
-static char g_original_global_ids[MAX_DLC][40];
-static int find_root(const char *tid, char *root, size_t n);
-
-
-/* Manual test mode. Only PKG symlinks made by PS4Mount under HOLD_DIR are
- * renamed; live /user mounts, USB PKGs, registered titles and DBs are untouched.
- * This is best-effort staging isolation, NOT scoping AppInstallAll itself. */
-static int isolation_operation_busy(void) {
-    return g_original_global_busy || g_deleting || g_restore_running ||
-           g_discover_requested || g_activate_request[0] || g_dlc_register_request[0] ||
-           !strcmp(g_progress.phase, "activating") ||
-           !strcmp(g_progress.phase, "searching") ||
-           !strcmp(g_progress.phase, "registering_dlcs") ||
-           !strcmp(g_progress.phase, "dlc_register_queued");
-}
-
-void app_isolation_json(buf_t *out) {
-    isolation_report_t r;
-    int active = isolation_status(HOLD_DIR, STATE_DIR, &r);
-    buf_printf(out, "{\"active\":%s,\"hidden\":%d,\"target\":\"%s\",\"error\":%s}",
-        (active > 0 || r.already_hidden) ? "true" : "false", r.already_hidden, r.target,
-        active < 0 ? "true" : "false");
-}
-
-int app_isolate_others(const char *tid, char *msg, size_t cap) {
-    if (isolation_operation_busy()) {
-        snprintf(msg, cap, "Busy; close all games and finish other operations first");
-        return -1;
-    }
-    char root[32];
-    if (find_root(tid, root, sizeof(root)) || !is_mountpoint(root) || !db_is_registered(tid)) {
-        snprintf(msg, cap, "Selected game must be on connected USB and registered");
-        return -1;
-    }
-    /* Do not temporarily hide app/patch/DLC links while any game sandbox is running. */
-    refresh_sandboxes();
-    if (g_nsandboxes) {
-        snprintf(msg, cap, "Game sandbox active; close all games before isolation");
-        return -1;
-    }
-    isolation_report_t r;
-    int rc = isolation_enable(HOLD_DIR, STATE_DIR, tid, &r);
-    printf("[isolation] ENABLE target=%s rc=%d candidates=%d changed=%d conflicts=%d failures=%d; PKG symlinks only, AppInstallAll remains GLOBAL\n",
-           tid, rc, r.examined, r.changed, r.conflicts, r.failures);
-    if (rc) snprintf(msg, cap, "Isolation failed; check log and press Restore");
-    else snprintf(msg, cap,
-        "Hidden %d staging PKG links from other games; target %s stays visible; AppInstallAll STILL GLOBAL",
-        r.changed, tid);
-    return rc;
-}
-
-int app_restore_others(char *msg, size_t cap) {
-    if (isolation_operation_busy()) {
-        snprintf(msg, cap, "Wait for AppInstallAll/global operation to finish before restoring");
-        return -1;
-    }
-    isolation_report_t r;
-    int rc = isolation_restore(HOLD_DIR, STATE_DIR, &r);
-    printf("[isolation] RESTORE rc=%d target=%s found=%d restored=%d conflicts=%d failures=%d\n",
-           rc, r.target, r.already_hidden, r.changed, r.conflicts, r.failures);
-    if (rc) snprintf(msg, cap, "Restoration incomplete; see [isolation] log and retry");
-    else snprintf(msg, cap, "Restored %d staging PKG symlinks", r.changed);
-    return rc;
-}
-
-static void *original_global_worker(void *arg) {
-    (void)arg;
-    int rc = sceAppInstUtilAppInstallAll(NULL);
-    __atomic_store_n(&g_original_global_rc, rc, __ATOMIC_RELEASE);
-    __atomic_store_n(&g_original_global_finished, 1, __ATOMIC_RELEASE);
-    return NULL;
-}
-
-static int original_global_start(void) {
-    if (g_original_global_busy) return -1;
-    g_original_global_busy = 1;
-    g_original_global_finished = 0;
-    g_original_global_rc = -1;
-    pthread_t th;
-    int rc = pthread_create(&th, NULL, original_global_worker, NULL);
-    if (rc) {
-        printf("[dlc-original] ERROR pthread_create rc=%d; NO synchronous fallback\n", rc);
-        g_original_global_busy = 0;
-        return -1;
-    }
-    pthread_detach(th);
-    return 0;
-}
-
-static void original_global_poll(void) {
-    if (!g_original_global_busy) return;
-    if (!__atomic_load_n(&g_original_global_finished, __ATOMIC_ACQUIRE)) {
-        static time_t last_heartbeat;
-        time_t now = time(NULL);
-        if (now - last_heartbeat >= 20) {
-            last_heartbeat = now;
-            printf("[dlc-original] %s AppInstallAll GLOBAL still running (no per-DLC progress API)\n", g_original_global_tid);
-        }
-        return;
-    }
-    int api_rc = __atomic_load_n(&g_original_global_rc, __ATOMIC_ACQUIRE);
-    /* ShellCore might still be writing rows after the function returns. */
-    wait_db_quiet(3, 25);
-    const char *ids[MAX_DLC];
-    int states[MAX_DLC];
-    int was = 0, now = 0, newly = 0, missing = 0, unknown = 0;
-    for (int i = 0; i < g_original_global_count; i++) ids[i] = g_original_global_ids[i];
-    db_dlc_registration(ids, g_original_global_count, states);
-    for (int i = 0; i < g_original_global_count; i++) {
-        if (g_original_global_before[i] == 1) was++;
-        if (states[i] == 1) {
-            now++;
-            if (g_original_global_before[i] != 1) newly++;
-            printf("[dlc-original] %s %s %s\n", g_original_global_tid,
-                   g_original_global_ids[i],
-                   g_original_global_before[i] == 1 ? "PRESENT_BEFORE" : "REGISTERED_AFTER");
-        } else if (states[i] == 0) {
-            missing++;
-            printf("[dlc-original] %s STILL_MISSING %s\n", g_original_global_tid,
-                   g_original_global_ids[i]);
-        } else {
-            unknown++;
-            printf("[dlc-original] %s UNKNOWN %s\n", g_original_global_tid,
-                   g_original_global_ids[i]);
-        }
-    }
-    printf("[dlc-original] %s GLOBAL AppInstallAll returned rc=0x%08x: BEFORE=%d AFTER=%d NEW=%d MISSING=%d UNKNOWN=%d of %d; OTHER TITLES MAY HAVE BEEN AFFECTED\n",
-           g_original_global_tid, (unsigned)api_rc, was, now, newly, missing, unknown,
-           g_original_global_count);
-    g_progress.done = g_original_global_count;
-    g_progress.ok = now;
-    g_progress.failed = missing + unknown;
-    progress_set((api_rc == 0 && missing == 0 && unknown == 0) ? "dlc_complete" : "dlc_error",
-        api_rc ? "AppInstallAll retornou erro; confira o log" :
-        (missing || unknown) ? "DLCs ausentes apos registro GLOBAL; confira o log" :
-        "Todos os registros do jogo foram encontrados; confira efeitos globais");
-    g_original_global_busy = 0;
-    g_catalog_dirty = 1;
-}
+static void install_dlcs_queued(void);
+static int redirect_mounted(void);
 
 static void progress_set(const char *phase, const char *detail) {
     g_progress.phase = phase;
@@ -1809,9 +1664,11 @@ static void progress_set(const char *phase, const char *detail) {
 static int any_external_usb(void);
 
 int app_rescan(void) {
-    isolation_report_t iso;
-    if (isolation_status(HOLD_DIR, STATE_DIR, &iso) != 0 || iso.already_hidden) return -1;
-    if (g_original_global_busy || g_discover_requested || g_restore_running || g_activate_request[0] || g_dlc_register_request[0] ||
+    if (redirect_mounted()) {
+        printf("[dlc-redirect] search refused while temporary native overlay active\n");
+        return -1;
+    }
+    if (g_discover_requested || g_restore_running || g_activate_request[0] || g_dlc_register_request[0] || g_dlc_install_request[0] ||
         !strcmp(g_progress.phase, "searching") || !strcmp(g_progress.phase, "activating") ||
         !strcmp(g_progress.phase, "registering_dlcs") || !strcmp(g_progress.phase, "dlc_register_queued"))
         return -1;
@@ -1828,13 +1685,13 @@ int app_rescan(void) {
     return 0;
 }
 
-int app_stop(void) {
-    if (g_original_global_busy) {
-        printf("[dlc-original] STOP IGNORED: GLOBAL AppInstallAll still running\n");
-        return -1;
+void app_stop(void) {
+    if (redirect_mounted() && !title_running("CUSA03842")) {
+        char msg[256];
+        app_restore_native_dlc("CUSA03842", msg, sizeof(msg));
+        printf("[dlc-redirect] stop cleanup: %s\n", msg);
     }
     g_stop = 1;
-    return 0;
 }
 
 static void json_str(buf_t *b, const char *s) {
@@ -1874,7 +1731,7 @@ typedef struct {
     int patch, dlc;
 } catalog_item_t;
 static catalog_item_t g_catalog[CATALOG_MAX];
-static int g_catalog_count;
+static int g_catalog_count, g_catalog_dirty = 1;
 static int active_status(const char *tid);
 
 static void catalog_refresh(void) {
@@ -2001,12 +1858,12 @@ int app_icon(const char *tid, buf_t *out) {
 
 /* Only the selected CUSA is registered; the callback merely queues a request. */
 int app_add(const char *tid, char *msg, size_t cap) {
-    isolation_report_t iso;
-    if (isolation_status(HOLD_DIR, STATE_DIR, &iso) != 0 || iso.already_hidden) {
-        snprintf(msg, cap, "Restore other games before mounting titles"); return -1;
+    if (redirect_mounted()) {
+        snprintf(msg, cap, "Restore temporary native DLC overlay first");
+        return -1;
     }
     char root[32];
-    if (g_original_global_busy || g_restore_running || g_discover_requested || g_activate_request[0] || g_dlc_register_request[0] ||
+    if (g_restore_running || g_discover_requested || g_activate_request[0] || g_dlc_register_request[0] || g_dlc_install_request[0] ||
         !strcmp(g_progress.phase, "activating") || !strcmp(g_progress.phase, "searching") ||
         !strcmp(g_progress.phase, "registering_dlcs") || !strcmp(g_progress.phase, "dlc_register_queued")) {
         snprintf(msg, cap, "Busy restoring, searching, or activating another game");
@@ -2136,11 +1993,11 @@ static int release_title_bundle(const title_src_t *t) {
 }
 
 int app_remove(const char *tid, char *msg, size_t cap) {
-    isolation_report_t iso;
-    if (isolation_status(HOLD_DIR, STATE_DIR, &iso) != 0 || iso.already_hidden) {
-        snprintf(msg, cap, "Restore other games before unmounting titles"); return -1;
+    if (redirect_mounted()) {
+        snprintf(msg, cap, "Restore temporary native DLC overlay first");
+        return -1;
     }
-    if (g_original_global_busy || g_restore_running || g_activate_request[0] || g_dlc_register_request[0] || g_discover_requested ||
+    if (g_restore_running || g_activate_request[0] || g_dlc_register_request[0] || g_dlc_install_request[0] || g_discover_requested ||
         !strcmp(g_progress.phase, "activating") || !strcmp(g_progress.phase, "searching") ||
         !strcmp(g_progress.phase, "registering_dlcs") || !strcmp(g_progress.phase, "dlc_register_queued")) {
         snprintf(msg, cap, "Wait until the current operation ends");
@@ -2355,8 +2212,9 @@ static int hold_link_is(const char *kind, const char *tid, const char *name, con
     return !strcmp(actual, expected);
 }
 
-/* Reports registration evidence for the chosen CUSA. Mount does not silently
- * run the GLOBAL AppInstallAll method; see the explicit experimental button. */
+/* Reports database evidence only.  Mounting ac.pkg is not equivalent to a
+ * registered entitlement; do not call AppInstallAll or install packages to
+ * internal storage as a hidden side effect of the Mount button. */
 static void report_dlc_registration(const title_src_t *t) {
     if (!t->ndlc) return;
     const char *ids[MAX_DLC];
@@ -2376,6 +2234,67 @@ static void report_dlc_registration(const title_src_t *t) {
         printf("[manual][dlc-db] %s: DLC registration NOT confirmed; targeted base registration does not prove add-on registration\n", t->app.title_id);
     if (unknown)
         printf("[manual][dlc-db] %s: addcont.db unreadable or schema not recognized; no registration claim\n", t->app.title_id);
+}
+
+/* Targeted, NO-COPY revalidation of a prepared USB bundle.
+ * We deliberately use the *existing* title registration function with its
+ * documented /user/app/ root, NOT InstallAll and NOT InstallByPackage.
+ * Firmware 11.40 has not proved that it also promotes addcont records.
+ * All results below are based on read-only addcont.db evidence. */
+static int usb_dlc_revalidate(title_src_t *t, const char *why) {
+    if (!t->ndlc) return 0;
+    const char *tid = t->app.title_id;
+    const char *ids[MAX_DLC];
+    int before[MAX_DLC], after[MAX_DLC];
+    int known = 0, added = 0, missing = 0, unknown = 0;
+    for (int i = 0; i < t->ndlc; i++) ids[i] = t->dlc[i].pkg.content_id;
+    db_dlc_registration(ids, t->ndlc, before);
+    for (int i = 0; i < t->ndlc; i++) if (before[i] == 1) known++;
+    printf("[dlc-usb] %s %s: staged=%d db_before=%d; probing title-only revalidation (UNPROVEN for DLCs)\n",
+           tid, why, t->ndlc, known);
+    /* An installed native DLC can mask this mount. Make this visible in logs;
+     * never delete or override the internal add-on to fake a USB-only result. */
+    for (int i = 0; i < t->ndlc_tids; i++) {
+        if (addcont_installed(t->dlc_tids[i]))
+            printf("[dlc-usb] %s: /user/addcont/%s has internal files; NOT USB-only for this folder\n",
+                   tid, t->dlc_tids[i]);
+    }
+    if (!g_appinst_ready || !db_snapshot_healthy() || !db_is_registered(tid) ||
+        title_running(tid) || !title_layers_mounted(t)) {
+        printf("[dlc-usb] %s: revalidation not attempted (service/DB/mount/running state)\n", tid);
+        return -1;
+    }
+    app_install_title_dir_fn single = one_title_install_api();
+    if (!single) {
+        printf("[dlc-usb] %s: AppInstallTitleDir unavailable; NO global fallback\n", tid);
+        return -1;
+    }
+    progress_set(g_progress.phase, "Revalidando registro local; DLCs continuam no USB");
+    int rc = single(tid, "/user/app/", NULL);
+    printf("[dlc-usb] %s AppInstallTitleDir(/user/app/) rc=0x%08x (not an addcont-specific API)\n",
+           tid, (unsigned)rc);
+    /* 0x80990002 is often an already-known title. Neither code proves DLC registration. */
+    if (rc && (uint32_t)rc != 0x80990002u) return -1;
+    wait_db_quiet(2, 12);
+    db_dlc_registration(ids, t->ndlc, after);
+    for (int i = 0; i < t->ndlc; i++) {
+        if (after[i] == 1) {
+            if (before[i] != 1) added++;
+        } else if (after[i] == 0) {
+            missing++;
+            printf("[dlc-usb] %s STILL_MISSING %s\n", tid, ids[i]);
+        } else {
+            unknown++;
+            printf("[dlc-usb] %s UNKNOWN %s\n", tid, ids[i]);
+        }
+    }
+    printf("[dlc-usb] %s AFTER: total=%d newly_registered=%d registered=%d missing=%d unknown=%d\n",
+           tid, t->ndlc, added, t->ndlc - missing - unknown, missing, unknown);
+    if (missing || unknown)
+        printf("[dlc-usb] %s: targeted title refresh DID NOT prove add-on registration; no PKGs copied\n", tid);
+    else
+        printf("[dlc-usb] %s: all DLC records present (might predate this action); no PKGs copied by PS4Mount\n", tid);
+    return (missing || unknown) ? -1 : 0;
 }
 
 static int mount_registered_title(title_src_t *t) {
@@ -2491,8 +2410,11 @@ static void activate_queued(void) {
         printf("[manual][activate] %s activated: game+update+DLC mounts checked; %d DLC source(s) staged\n",
                tid, t.ndlc);
         report_dlc_registration(&t);
-        /* Normal Mount is no-copy and never launches a GLOBAL API silently.
-         * Use the explicit 'Registrar DLCs (GLOBAL)' button to test the original. */
+        if (t.ndlc) {
+            int drc = usb_dlc_revalidate(&t, "MOUNT");
+            printf("[manual][activate] %s DLC registration probe %s (game stays mounted)\n",
+                   tid, drc ? "NOT_CONFIRMED" : "DB_CONFIRMED");
+        }
     }
     src_close(&t);
     if (rc) goto failed;
@@ -2516,8 +2438,8 @@ failed:
  * Useful to compare native-installed Resident Evil 7 add-ons with absent
  * God of War Ragnarök add-on rows. */
 int app_diagnose_db(const char *tid, char *msg, size_t cap) {
-    if (g_original_global_busy || g_discover_requested || g_restore_running || g_activate_request[0] ||
-        g_dlc_register_request[0] || !strcmp(g_progress.phase, "registering_dlcs") ||
+    if (g_discover_requested || g_restore_running || g_activate_request[0] ||
+        g_dlc_register_request[0] || g_dlc_install_request[0] || !strcmp(g_progress.phase, "registering_dlcs") ||
         !strcmp(g_progress.phase, "activating") || !strcmp(g_progress.phase, "searching")) {
         snprintf(msg, cap, "An operation is running. Retry when idle");
         return -1;
@@ -2533,43 +2455,36 @@ int app_diagnose_db(const char *tid, char *msg, size_t cap) {
     return 0;
 }
 
-/* Optional explicit, GLOBAL original PS4Mount installer experiment.
- * It never calls the native InstallByPackage routine, and it cannot be
- * restricted to the chosen CUSA by any argument. It is not automatic. */
+/* Independent Retry button. The same targeted no-copy revalidation is also
+ * attempted on Mount. We NEVER uninstall and NEVER run a package installer. */
 int app_register_dlcs(const char *tid, char *msg, size_t cap) {
-    if (g_deleting) { snprintf(msg, cap, "System delete UI active; exit it before GLOBAL registration"); return -1; }
+    if (redirect_mounted()) {
+        snprintf(msg, cap, "Restore temporary native DLC overlay first");
+        return -1;
+    }
     char root[32];
-    if (g_original_global_busy || g_dlc_register_request[0] || g_activate_request[0] || g_discover_requested ||
+    if (g_dlc_register_request[0] || g_dlc_install_request[0] || g_activate_request[0] || g_discover_requested ||
         g_restore_running || !strcmp(g_progress.phase, "registering_dlcs") ||
         !strcmp(g_progress.phase, "activating") || !strcmp(g_progress.phase, "searching") ||
         !strcmp(g_progress.phase, "dlc_register_queued")) {
         snprintf(msg, cap, "Another operation is running");
         return -1;
     }
-    if (!g_appinst_ready || g_original_global_busy) {
-        snprintf(msg, cap, "AppInstUtil unavailable or global registration already in progress");
+    if (!g_appinst_ready || !one_title_install_api()) {
+        snprintf(msg, cap, "Targeted AppInstallTitleDir unavailable; no global fallback");
         return -1;
     }
-    if (find_root(tid, root, sizeof(root)) || !is_mountpoint(root) || title_running(tid)) {
-        snprintf(msg, cap, "USB unavailable or selected game running");
+    if (find_root(tid, root, sizeof(root)) || !is_mountpoint(root) ||
+        title_running(tid) || installed_internally(tid) ||
+        !db_snapshot_healthy() || !db_is_registered(tid)) {
+        snprintf(msg, cap, "Game must be mounted, on USB, registered and closed");
         return -1;
     }
-    isolation_report_t iso;
-    int iso_active = isolation_status(HOLD_DIR, STATE_DIR, &iso);
-    if (iso_active < 0) {
-        snprintf(msg, cap, "Isolation state unreadable; restore and inspect log first");
-        return -1;
-    }
-    if ((iso_active > 0 || iso.already_hidden) && strcmp(iso.target, tid)) {
-        snprintf(msg, cap, "Other games isolated for %s; restore before choosing %s", iso.target, tid);
-        return -1;
-    }
-    /* Deliberately do NOT filter by app.db, addcont.db or .removed flags. */
     snprintf(g_dlc_register_request, sizeof(g_dlc_register_request), "%s", tid);
-    g_progress = (progress_t){"dlc_register_queued", 0, 0, 0, 0, "", "Aguardando AppInstallAll GLOBAL (original)"};
+    g_progress = (progress_t){"dlc_register_queued", 0, 0, 0, 0, "", "Aguardando revalidacao dos DLCs no USB"};
     snprintf(g_progress.current, sizeof(g_progress.current), "%s", tid);
-    printf("[dlc-original] %s QUEUED: requested GLOBAL AppInstallAll; no DLC status filter\n", tid);
-    snprintf(msg, cap, "GLOBAL AppInstallAll queued; may affect every staged PS4 item, not just %s", tid);
+    printf("[dlc-usb] %s queued, no native PKG installer, no AppInstallAll\n", tid);
+    snprintf(msg, cap, "USB DLC registration probe queued for %s", tid);
     return 0;
 }
 
@@ -2579,50 +2494,483 @@ static void register_dlcs_queued(void) {
     snprintf(tid, sizeof(tid), "%s", g_dlc_register_request);
     g_dlc_register_request[0] = 0;
     snprintf(g_progress.current, sizeof(g_progress.current), "%s", tid);
-    progress_set("registering_dlcs", "Preparando DLCs no USB para AppInstallAll GLOBAL");
+    progress_set("registering_dlcs", "Validando montagem e metadados no USB");
     title_src_t t = {0};
-    int opened = 0;
-    if (find_root(tid, root, sizeof(root)) || !is_mountpoint(root) || title_running(tid) ||
-        !g_appinst_ready || g_original_global_busy) goto failed;
-    if (src_open(&t, root, tid)) goto failed;
+    int opened = 0, rc = -1;
+    if (find_root(tid, root, sizeof(root)) || !is_mountpoint(root) ||
+        !db_snapshot_healthy() || !db_is_registered(tid) || title_running(tid) ||
+        installed_internally(tid)) goto out;
+    if (src_open(&t, root, tid)) goto out;
     opened = 1;
     if (!t.ndlc) {
-        printf("[dlc-original] %s: no DLC PKG found; no global API called\n", tid);
-        goto failed;
+        printf("[dlc-usb] %s: no valid DLC PKGs on USB\n", tid);
+        goto out;
+    }
+    if (!title_layers_mounted(&t) || target_mounts_safe(&t)) {
+        printf("[dlc-usb] %s: game/patch/addcont USB bundle not safely mounted\n", tid);
+        goto out;
     }
     g_progress.total = t.ndlc;
-    /* The same metadata/symlink preparation as the upstream project. No
-     * filter for already registered DLCs, removed flags or app.db status. */
-    if (target_mounts_safe(&t) || place_files(&t) || mount_title(&t) ||
-        !title_layers_mounted(&t)) {
-        printf("[dlc-original] %s: unable to stage USB bundle; no global call\n", tid);
+    /* Recreate only metadata and symlinks, never install PKG contents. */
+    if (place_files(&t) || mount_title(&t) || !title_layers_mounted(&t)) {
+        printf("[dlc-usb] %s: failed to refresh USB metadata\n", tid);
+        goto out;
+    }
+    rc = usb_dlc_revalidate(&t, "BUTTON");
+    report_dlc_registration(&t);
+    g_progress.done = t.ndlc;
+    if (!rc) g_progress.ok = t.ndlc;
+    else g_progress.failed = t.ndlc;
+out:
+    if (opened) src_close(&t);
+    g_catalog_dirty = 1;
+    progress_set(rc ? "dlc_error" : "dlc_complete",
+                 rc ? "Registro dos DLCs NAO confirmado; veja o log" : "Registros de DLC presentes no banco");
+    printf("[dlc-usb] %s explicit probe %s\n", tid, rc ? "NOT_CONFIRMED" : "DB_CONFIRMED");
+}
+
+/* Explicit per-title request. Never invoked by Mount, USB scan or restoration.
+ * Installation is a native PKG operation; data MAY be copied to internal storage.
+ * Unlike external mounts, internal add-on installations are not removed on Unmount. */
+int app_install_dlcs(const char *tid, char *msg, size_t cap) {
+    char root[32];
+    if (g_dlc_install_request[0] || g_dlc_register_request[0] || g_activate_request[0] || g_discover_requested ||
+        g_restore_running || !strcmp(g_progress.phase, "installing_dlcs") ||
+        !strcmp(g_progress.phase, "activating") || !strcmp(g_progress.phase, "searching") ||
+        !strcmp(g_progress.phase, "installing_dlcs") || !strcmp(g_progress.phase, "dlc_queued")) {
+        snprintf(msg, cap, "Another operation is running");
+        return -1;
+    }
+    if (redirect_mounted()) {
+        snprintf(msg, cap, "Restore the RE7 USB overlay before native DLC installation");
+        return -1;
+    }
+    if (!g_appinst_ready) {
+        snprintf(msg, cap, "PS5 AppInstUtil initialization failed; see startup log");
+        return -1;
+    }
+    if (find_root(tid, root, sizeof(root)) || !is_mountpoint(root)) {
+        snprintf(msg, cap, "%s: USB storage not connected", tid);
+        return -1;
+    }
+    if (title_running(tid) || installed_internally(tid)) {
+        snprintf(msg, cap, "Close the game and use an external USB game");
+        return -1;
+    }
+    if (!db_snapshot_healthy() || !db_is_registered(tid)) {
+        snprintf(msg, cap, "Base game must already be registered on PS5");
+        return -1;
+    }
+    snprintf(g_dlc_install_request, sizeof(g_dlc_install_request), "%s", tid);
+    g_dlc_percent = -1;
+    g_dlc_content[0] = 0;
+    g_progress = (progress_t){"dlc_queued", 0, 0, 0, 0, "", "Aguardando instalacao individual dos DLCs"};
+    snprintf(g_progress.current, sizeof(g_progress.current), "%s", tid);
+    printf("[dlc-install] %s queued (individual PKGs, never AppInstallAll)\n", tid);
+    snprintf(msg, cap, "Individual DLC installation queued for %s", tid);
+    return 0;
+}
+
+/* Selective layer release: an external nullfs add-on folder must not mask a
+ * native installer destination. Do not touch base/patch or non-owned mounts. */
+static int dlc_installer_release_external_layer(const char *dtid) {
+    char target[64], hold[PATH_MAX];
+    snprintf(target, sizeof(target), "/user/addcont/%s", dtid);
+    hold_path(hold, sizeof(hold), "addcont", dtid);
+    int n = owned_layer_count(target, hold);
+    int top = top_layer(target, hold);
+    if (n < 0 || top < 0 || dead_layer(target)) return -1;
+    if (n == 0) return top == 0 ? 0 : -1;
+    if (top != 1) return -1;
+    if (release_owned_layer(dtid, "addcont")) return -1;
+    printf("[dlc-install] released PS4Mount add-on overlay %s for native installer\n", dtid);
+    return 0;
+}
+
+static int dlc_status_terminal(const char *s) {
+    return !strcmp(s, "playable") || !strcmp(s, "completed") ||
+           !strcmp(s, "installed") || !strcmp(s, "done");
+}
+
+/* Returns 0 only when the native installer reports a successful terminal
+ * state. The independent database check is performed by the caller. */
+static int dlc_native_install_one(const dlc_src_t *dlc) {
+    struct stat st;
+    if (stat(dlc->path, &st) || !S_ISREG(st.st_mode) || st.st_size <= 0) {
+        printf("[dlc-install] %s missing source: %s\n", dlc->pkg.content_id, dlc->path);
+        return -1;
+    }
+    ps5_pkg_meta_t meta = {
+        .uri = dlc->path, .ex_uri = "", .playgo_scenario_id = "",
+        .content_id = "", .content_name = dlc->pkg.content_id, .icon_url = ""
+    };
+    ps5_pkg_info_t info = {0};
+    ps5_playgo_info_t *playgo = calloc(1, sizeof(*playgo));
+    if (!playgo) return -1;
+    printf("[dlc-install] START %s from %s (%llu bytes)\n", dlc->pkg.content_id,
+           dlc->path, (unsigned long long)st.st_size);
+    int rc = sceAppInstUtilInstallByPackage(&meta, &info, playgo);
+    free(playgo);
+    printf("[dlc-install] request %s rc=0x%08x returned_id=%.36s\n",
+           dlc->pkg.content_id, (unsigned)rc, info.content_id);
+    if (rc) return -1;
+    /* Use the actual content_id returned by AppInst; the requested ID is the
+     * fallback if an implementation leaves that field blank. */
+    info.content_id[sizeof(info.content_id)-1] = 0;
+    const char *cid = info.content_id[0] ? info.content_id : dlc->pkg.content_id;
+    if (strcmp(cid, dlc->pkg.content_id)) {
+        printf("[dlc-install] Content ID mismatch %s != %s (aborting)\n",
+               cid, dlc->pkg.content_id);
+        return -2; /* accepted task, but mismatched ID: do not start another */
+    }
+    for (int second = 0; second < 1800; ++second) {
+        ps5_install_status_t status = {0};
+        rc = sceAppInstUtilGetInstallStatus(cid, &status);
+        status.status[sizeof(status.status)-1] = 0;
+        if (rc) {
+            printf("[dlc-install] status query %s failed rc=0x%08x; task outcome unknown\n", cid, (unsigned)rc);
+            return -2;
+        }
+        if (status.total_size > 0) {
+            unsigned long long pct = status.downloaded_size * 100ULL / status.total_size;
+            g_dlc_percent = (int)(pct > 100 ? 100 : pct);
+        } else if (status.local_copy_percent >= 0 && status.local_copy_percent <= 100 &&
+                   status.local_copy_percent != 0) {
+            g_dlc_percent = status.local_copy_percent;
+        }
+        if (second % 5 == 0 || dlc_status_terminal(status.status) ||
+            !strcmp(status.status, "error") || !strcmp(status.status, "none"))
+            printf("[dlc-install] %s status=%s transfer=%llu/%llu progress=%d%% copy=%d promote=%u error=0x%08x\n",
+                   cid, status.status, (unsigned long long)status.downloaded_size,
+                   (unsigned long long)status.total_size, g_dlc_percent,
+                   status.local_copy_percent, status.promote_progress,
+                   (unsigned)status.error_info.error_code);
+        if (dlc_status_terminal(status.status)) return 0;
+        if (!strcmp(status.status, "error")) return -1;
+        /* A newly accepted task can briefly report none before its status
+         * becomes visible. Past that window, consider its fate uncertain. */
+        if (!strcmp(status.status, "none") && second >= 4) return -2;
+        pump_events(1000);
+    }
+    printf("[dlc-install] %s still processing after 30 minutes; no new package started\n", cid);
+    return -2;
+}
+
+static void install_dlcs_queued(void) {
+    if (!g_dlc_install_request[0]) return;
+    char tid[10], root[32];
+    snprintf(tid, sizeof(tid), "%s", g_dlc_install_request);
+    g_dlc_install_request[0] = 0;
+    snprintf(g_progress.current, sizeof(g_progress.current), "%s", tid);
+    progress_set("installing_dlcs", "Verificando registros dos DLCs");
+    title_src_t t = {0};
+    int opened = 0;
+    int fatal = 0;
+    int native_task_unknown = 0;
+    if (find_root(tid, root, sizeof(root)) || !is_mountpoint(root) ||
+        !db_snapshot_healthy() || !db_is_registered(tid) || title_running(tid)) {
+        printf("[dlc-install] %s invalid base registration, storage or running state\n", tid);
         goto failed;
     }
-    manage(&t); /* Same managed mount bookkeeping as the upstream register_prepare. */
+    if (src_open(&t, root, tid)) goto failed;
+    opened = 1;
+    printf("[dlc-install] %s discovered=%d PKG(s) for explicit install (removed flags ignored)\n", tid, t.ndlc);
+    if (!t.ndlc) {
+        printf("[dlc-install] %s no DLC PKGs in organized USB folder\n", tid);
+        goto failed;
+    }
     const char *ids[MAX_DLC];
-    for (int i = 0; i < t.ndlc; i++) {
-        snprintf(g_original_global_ids[i], sizeof(g_original_global_ids[i]), "%s",
-                 t.dlc[i].pkg.content_id);
-        ids[i] = g_original_global_ids[i];
+    int states[MAX_DLC];
+    for (int i = 0; i < t.ndlc; ++i) ids[i] = t.dlc[i].pkg.content_id;
+    db_dlc_registration(ids, t.ndlc, states);
+    /* Explicit Instalar DLCs retries every valid USB PKG, even if its record
+     * already exists. Let the native per-package API decide whether it can be
+     * reinstalled; never silently skip a user-requested DLC. */
+    int todo = t.ndlc;
+    int already = 0;
+    for (int i = 0; i < t.ndlc; i++) if (states[i] == 1) already++;
+    g_progress.total = todo;
+    g_progress.done = g_progress.failed = g_progress.ok = 0;
+    printf("[dlc-install] %s found=%d already_in_db=%d attempting_all=%d\n",
+           tid, t.ndlc, already, todo);
+    if (!todo) goto done;
+    /* External overlays would otherwise hide the installer's destination. */
+    for (int i = 0; i < t.ndlc_tids; ++i) {
+        if (other_active_title_uses_dlc(tid, t.dlc_tids[i]) ||
+            dlc_installer_release_external_layer(t.dlc_tids[i])) {
+            printf("[dlc-install] %s could not safely clear add-on overlay %s\n", tid, t.dlc_tids[i]);
+            fatal = 1;
+            goto done;
+        }
     }
-    g_original_global_count = t.ndlc;
-    snprintf(g_original_global_tid, sizeof(g_original_global_tid), "%s", tid);
-    db_dlc_registration(ids, t.ndlc, g_original_global_before);
-    for (int i = 0; i < t.ndlc; i++) {
-        printf("[dlc-original] %s PRE %s state=%d (NO FILTER)\n", tid,
-               ids[i], g_original_global_before[i]);
+    for (int i = 0; i < t.ndlc; ++i) {
+        if (!is_mountpoint(root) || title_running(tid)) { fatal = 1; break; }
+        snprintf(g_dlc_content, sizeof(g_dlc_content), "%s", t.dlc[i].pkg.content_id);
+        g_dlc_percent = -1;
+        snprintf(g_progress.detail, sizeof(g_progress.detail), "Instalando DLC %d/%d: %.36s",
+                 g_progress.done + 1, todo, g_dlc_content);
+        int rc = dlc_native_install_one(&t.dlc[i]);
+        if (!rc) {
+            /* Do not confuse accepted request with a DB registration. */
+            wait_db_quiet(2, 15);
+            const char *id = t.dlc[i].pkg.content_id;
+            int st = -1;
+            db_dlc_registration(&id, 1, &st);
+            if (st != 1) {
+                printf("[dlc-install] %s native task completed but addcont.db state=%d\n", id, st);
+                rc = -1;
+            }
+        }
+        if (rc) g_progress.failed++;
+        else g_progress.ok++;
+        if (rc == -2) {
+            fatal = 1;
+            native_task_unknown = 1; /* may still be running: do not remount add-on paths */
+        }
+        g_progress.done++;
+        printf("[dlc-install] %s result=%s (%d/%d)\n", t.dlc[i].pkg.content_id,
+               rc ? "FAILED_OR_NOT_REGISTERED" : "REGISTERED", g_progress.done, todo);
+        if (fatal) break;
     }
-    printf("[dlc-original] %s START GLOBAL AppInstallAll: %d DLC(s) staged; app.db/DLC status ignored. This call can process OTHER titles in /user too.\n",
-           tid, t.ndlc);
-    progress_set("registering_dlcs", "AppInstallAll GLOBAL executando; NAO desligar PS5 nem desconectar USB");
-    if (original_global_start()) goto failed;
-    src_close(&t);
+done:
+    /* Native add-ons take precedence. Rebuild our external mounts only for
+     * folders still without internal installed contents. */
+    if (opened && !native_task_unknown && mount_title(&t)) {
+        printf("[dlc-install] %s could not restore external bundle after installer\n", tid);
+        fatal = 1;
+    }
+    if (native_task_unknown)
+        printf("[dlc-install] %s native task status UNKNOWN: external add-on overlay not restored to avoid hiding an ongoing install\n", tid);
+    if (opened) {
+        report_dlc_registration(&t);
+        src_close(&t);
+    }
+    g_dlc_percent = -1;
+    g_dlc_content[0] = 0;
+    g_catalog_dirty = 1;
+    if (fatal || g_progress.failed) {
+        progress_set("dlc_error", "Instalacao incompleta; consulte o log de DLCs");
+        printf("[dlc-install] %s finished with errors: success=%d failed=%d fatal=%d\n",
+               tid, g_progress.ok, g_progress.failed, fatal);
+    } else {
+        progress_set("dlc_complete", "DLCs com registro confirmado no banco");
+        printf("[dlc-install] %s finished: %d/%d registered\n", tid, g_progress.ok, todo);
+    }
     return;
 failed:
     if (opened) src_close(&t);
-    g_catalog_dirty = 1;
-    g_progress.failed = g_progress.total ? g_progress.total : 1;
-    progress_set("dlc_error", "Falha na preparacao do registro GLOBAL; verifique log");
+    g_dlc_percent = -1;
+    g_dlc_content[0] = 0;
+    g_progress.failed++;
+    progress_set("dlc_error", "Nao foi possivel iniciar instalacao de DLCs");
+    printf("[dlc-install] %s unable to start\n", tid);
+}
+
+
+
+/* One-item reversible experiment: mask the native Resident Evil 7 DLC folder
+ * with an owned nullfs directory containing the EXACT native metadata and a
+ * USB-targeting ac.pkg symlink. Underlying SSD files are never renamed, deleted
+ * or written. This DOES NOT register DLCs or free SSD space. */
+#define REDIRECT_TID "CUSA03842"
+#define REDIRECT_LABEL "BH70000000DLC001"
+#define REDIRECT_CID "EP0102-CUSA03842_00-BH70000000DLC001"
+#define REDIRECT_TARGET "/mnt/ext1/user/addcont/" REDIRECT_TID "/" REDIRECT_LABEL
+#define REDIRECT_SOURCE HOLD_DIR "/redirect-native/" REDIRECT_TID "/" REDIRECT_LABEL
+#define REDIRECT_MAX_BYTES (32LL * 1024 * 1024)
+
+static int redirect_busy(void) {
+    return g_discover_requested || g_restore_running || g_activate_request[0] ||
+           g_dlc_register_request[0] || g_dlc_install_request[0] || g_deleting ||
+           !strcmp(g_progress.phase, "activating") ||
+           !strcmp(g_progress.phase, "installing_dlcs") ||
+           !strcmp(g_progress.phase, "registering_dlcs") ||
+           !strcmp(g_progress.phase, "searching") ||
+           !strcmp(g_progress.phase, "queued") ||
+           !strcmp(g_progress.phase, "dlc_queued") ||
+           !strcmp(g_progress.phase, "dlc_register_queued");
+}
+
+static int redirect_mounted(void) {
+    return top_layer(REDIRECT_TARGET, REDIRECT_SOURCE) == 1 &&
+           owned_layer_count(REDIRECT_TARGET, REDIRECT_SOURCE) == 1;
+}
+
+/* Compare entire packages, not only a size / header; only the small pilot DLC
+ * is eligible. Prevents redirecting a registered package to different contents. */
+static int redirect_same_file_bytes(const char *native, const char *usb) {
+    struct stat a, b;
+    if (stat(native, &a) || stat(usb, &b) || !S_ISREG(a.st_mode) ||
+        !S_ISREG(b.st_mode) || a.st_size <= 0 || a.st_size != b.st_size ||
+        a.st_size > REDIRECT_MAX_BYTES) return -1;
+    int fd1 = open(native, O_RDONLY), fd2 = open(usb, O_RDONLY);
+    if (fd1 < 0 || fd2 < 0) {
+        if (fd1 >= 0) close(fd1);
+        if (fd2 >= 0) close(fd2);
+        return -1;
+    }
+    unsigned char x[65536], y[65536];
+    int rc = 0;
+    while (1) {
+        ssize_t n = read(fd1, x, sizeof(x));
+        if (n < 0) { rc = -1; break; }
+        if (!n) break;
+        size_t done = 0;
+        while (done < (size_t)n) {
+            ssize_t m = read(fd2, y + done, (size_t)n - done);
+            if (m <= 0) { rc = -1; break; }
+            done += (size_t)m;
+        }
+        if (rc || memcmp(x, y, (size_t)n)) { rc = -1; break; }
+    }
+    close(fd1);
+    close(fd2);
+    if (!rc) printf("[dlc-redirect] MATCH verified full package contents between native SSD and USB\n");
+    return rc;
+}
+
+/* Copy only small native metadata (<64 KiB each), never the installed package. */
+static int redirect_copy_meta(const char *filename) {
+    char from[PATH_MAX], to[PATH_MAX];
+    snprintf(from, sizeof(from), REDIRECT_TARGET "/%s", filename);
+    snprintf(to, sizeof(to), REDIRECT_SOURCE "/%s", filename);
+    struct stat st;
+    if (lstat(from, &st) || !S_ISREG(st.st_mode) || st.st_size < 1 || st.st_size > 65536)
+        return -1;
+    unsigned char *buf = malloc((size_t)st.st_size);
+    if (!buf) return -1;
+    int fd = open(from, O_RDONLY);
+    if (fd < 0) { free(buf); return -1; }
+    size_t done = 0;
+    while (done < (size_t)st.st_size) {
+        ssize_t n = read(fd, buf + done, (size_t)st.st_size - done);
+        if (n <= 0) break;
+        done += (size_t)n;
+    }
+    close(fd);
+    int rc = done == (size_t)st.st_size ? write_file(to, buf, done, 0770) : -1;
+    free(buf);
+    return rc;
+}
+
+int app_redirect_native_dlc(const char *tid, char *msg, size_t cap) {
+    if (strcmp(tid, REDIRECT_TID)) {
+        snprintf(msg, cap, "Pilot only: " REDIRECT_TID " / " REDIRECT_LABEL);
+        return -1;
+    }
+    if (redirect_busy() || title_running(tid)) {
+        snprintf(msg, cap, "Close the game and finish other tasks first");
+        return -1;
+    }
+    if (redirect_mounted()) {
+        snprintf(msg, cap, "USB overlay already active; use Restore native DLC");
+        return -1;
+    }
+    if (layers_on(REDIRECT_TARGET) || dead_layer(REDIRECT_TARGET)) {
+        snprintf(msg, cap, "Native DLC target already has another mount; refusing");
+        return -1;
+    }
+    struct stat native;
+    if (lstat(REDIRECT_TARGET "/ac.pkg", &native) || !S_ISREG(native.st_mode)) {
+        snprintf(msg, cap, "Native SSD ac.pkg missing or not a real file");
+        return -1;
+    }
+    const char *cid = REDIRECT_CID;
+    int db = -1;
+    db_dlc_registration(&cid, 1, &db);
+    if (!db_snapshot_healthy() || !db_is_registered(tid) ||
+        db != 1) {
+        snprintf(msg, cap, "DLC must already be registered in addcont.db");
+        return -1;
+    }
+    char root[32];
+    title_src_t t = {0};
+    if (find_root(tid, root, sizeof(root)) || strncmp(root, "/mnt/usb", 8) ||
+        !is_mountpoint(root) || src_open(&t, root, tid)) {
+        snprintf(msg, cap, "Connect original USB with Resident Evil 7 DLCs");
+        return -1;
+    }
+    const dlc_src_t *chosen = NULL;
+    for (int i = 0; i < t.ndlc; i++)
+        if (!strcmp(t.dlc[i].pkg.content_id, REDIRECT_CID)) chosen = &t.dlc[i];
+    if (!chosen || strncmp(chosen->path, "/mnt/usb", 8) ||
+        redirect_same_file_bytes(REDIRECT_TARGET "/ac.pkg", chosen->path)) {
+        printf("[dlc-redirect] REFUSED: USB source missing or content differs from native ac.pkg\n");
+        src_close(&t);
+        snprintf(msg, cap, "USB/native PKGs not identical; original untouched");
+        return -1;
+    }
+    mkdirs(REDIRECT_SOURCE, 0770);
+    const char *meta[] = {"ac.json", "ac.pbm", "ac.pbm.backup"};
+    int rc = 0;
+    for (size_t i = 0; i < sizeof(meta) / sizeof(meta[0]); i++)
+        if (redirect_copy_meta(meta[i])) { rc = -1; break; }
+    char link[PATH_MAX], target[PATH_MAX];
+    snprintf(link, sizeof(link), REDIRECT_SOURCE "/ac.pkg");
+    if (!rc) {
+        struct stat existing;
+        if (!lstat(link, &existing) && !S_ISLNK(existing.st_mode)) rc = -1;
+        if (!rc && !lstat(link, &existing) && unlink(link)) rc = -1;
+        if (!rc && symlink(chosen->path, link)) rc = -1;
+    }
+    snprintf(target, sizeof(target), "%s", chosen->path);
+    src_close(&t);
+    if (rc || !exists(link)) {
+        printf("[dlc-redirect] REFUSED: unable to prepare sandbox source\n");
+        snprintf(msg, cap, "Preparing temporary link/metadata failed; original untouched");
+        return -1;
+    }
+    printf("[dlc-redirect] PILOT start: cid=%s native=%s source=%s USB=%s\n",
+           REDIRECT_CID, REDIRECT_TARGET, REDIRECT_SOURCE, target);
+    if (nullfs_mount(REDIRECT_SOURCE, REDIRECT_TARGET)) {
+        snprintf(msg, cap, "nullfs failed (see log); SSD contents remain original");
+        return -1;
+    }
+    char actual[PATH_MAX] = "";
+    ssize_t len = readlink(REDIRECT_TARGET "/ac.pkg", actual, sizeof(actual)-1);
+    if (len > 0) actual[len] = 0;
+    if (!redirect_mounted() || len <= 0 || strcmp(actual, target)) {
+        printf("[dlc-redirect] verification failed; trying normal unmount rollback\n");
+        if (redirect_mounted() && unmount(REDIRECT_TARGET, 0))
+            printf("[dlc-redirect] ROLLBACK FAILED errno=%d; use Restore native DLC\n", errno);
+        snprintf(msg, cap, "Overlay verification failed; check log and restore");
+        return -1;
+    }
+    printf("[dlc-redirect] ACTIVE 1/17: mount=%s -> %s; ac.pkg symlink -> %s; native SSD ac.pkg is merely HIDDEN, not deleted\n",
+           REDIRECT_SOURCE, REDIRECT_TARGET, actual);
+    snprintf(msg, cap, "USB overlay ACTIVE for " REDIRECT_LABEL "; check game, then RESTORE");
+    return 0;
+}
+
+int app_restore_native_dlc(const char *tid, char *msg, size_t cap) {
+    if (strcmp(tid, REDIRECT_TID)) {
+        snprintf(msg, cap, "Pilot only: " REDIRECT_TID);
+        return -1;
+    }
+    if (redirect_busy() || title_running(tid)) {
+        snprintf(msg, cap, "Close game and finish other tasks before restoring");
+        return -1;
+    }
+    if (!redirect_mounted()) {
+        printf("[dlc-redirect] no owned overlay at %s; nothing to remove\n", REDIRECT_TARGET);
+        snprintf(msg, cap, "No PS4Mount test overlay is mounted; native DLC unchanged");
+        return 0;
+    }
+    if (unmount(REDIRECT_TARGET, 0)) {
+        printf("[dlc-redirect] RESTORE FAILED errno=%d (%s)\n", errno, strerror(errno));
+        snprintf(msg, cap, "Unmount failed; native content is still masked (see log)");
+        return -1;
+    }
+    struct stat st;
+    if (lstat(REDIRECT_TARGET "/ac.pkg", &st) || !S_ISREG(st.st_mode)) {
+        printf("[dlc-redirect] native ac.pkg not visible after unmount; inspect mount layout\n");
+        snprintf(msg, cap, "Unmounted but native ac.pkg not visible; inspect log");
+        return -1;
+    }
+    printf("[dlc-redirect] RESTORED native SSD ac.pkg size=%llu bytes; DB untouched\n",
+           (unsigned long long)st.st_size);
+    snprintf(msg, cap, "Native DLC visible again; unchanged SSD installation");
+    return 0;
 }
 
 void app_progress_json(buf_t *out) {
@@ -2907,14 +3255,6 @@ int main(void) {
     unsigned last_usb_mask = 0;
     time_t last_usb_check = 0;
     int restore_on_reconnect = 0;
-    isolation_report_t iso_boot;
-    int iso_boot_state = isolation_status(HOLD_DIR, STATE_DIR, &iso_boot);
-    if (iso_boot_state != 0 || iso_boot.already_hidden) {
-        isolation_report_t recovered;
-        int recovered_rc = isolation_restore(HOLD_DIR, STATE_DIR, &recovered);
-        printf("[isolation] STARTUP_RECOVERY rc=%d restored=%d conflicts=%d; no game DB changes\n",
-               recovered_rc, recovered.changed, recovered.conflicts);
-    }
     int previously_active = restore_active_games();
     for (int i = 0; i < 10; ++i) {
         char root[32];
@@ -2926,13 +3266,13 @@ int main(void) {
     if (!previously_active)
         notify(g_web >= 0 ? VERSION " ready. Panel at http://<PS5 IP>:8770" : VERSION " panel unavailable");
     for (;;) {
-        if (g_original_global_busy && (g_stop || exists(STATE_DIR "/stop"))) {
-            printf("[dlc-original] stop deferred until GLOBAL AppInstallAll finishes\n");
-            g_stop = 0;
-            unlink(STATE_DIR "/stop");
-        }
         if (g_stop || exists(STATE_DIR "/stop")) {
             unlink(STATE_DIR "/stop");
+            if (redirect_mounted() && !title_running("CUSA03842")) {
+                char restore_msg[256];
+                app_restore_native_dlc("CUSA03842", restore_msg, sizeof(restore_msg));
+                printf("[dlc-redirect] exit cleanup: %s\n", restore_msg);
+            }
             notify(VERSION " stopped");
             return 0;
         }
@@ -2960,8 +3300,8 @@ int main(void) {
         if (!g_deleting && g_discover_requested) discover_usb();
         if (!g_deleting && g_activate_request[0]) activate_queued();
         if (!g_deleting && g_dlc_register_request[0]) register_dlcs_queued();
+        if (!g_deleting && g_dlc_install_request[0]) install_dlcs_queued();
         pump_events(1000);
-        original_global_poll();
         /* Lightweight USB polling: no PKG walk. Restore only known, active titles
          * after a genuinely new storage mount appears. Never discover automatically. */
         time_t now = time(NULL);
@@ -2981,7 +3321,15 @@ int main(void) {
                 last_usb_mask = mask;
             }
         }
-        if (restore_on_reconnect && !g_original_global_busy && !g_deleting && !g_discover_requested &&
+        /* A removed USB makes the temporary ac.pkg link invalid: restore native
+         * directory when the pilot title is not running. */
+        if (redirect_mounted() && !title_running("CUSA03842") &&
+            !exists(REDIRECT_TARGET "/ac.pkg")) {
+            char restore_msg[256];
+            app_restore_native_dlc("CUSA03842", restore_msg, sizeof(restore_msg));
+            printf("[dlc-redirect] missing USB source auto-restore: %s\n", restore_msg);
+        }
+        if (restore_on_reconnect && !g_deleting && !g_discover_requested &&
             !g_activate_request[0] && !g_dlc_register_request[0] && !g_restore_running &&
             strcmp(g_progress.phase, "searching") && strcmp(g_progress.phase, "activating") &&
             strcmp(g_progress.phase, "registering_dlcs") && strcmp(g_progress.phase, "dlc_register_queued")) {

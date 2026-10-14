@@ -1,12 +1,16 @@
-# PS4Mount 0.4.11 — Teste de revalidação DLC via USB
+# PS4Mount v0.4.15 — DLC nativo ↔ USB (experimento reversível)
 
-**v0.4.12 — Diagnóstico de registros:** o novo botão **Diagnosticar DB** consulta apenas os registros de DLC do CUSA selecionado em `addcont.db` (somente leitura), e registra tabelas, colunas e valores técnicos para comparação. Não instala PKGs nem modifica bancos de dados. Consulte `DIAGNOSTICO-DB-0412.md`.
+**Base:** v0.4.12 (sem `AppInstallAll` global e sem o isolamento de links da v0.4.14).
 
-**Esta edição é experimental.** Ao clicar em **Montar**, o programa prepara/monta jogo, update e DLCs no USB e tenta revalidar o título por `sceAppInstUtilAppInstallTitleDir(tid, "/user/app/", NULL)`. O botão **Registrar DLCs (USB)** repete essa tentativa para o jogo já montado. Essa API é direcionada ao **jogo base**: **não há comprovação** de que registre DLCs novos. O resultado do banco `addcont.db` é comparado antes e depois.
+- **Registrar DLCs (USB):** conserva a revalidação experimental `AppInstallTitleDir`. Não se comprovou a criação de registros de DLC por essa API.
+- **Instalar DLCs (NATIVO / SSD):** reintegra `InstallByPackage` por DLC, como na v0.4.10. **Copia dados para armazenamento interno**, ocupa espaço e cria operações reais de instalação. Usar com conhecimento desse efeito.
+- **Testar 1 DLC no USB:** habilitado SOMENTE para RE7 `CUSA03842 / BH70000000DLC001`, previamente instalado nativamente no M.2. Confere os bytes do PKG nativo contra o PKG do USB, prepara metadados a partir da instalação nativa e tenta `nullfs` sobre **um diretório** em `/mnt/ext1/user/addcont/...`, expondo um link para USB. **Não apaga, renomeia ou substitui o `ac.pkg` nativo**; ele fica oculto sob a montagem durante o teste. Não libera espaço no SSD e não altera o banco.
+- **Restaurar DLC no SSD:** desfaz apenas a montagem do teste se ainda pertencer ao PS4Mount, revelando a instalação nativa. Não usa `MNT_FORCE`.
+- **Diagnosticar DB:** leitura filtrada e somente leitura de `addcont.db`, herdada da v0.4.12.
 
-Não chama `sceAppInstUtilInstallByPackage` ou `sceAppInstUtilAppInstallAll`; não desinstala DLCs, não copia PKGs para o armazenamento interno. Metadados e links pequenos permanecem no armazenamento interno, como no original. Os DLCs instalados anteriormente de forma nativa **permanecem no armazenamento interno** e podem continuar sendo lidos dali.
+**O experimento não está comprovado no PS5.** Pode falhar ao montar em `/mnt/ext1`, o jogo pode consultar outro caminho/cache e a aceitação dos DLCs depende do sistema. Veja [TESTE-DLC-SSD-USB-0415.md](TESTE-DLC-SSD-USB-0415.md).
 
-**Teste recomendado:** CUSA34384 (3 DLCs ausentes no banco no log anterior). Resident Evil 7 já teve 17/17 registrados pela instalação nativa, portanto não prova registro novo pelo mecanismo USB. Consulte [TESTE-REGISTRO-USB-0411.md](TESTE-REGISTRO-USB-0411.md).
+Nenhuma chamada a `sceAppInstUtilAppInstallAll(NULL)` existe nesta versão. Todas as ações de teste são manuais e individuais. Não inicie o jogo durante a alteração de montagem; apenas abra depois que o log indicar `ACTIVE` e feche antes de restaurar. Preserve backup antes de testes em armazenamento do console.
 
 ## Mudanças na 0.4.7 (bundle de DLCs)
 
@@ -374,7 +378,3 @@ folder); this is not a read-only scan. It does not copy game PKGs to PS5 interna
 storage. Group registration, DLC install, automatic scans and web UI remain
 upstream behavior. Directory symlinks and other filesystem devices are not
 followed, and managed title folders are skipped during discovery.
-
-## Experimental original AppInstallAll (v0.4.13)
-
-Use **Registrar DLCs (GLOBAL)** only after reading [TESTE-REGISTRO-ORIGINAL-GLOBAL-0413.md](TESTE-REGISTRO-ORIGINAL-GLOBAL-0413.md). This may affect all prepared titles and previously caused instability. This mode is NOT title scoped and requires a deliberate click. Mount stays no-copy and does not trigger global registration automatically.

@@ -38,7 +38,7 @@ build/test/dlc_registry
 python3 test/dlc_bundle_contract.py
 
 # Verify the no-copy USB revalidation path and read-only registry checks.
-python3 test/original_global_contract.py
+python3 test/usb_dlc_register_contract.py
 
 # Regression test: a failed system delete must not suppress later USB DLC mounts.
 ${CC:-cc} -std=c11 -Wall -Wextra -Werror -Isrc -o build/test/uninstall_event test/uninstall_event.c
@@ -46,9 +46,4 @@ build/test/uninstall_event
 python3 test/all_dlcs_contract.py
 python3 test/db_diagnostics_contract.py
 
-# Synthetic staging tree: no real PS5 directories or USB pkg modified.
-${CC:-cc} -std=c11 -D_DEFAULT_SOURCE -Wall -Wextra -Werror -Wno-format-truncation -Isrc \
-  -o build/test/isolation_unit test/isolation_unit.c src/isolation.c
-build/test/isolation_unit
-python3 test/isolation_contract.py
-node test/isolation_ui.cjs
+python3 test/native_redirect_contract.py

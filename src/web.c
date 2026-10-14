@@ -177,25 +177,29 @@ void web_serve(int listen_fd) {
             int rc = app_diagnose_db(tid, msg, sizeof(msg));
             json_msg(fd, !rc, msg);
         }
-    } else if (!strcmp(path, "/api/isolation") && !post) {
-        buf_t b = {0};
-        app_isolation_json(&b);
-        reply(fd, "200 OK", "application/json; charset=utf-8", b.data, b.len);
-        buf_free(&b);
-    } else if (post && !strncmp(path, "/api/isolate-others?", 20)) {
-        if (title_param(path, tid)) json_msg(fd, 0, "invalid title_id");
-        else {
-            int rc = app_isolate_others(tid, msg, sizeof(msg));
-            json_msg(fd, !rc, msg);
-        }
-    } else if (post && !strcmp(path, "/api/restore-others")) {
-        int rc = app_restore_others(msg, sizeof(msg));
-        json_msg(fd, !rc, msg);
     } else if (post && !strncmp(path, "/api/register-dlcs", 18)) {
         if (title_param(path, tid))
             json_msg(fd, 0, "invalid title_id");
         else {
             int rc = app_register_dlcs(tid, msg, sizeof(msg));
+            json_msg(fd, !rc, msg);
+        }
+    } else if (post && !strncmp(path, "/api/install-dlcs?", 18)) {
+        if (title_param(path, tid)) json_msg(fd, 0, "invalid title_id");
+        else {
+            int rc = app_install_dlcs(tid, msg, sizeof(msg));
+            json_msg(fd, !rc, msg);
+        }
+    } else if (post && !strncmp(path, "/api/test-dlc-usb?", 18)) {
+        if (title_param(path, tid)) json_msg(fd, 0, "invalid title_id");
+        else {
+            int rc = app_redirect_native_dlc(tid, msg, sizeof(msg));
+            json_msg(fd, !rc, msg);
+        }
+    } else if (post && !strncmp(path, "/api/restore-dlc-native?", 24)) {
+        if (title_param(path, tid)) json_msg(fd, 0, "invalid title_id");
+        else {
+            int rc = app_restore_native_dlc(tid, msg, sizeof(msg));
             json_msg(fd, !rc, msg);
         }
     } else if (post && !strncmp(path, "/api/unmount", 12)) {
@@ -219,8 +223,8 @@ void web_serve(int listen_fd) {
     } else if (!strcmp(path, "/api/log")) {
         send_log(fd);
     } else if (post && !strcmp(path, "/api/stop")) {
-        int rc = app_stop();
-        json_msg(fd, !rc, rc ? "AppInstallAll GLOBAL still running; cannot stop PS4Mount yet" : "PS4Mount is stopping");
+        json_msg(fd, 1, "PS4Mount is stopping");
+        app_stop();
     } else {
         reply(fd, "404 Not Found", "text/plain", "not found\n", 10);
     }
