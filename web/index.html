@@ -163,7 +163,7 @@ $('grid').addEventListener('click', function (e) {
   if (!b) return;
   var tid = b.getAttribute('data-t'), a = b.getAttribute('data-a');
   if (busy[tid]) return;
-  if (a === 'unmount' && !confirm('Desmontar ' + tid + '? Apenas o jogo e a atualizacao serao desmontados. DLCs, registros e mapeamento USB permanecem. O icone pode continuar na biblioteca; nao abra o jogo enquanto estiver desmontado.')) return;
+  if (a === 'unmount' && !confirm('Desmontar ' + tid + '? O jogo sera removido da biblioteca do PS5. Os PKGs no USB nao serao apagados.')) return;
   // Mount is a single click. Unmount retains its safety confirmation.
   busy[tid] = {action: a, percent:-1, detail: a === 'mount' ? 'Montando e registrando DLCs…' : 'Desmontando jogo…'};
   render();

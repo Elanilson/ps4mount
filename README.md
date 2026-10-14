@@ -1,21 +1,3 @@
-## v0.4.22 — Desmontar sem desinstalar DLCs (teste no console pendente)
-
-**Novo Desmontar**: libera exclusivamente as montagens de **jogo base e patch**.
-Mantém **os registros do jogo e dos DLCs no PS5**, as montagens de DLC,
-os stubs `ac.pkg` de 0 byte e os journals em `STATE_DIR`.
-Por isso o botão **não chama `sceAppInstUtilAppUnInstall`** e a próxima
-montagem reutiliza os DLCs registrados, sem instalar novamente.
-O restabelecimento dos redirecionamentos de DLC também roda após reiniciar
-o PS4Mount, mesmo quando o jogo base está marcado como desmontado.
-
-**Consequência importante**: como não desinstalamos o título, o ícone **pode
-continuar aparecendo na biblioteca do PS5**. Não abra esse jogo pelo ícone
-enquanto estiver desmontado: é preciso clicar **Montar** no painel antes.
-Este método não promete remover o jogo da biblioteca e preservar seus DLCs ao
-mesmo tempo. Não retira licença ou registro dos DLCs, não escreve em SQLite e
-não altera o PKG original no USB. Preserve backup; falta validação em PS5.
-Veja [TESTE-0422-PRESERVAR-DLCS.md](TESTE-0422-PRESERVAR-DLCS.md).
-
 ## Alterações locais v0.4.21 — recuperação de status e offload
 
 Corrige o fluxo após `GetInstallStatus=0x80a30003` comprovado no log do MARVEL: aguarda registro e arquivo nativo estável, compara bytes com o USB e só então permite excluir a cópia nativa sob `nullfs`. Inclui logs `logical_bytes` e `allocated_bytes_estimate`. **Experimental, compilação PS5 e teste de hardware pendentes.** Veja [TESTE-0421-RECUPERAR-OFFLOAD.md](TESTE-0421-RECUPERAR-OFFLOAD.md).

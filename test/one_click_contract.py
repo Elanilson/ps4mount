@@ -18,7 +18,7 @@ checks={
  'empty native file': 'open(pkg,O_CREAT|O_EXCL|O_WRONLY,0600)' in s,
  'mount validated BEFORE huge file unlink': s.index('if(offload_confirm_overlay(&rec))goto rollback;') < s.index('if(unlink(held))'),
  'survives restart': 'offload_resume_all();' in s,
- 'unmount keeps DLC DB and overlays': 'release_base_patch_only(tid)' in s and 'sceAppInstUtilAppUnInstall(' not in s and 'offload_unmount_title(tid)' not in s,
+ 'unmount drops only targeted game registration': 'uninstall_title_one(tid)' in s and 'sceAppInstUtilAppUnInstall(g_one_uninstall_tid)' in s,
  'usb original PKGs untouched': 'unlink(rec.usb)' not in s,
  'read-only addcont DB': 'db_dlc_registration(' in s and 'sqlite3_exec(db, "UPDATE' not in (p/'src/db.c').read_text(),
 }
