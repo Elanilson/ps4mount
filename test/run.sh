@@ -33,3 +33,8 @@ python3 test/dlc_bundle_contract.py
 ${CC:-cc} -std=c11 -Wall -Wextra -Werror -Isrc -o build/test/native_pkg_abi test/native_pkg_abi.c
 build/test/native_pkg_abi
 python3 test/native_dlc_contract.py
+
+# Regression test: a failed system delete must not suppress later USB DLC mounts.
+${CC:-cc} -std=c11 -Wall -Wextra -Werror -Isrc -o build/test/uninstall_event test/uninstall_event.c
+build/test/uninstall_event
+python3 test/all_dlcs_contract.py

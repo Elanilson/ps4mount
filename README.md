@@ -1,3 +1,5 @@
+> **Versão 0.4.10:** jogo base, update e todos os DLCs validos do USB sao sempre considerados em Montar/Desmontar, inclusive se existirem marcadores antigos `.removed` ou registros de DLC anteriores. O botao **Instalar DLCs** solicita individualmente a instalacao de **todos** os DLCs validos do jogo, sem pular itens ja registrados. A API nativa pode responder que o DLC ja esta instalado e pode consumir espaco interno. Montagem USB nao equivale a registro efetivo de DLC no PS5. Consulte [TODOS-DLCS-0410.md](TODOS-DLCS-0410.md).
+
 > **Versão experimental 0.4.9:** instalação individual de DLCs pelo instalador nativo do PS5. Veja [TESTE-DLC-INDIVIDUAL-049.md](TESTE-DLC-INDIVIDUAL-049.md). `Instalar DLCs` é uma operação explícita separada de `Montar`; pode consumir armazenamento interno e não é revertida ao desmontar.
 
 ## Mudanças na 0.4.7 (bundle de DLCs)

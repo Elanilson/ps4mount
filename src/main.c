@@ -41,7 +41,7 @@
 #include "web.h"
 #include "icon_data.h"
 
-#define VERSION "PS4Mount 0.4.9-individual-dlc-test"
+#define VERSION "PS4Mount 0.4.10-all-dlcs"
 #define LOCK_PORT 9032
 #define SCAN_SECONDS 10 /* legacy value; polling for PKGs is disabled */
 #define STATE_DIR "/data/ps4mount"
@@ -62,7 +62,7 @@
 typedef struct {
     int batch;      /* new games are added in groups */
     int batch_size; /* games per group */
-    int dlc;        /* add-ons are moved and installed */
+    int dlc;        /* legacy config field; DLCs are always included */
     char paths[MAX_SCAN_PATHS][128]; /* folders searched for pkgs, relative to each drive; "" is the root */
     int npaths;
 } config_t;
@@ -75,6 +75,7 @@ int sceAppInstUtilInitialize(void);
 int sceAppInstUtilAppUnInstall(const char *);
 
 #include "ps5_appinst_pkg.h"
+#include "uninstall_event.h"
 int sceKernelSendNotificationRequest(int, notify_request_t *, size_t, int);
 /* Targeted registration only. No fallback to global AppInstallAll: a prior full-library
  * attempt caused a console panic. Resolve BEFORE writing any title metadata. */
@@ -304,12 +305,8 @@ static void dlc_open(title_src_t *t) {
                 pkg_close(&a->pkg);
                 continue;
             }
-            char rm[96];
-            snprintf(rm, sizeof(rm), STATE_DIR "/%s.removed", a->pkg.content_id);
-            if (exists(rm)) { /* deleted on the console */
-                pkg_close(&a->pkg);
-                continue;
-            }
+            /* USB PKG is the source of truth. Legacy .removed flags and DB
+             * registration state must never hide valid DLCs from Mount. */
             a->data = a->pkg.header[0x77] == 0x1b; /* content type: 0x1b with data, 0x1c license only */
             t->ndlc++;
             int known = 0;
@@ -371,8 +368,9 @@ static int src_open(title_src_t *t, const char *root, const char *tid) {
         for (int i = 0; i < 32; i++)
             snprintf(digest + i * 2, 3, "%02x", t->patch.digest[i]);
     snprintf(t->marker, sizeof(t->marker), "%s\n%s\n", t->dir, t->has_patch ? digest : "nopatch");
-    if (g_cfg.dlc)
-        dlc_open(t);
+    /* Mount always discovers the complete bundle, even if legacy config had
+     * dlc=0 or a previous PS5 uninstall left stale .removed flags. */
+    dlc_open(t);
     if (t->ndlc) {
         /* one line for all add-ons, so markers of titles without add-ons stay as before */
         uint8_t h[32];
@@ -1356,10 +1354,7 @@ static int adopt_dir_pkgs(const char *root, const char *dir) {
         if (is_dlc || pass == 1) {
             /* add-ons go in the second pass: their game may be in this folder too */
             if (pass == 1 && is_dlc && !strncmp(pkg.title_id, "CUSA", 4)) {
-                if (!g_cfg.dlc) {
-                    if (first_time(path))
-                        printf("[scan] skip %s (add-ons are turned off)\n", path);
-                } else if (pkg_fake_key(&pkg)) {
+                if (pkg_fake_key(&pkg)) {
                     int count = adopt_dlc(root, e->d_name, path, &pkg);
                     moved += count;
                     g_scan_organized += count;
@@ -1477,22 +1472,6 @@ static int adopt_root_pkgs(const char *root) {
     if (g_dlc_dupes)
         notify("%s: %d add-on copy(ies) were left in place because the game already has them", root + 5, g_dlc_dupes);
     return moved;
-}
-
-/* Add-ons deleted on the console come back with their game: drive reconnected or
- * "Add to library" in the panel. */
-static void clear_removed_dlc(void) {
-    DIR *d = opendir(STATE_DIR);
-    if (!d)
-        return;
-    struct dirent *e;
-    char p[PATH_MAX];
-    while ((e = readdir(d)))
-        if (strlen(e->d_name) == 36 + 8 && !strcmp(e->d_name + 36, ".removed")) {
-            snprintf(p, sizeof(p), STATE_DIR "/%s", e->d_name);
-            unlink(p);
-        }
-    closedir(d);
 }
 
 /* The upstream automatic scan_root/scan_all/registration loop is deliberately
@@ -1620,6 +1599,16 @@ static void handle_klog_line(const char *line) {
         }
     } else if ((p = after(line, "[PlayGoCore][Uninstall] end ("))) {
         snprintf(id, sizeof(id), "%.36s", p);
+        /* The old handler treated even 0x80020042 failures as a successful
+         * deletion, hiding DLCs from future scans. Require an explicit 0. */
+        unsigned int uninstall_rc = ~0u;
+        (void)ps4mount_uninstall_result(p, &uninstall_rc);
+        if (uninstall_rc != 0) {
+            printf("[delete] %s uninstall not confirmed rc=0x%08x; preserving USB bundle\n",
+                   id, uninstall_rc);
+            if (g_deleting) g_deleting_close_at = time(NULL) + 3;
+            return;
+        }
         managed_t *m = managed_by(NULL, id);
         if (m) {
             char path[64];
@@ -1635,22 +1624,9 @@ static void handle_klog_line(const char *line) {
             notify("%s removed from the library. The pkg stays on the USB drive.", m->name);
             m->used = 0;
         } else if (strlen(id) == 36) {
-            /* an add-on of one of our games: keep it out until the drive is reconnected */
-            for (int i = 0; i < MAX_TITLES; i++) {
-                managed_t *g = &g_managed[i];
-                for (int j = 0; g->used && j < g->ndlc_tids; j++) {
-                    if (strncmp(id + 7, g->dlc_tids[j], 9))
-                        continue;
-                    char path[96], hold[PATH_MAX];
-                    snprintf(path, sizeof(path), STATE_DIR "/%s.removed", id);
-                    write_file(path, id, strlen(id), 0666);
-                    snprintf(hold, sizeof(hold), HOLD_DIR "/addcont/%.9s/%s", id + 7, id + 20);
-                    rm_tree(hold);
-                    printf("[delete] add-on %s removed\n", id);
-                    i = MAX_TITLES;
-                    break;
-                }
-            }
+            /* Do not erase the held USB add-on or create a .removed flag.
+             * A future explicit Mount must be able to rebuild this DLC. */
+            printf("[delete] add-on %s uninstalled by PS5; USB source stays eligible for Mount\n", id);
         }
         /* the delete is done: mount the other games again shortly after */
         if (g_deleting)
@@ -2297,6 +2273,8 @@ static void activate_queued(void) {
     if (find_root(tid, root, sizeof(root))) goto failed;
     title_src_t t = {0};
     if (src_open(&t, root, tid)) goto failed;
+    printf("[manual][dlc] %s discovered=%d valid PKG(s), folders=%d (removed markers ignored)\n",
+           tid, t.ndlc, t.ndlc_tids);
     /* An explicit click may re-enable a title removed in an earlier upstream release. */
     char removed_path[64];
     snprintf(removed_path, sizeof(removed_path), STATE_DIR "/%s.removed", tid);
@@ -2508,6 +2486,7 @@ static void install_dlcs_queued(void) {
     }
     if (src_open(&t, root, tid)) goto failed;
     opened = 1;
+    printf("[dlc-install] %s discovered=%d PKG(s) for explicit install (removed flags ignored)\n", tid, t.ndlc);
     if (!t.ndlc) {
         printf("[dlc-install] %s no DLC PKGs in organized USB folder\n", tid);
         goto failed;
@@ -2516,11 +2495,16 @@ static void install_dlcs_queued(void) {
     int states[MAX_DLC];
     for (int i = 0; i < t.ndlc; ++i) ids[i] = t.dlc[i].pkg.content_id;
     db_dlc_registration(ids, t.ndlc, states);
-    int todo = 0;
-    for (int i = 0; i < t.ndlc; i++) if (states[i] != 1) todo++;
+    /* Explicit Instalar DLCs retries every valid USB PKG, even if its record
+     * already exists. Let the native per-package API decide whether it can be
+     * reinstalled; never silently skip a user-requested DLC. */
+    int todo = t.ndlc;
+    int already = 0;
+    for (int i = 0; i < t.ndlc; i++) if (states[i] == 1) already++;
     g_progress.total = todo;
     g_progress.done = g_progress.failed = g_progress.ok = 0;
-    printf("[dlc-install] %s found=%d already_in_db=%d pending=%d\n", tid, t.ndlc, t.ndlc-todo, todo);
+    printf("[dlc-install] %s found=%d already_in_db=%d attempting_all=%d\n",
+           tid, t.ndlc, already, todo);
     if (!todo) goto done;
     /* External overlays would otherwise hide the installer's destination. */
     for (int i = 0; i < t.ndlc_tids; ++i) {
@@ -2532,7 +2516,6 @@ static void install_dlcs_queued(void) {
         }
     }
     for (int i = 0; i < t.ndlc; ++i) {
-        if (states[i] == 1) continue;
         if (!is_mountpoint(root) || title_running(tid)) { fatal = 1; break; }
         snprintf(g_dlc_content, sizeof(g_dlc_content), "%s", t.dlc[i].pkg.content_id);
         g_dlc_percent = -1;
@@ -2663,7 +2646,7 @@ static void config_load(void) {
         else if (!strncmp(line, "batch_size=", 11))
             c.batch_size = atoi(line + 11);
         else if (!strncmp(line, "dlc=", 4))
-            c.dlc = atoi(line + 4) != 0;
+            c.dlc = 1; /* legacy setting ignored: all DLCs always included */
         else if (!strncmp(line, "path=", 5) && c.npaths < MAX_SCAN_PATHS &&
                  !clean_scan_path(line + 5, path, sizeof(path), why, sizeof(why)))
             snprintf(c.paths[c.npaths++], sizeof(c.paths[0]), "%s", path);
@@ -2673,6 +2656,7 @@ static void config_load(void) {
         c.batch_size = 5;
     if (!c.npaths)
         c.npaths = 1; /* the root */
+    c.dlc = 1;
     g_cfg = c;
     printf("[config] batch=%d batch_size=%d dlc=%d folders=%d\n", g_cfg.batch, g_cfg.batch_size, g_cfg.dlc,
            g_cfg.npaths);
@@ -2720,7 +2704,7 @@ int app_config_set(const char *body, char *msg, size_t cap) {
             else if (k == 10 && !strncmp(p, "batch_size", 10))
                 c.batch_size = atoi(value);
             else if (k == 3 && !strncmp(p, "dlc", 3))
-                c.dlc = atoi(value) != 0;
+                c.dlc = 1; /* keep compatibility with older panel clients */
             else if (k == 5 && !strncmp(p, "paths", 5)) {
                 c.npaths = 0;
                 for (char *line = strtok(value, "\n"); line; line = strtok(NULL, "\n")) {
@@ -2752,6 +2736,7 @@ int app_config_set(const char *body, char *msg, size_t cap) {
         snprintf(msg, cap, "Not saved: add at least one folder (/ is the drive root)");
         return -1;
     }
+    c.dlc = 1;
     g_cfg = c;
     config_save();
     printf("[config] saved: batch=%d batch_size=%d dlc=%d folders=%d\n", c.batch, c.batch_size, c.dlc, c.npaths);
