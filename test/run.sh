@@ -28,3 +28,8 @@ ${CC:-cc} -O0 -D_DEFAULT_SOURCE -DSQLITE_THREADSAFE=0 \
   test/dlc_registry.c src/db.c third_party/sqlite/sqlite3.c -lm -ldl -lpthread
 build/test/dlc_registry
 python3 test/dlc_bundle_contract.py
+
+# PS5 package installer ABI and native-task integration contracts.
+${CC:-cc} -std=c11 -Wall -Wextra -Werror -Isrc -o build/test/native_pkg_abi test/native_pkg_abi.c
+build/test/native_pkg_abi
+python3 test/native_dlc_contract.py

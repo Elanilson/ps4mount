@@ -91,7 +91,7 @@ form.settings .row{display:flex;gap:8px;justify-content:flex-end}
 <dialog id="logdlg"><h3>Log</h3><pre id="log"></pre><form method="dialog"><button>Fechar</button></form></dialog>
 <div id="toast"></div>
 <script>
-var games = [], busy = {}, lastPhase = '', serverMount = '';
+var games = [], busy = {}, lastPhase = '', serverMount = '', serverDlc = '';
 var stageLabels = {
   'Preparing selected game': 'Preparando jogo…',
   'Checking selected title': 'Verificando arquivos e registro…',
@@ -130,8 +130,10 @@ function render() {
     if (['removed', 'inactive', 'pending'].indexOf(g.state) >= 0) act = '<button class="primary" data-a="mount" data-t="' + g.title_id + '">Montar</button>';
     else if (g.state === 'ready') act = '<button class="danger" data-a="unmount" data-t="' + g.title_id + '">Desmontar</button>';
     else if (g.state === 'running') act = '<button disabled>Feche o jogo para desmontar</button>';
+    if (g.dlc > 0 && g.state === 'ready')
+      act += '<button data-a="install-dlcs" data-t="' + g.title_id + '" title="Instala cada PKG de DLC no armazenamento do PS5; não é revertido ao desmontar">Instalar DLCs</button>';
     var job = busy[g.title_id];
-    if (job) act = '<button disabled>' + (job.action === 'unmount' ? 'Desmontando…' : 'Montando…') + '</button>';
+    if (job) act = '<button disabled>' + (job.action === 'unmount' ? 'Desmontando…' : job.action === 'install-dlcs' ? 'Instalando DLCs…' : 'Montando…') + '</button>';
     html += '<div class="card"><div class="art" style="background-image:url(/icon/' + g.title_id + ')">' +
       '<span class="badge b-' + g.state + '">' + esc(labels[g.state] || g.state) + '</span></div>' +
       '<div class="info"><div class="name">' + esc(g.name) + '</div>' +
@@ -140,7 +142,7 @@ function render() {
       '<div class="meta">' + esc(g.source) + (g.mount ? ' · montagem ' + g.mount : '') + '</div>' +
       (g.update_issue ? '<div class="warn">' + esc(g.update_issue) + '</div>' : '') + '</div>' +
       (job ? '<div class="card-progress" role="status" aria-live="polite">' +
-        '<span>' + esc(job.detail) + '</span><progress aria-label="Processamento de ' + esc(g.name) + '"></progress></div>' : '') +
+        '<span>' + esc(job.detail) + '</span><progress aria-label="Processamento de ' + esc(g.name) + '"' + (job.percent >= 0 ? ' value="' + job.percent + '" max="100"' : '') + '></progress></div>' : '') +
       '<div class="actions">' + act + '</div></div>';
   });
   $('grid').innerHTML = html;
@@ -160,15 +162,16 @@ $('grid').addEventListener('click', function (e) {
   if (!b) return;
   var tid = b.getAttribute('data-t'), a = b.getAttribute('data-a');
   if (busy[tid]) return;
+  if (a === 'install-dlcs' && !confirm('Instalar individualmente DLCs não registrados de ' + tid + '? O instalador do PS5 pode copiar os dados para o armazenamento interno; Desmontar NÃO remove essas instalações.')) return;
   if (a === 'unmount' && !confirm('Desmontar ' + tid + '? O registro no PS5 será mantido; a restauração automática deste jogo será desativada.')) return;
   // Mount is a single click. Unmount retains its safety confirmation.
-  busy[tid] = {action: a, detail: a === 'mount' ? 'Solicitando montagem…' : 'Desmontando jogo…'};
+  busy[tid] = {action: a, percent:-1, detail: a === 'mount' ? 'Solicitando montagem…' : a === 'install-dlcs' ? 'Solicitando instalação dos DLCs…' : 'Desmontando jogo…'};
   render();
   api('/api/' + a + '?title_id=' + tid, 'POST').then(function () {
-    if (a === 'mount') {
+    if (a === 'mount' || a === 'install-dlcs') {
       // POST means queued, NOT completed: retain card progress until /api/progress says so.
-      if (busy[tid] && busy[tid].detail === 'Solicitando montagem…') {
-        busy[tid].detail = 'Montagem na fila…';
+      if (busy[tid] && (busy[tid].detail === 'Solicitando montagem…' || busy[tid].detail === 'Solicitando instalação dos DLCs…')) {
+        busy[tid].detail = a === 'install-dlcs' ? 'Instalação de DLCs na fila…' : 'Montagem na fila…';
         render();
       }
       loadProgress();
@@ -178,7 +181,7 @@ $('grid').addEventListener('click', function (e) {
     }
   }).catch(function (err) {
     delete busy[tid];
-    toast('Erro ao ' + (a === 'mount' ? 'montar' : 'desmontar') + ' ' + tid + ': ' + err.message);
+    toast('Erro ao ' + (a === 'mount' ? 'montar' : a === 'install-dlcs' ? 'instalar DLCs de' : 'desmontar') + ' ' + tid + ': ' + err.message);
     load();
   });
 });
@@ -212,7 +215,7 @@ $('stop').onclick = function () {
 };
 function loadProgress() {
   api('/api/progress').then(function (p) {
-    var active = ['restoring','searching','activating','queued'].indexOf(p.phase) >= 0;
+    var active = ['restoring','searching','activating','queued','dlc_queued','installing_dlcs'].indexOf(p.phase) >= 0;
     $('rescan').disabled = active;
     // Only scanning/restoring uses the global progress. Mount/unmount uses its game card.
     var globalProgress = p.phase === 'searching' || p.phase === 'restoring';
@@ -228,6 +231,22 @@ function loadProgress() {
         $('progress-title').textContent = 'Restaurando jogos ativos — ' + p.done + '/' + p.total;
         $('progress-detail').textContent = (p.current ? p.current + ' · ' : '') + p.detail;
       }
+    }
+    var installingDlc = (p.phase === 'dlc_queued' || p.phase === 'installing_dlcs') && p.current;
+    if (installingDlc) {
+      serverDlc = p.current;
+      var dlcDetail = p.phase === 'dlc_queued' ? 'Aguardando instalação dos DLCs…' :
+        ((p.done || 0) + '/' + (p.total || '?') + ' DLC(s) processados · ' + (p.detail || 'Instalando DLC…'));
+      var current = busy[serverDlc];
+      if (!current || current.action !== 'install-dlcs' || current.detail !== dlcDetail || current.percent !== p.dlc_percent) {
+        busy[serverDlc] = {action:'install-dlcs', detail:dlcDetail, percent:p.dlc_percent};
+        render();
+      }
+    } else if (serverDlc && (p.phase === 'dlc_complete' || p.phase === 'dlc_error')) {
+      delete busy[serverDlc];
+      if (p.phase === 'dlc_error') toast('Instalação dos DLCs incompleta: consulte o log.');
+      serverDlc = '';
+      load(); render();
     }
     var mounting = (p.phase === 'queued' || p.phase === 'activating') && p.current;
     var changed = false;

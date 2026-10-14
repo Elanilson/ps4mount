@@ -1,3 +1,5 @@
+> **Versão experimental 0.4.9:** instalação individual de DLCs pelo instalador nativo do PS5. Veja [TESTE-DLC-INDIVIDUAL-049.md](TESTE-DLC-INDIVIDUAL-049.md). `Instalar DLCs` é uma operação explícita separada de `Montar`; pode consumir armazenamento interno e não é revertida ao desmontar.
+
 ## Mudanças na 0.4.7 (bundle de DLCs)
 
 - **Montar** trata jogo base, atualização disponível e todas as pastas externas de DLC como um conjunto. Em caso de falha, desmonta somente as novas camadas criadas pela tentativa atual.

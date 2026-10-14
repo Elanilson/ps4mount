@@ -170,6 +170,13 @@ void web_serve(int listen_fd) {
             int rc = app_add(tid, msg, sizeof(msg));
             json_msg(fd, !rc, msg);
         }
+    } else if (post && !strncmp(path, "/api/install-dlcs", 17)) {
+        if (title_param(path, tid))
+            json_msg(fd, 0, "invalid title_id");
+        else {
+            int rc = app_install_dlcs(tid, msg, sizeof(msg));
+            json_msg(fd, !rc, msg);
+        }
     } else if (post && !strncmp(path, "/api/unmount", 12)) {
         if (title_param(path, tid))
             json_msg(fd, 0, "invalid title_id");

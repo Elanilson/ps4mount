@@ -41,7 +41,7 @@
 #include "web.h"
 #include "icon_data.h"
 
-#define VERSION "PS4Mount 0.4.7-bundle-dlc-check"
+#define VERSION "PS4Mount 0.4.9-individual-dlc-test"
 #define LOCK_PORT 9032
 #define SCAN_SECONDS 10 /* legacy value; polling for PKGs is disabled */
 #define STATE_DIR "/data/ps4mount"
@@ -73,6 +73,8 @@ typedef struct { char useless[45]; char message[3075]; } notify_request_t;
 int sceUserServiceInitialize(void *);
 int sceAppInstUtilInitialize(void);
 int sceAppInstUtilAppUnInstall(const char *);
+
+#include "ps5_appinst_pkg.h"
 int sceKernelSendNotificationRequest(int, notify_request_t *, size_t, int);
 /* Targeted registration only. No fallback to global AppInstallAll: a prior full-library
  * attempt caused a console panic. Resolve BEFORE writing any title metadata. */
@@ -1661,6 +1663,7 @@ static void handle_klog_line(const char *line) {
 /* Jobs are accepted by POST and executed by the main loop, never from GET. */
 static int g_discover_requested;
 static char g_activate_request[10];
+static char g_dlc_install_request[10];
 static int g_restore_running;
 typedef struct {
     const char *phase;
@@ -1669,6 +1672,10 @@ typedef struct {
     char detail[192];
 } progress_t;
 static progress_t g_progress = {"idle", 0, 0, 0, 0, "", "Waiting for action"};
+static int g_dlc_percent = -1;    /* -1 means indeterminate */
+static char g_dlc_content[48];
+static int g_appinst_ready = 0;
+static void install_dlcs_queued(void);
 
 static void progress_set(const char *phase, const char *detail) {
     g_progress.phase = phase;
@@ -1678,8 +1685,9 @@ static void progress_set(const char *phase, const char *detail) {
 static int any_external_usb(void);
 
 int app_rescan(void) {
-    if (g_discover_requested || g_restore_running || g_activate_request[0] ||
-        !strcmp(g_progress.phase, "searching") || !strcmp(g_progress.phase, "activating"))
+    if (g_discover_requested || g_restore_running || g_activate_request[0] || g_dlc_install_request[0] ||
+        !strcmp(g_progress.phase, "searching") || !strcmp(g_progress.phase, "activating") ||
+        !strcmp(g_progress.phase, "installing_dlcs") || !strcmp(g_progress.phase, "dlc_queued"))
         return -1;
     if (!any_external_usb()) {
         g_progress = (progress_t){"error", 0, 0, 0, 0, "", "No external USB mounted; search not started"};
@@ -1861,8 +1869,9 @@ int app_icon(const char *tid, buf_t *out) {
 /* Only the selected CUSA is registered; the callback merely queues a request. */
 int app_add(const char *tid, char *msg, size_t cap) {
     char root[32];
-    if (g_restore_running || g_discover_requested || g_activate_request[0] ||
-        !strcmp(g_progress.phase, "activating") || !strcmp(g_progress.phase, "searching")) {
+    if (g_restore_running || g_discover_requested || g_activate_request[0] || g_dlc_install_request[0] ||
+        !strcmp(g_progress.phase, "activating") || !strcmp(g_progress.phase, "searching") ||
+        !strcmp(g_progress.phase, "installing_dlcs") || !strcmp(g_progress.phase, "dlc_queued")) {
         snprintf(msg, cap, "Busy restoring, searching, or activating another game");
         return -1;
     }
@@ -1990,8 +1999,9 @@ static int release_title_bundle(const title_src_t *t) {
 }
 
 int app_remove(const char *tid, char *msg, size_t cap) {
-    if (g_restore_running || g_activate_request[0] || g_discover_requested ||
-        !strcmp(g_progress.phase, "activating") || !strcmp(g_progress.phase, "searching")) {
+    if (g_restore_running || g_activate_request[0] || g_dlc_install_request[0] || g_discover_requested ||
+        !strcmp(g_progress.phase, "activating") || !strcmp(g_progress.phase, "searching") ||
+        !strcmp(g_progress.phase, "installing_dlcs") || !strcmp(g_progress.phase, "dlc_queued")) {
         snprintf(msg, cap, "Wait until the current operation ends");
         return -1;
     }
@@ -2151,7 +2161,7 @@ static int restore_active_games(void) {
 static void discover_usb(void) {
     g_discover_requested = 0;
     g_scan_abort = 0;
-    if (g_restore_running || g_activate_request[0]) {
+    if (g_restore_running || g_activate_request[0] || g_dlc_install_request[0]) {
         printf("[manual][scan] busy, search ignored\n");
         return;
     }
@@ -2356,6 +2366,235 @@ failed:
     notify("PS4Mount: %s mount FAILED. Check the log", tid);
 }
 
+
+/* Explicit per-title request. Never invoked by Mount, USB scan or restoration.
+ * Installation is a native PKG operation; data MAY be copied to internal storage.
+ * Unlike external mounts, internal add-on installations are not removed on Unmount. */
+int app_install_dlcs(const char *tid, char *msg, size_t cap) {
+    char root[32];
+    if (g_dlc_install_request[0] || g_activate_request[0] || g_discover_requested ||
+        g_restore_running || !strcmp(g_progress.phase, "installing_dlcs") ||
+        !strcmp(g_progress.phase, "activating") || !strcmp(g_progress.phase, "searching") ||
+        !strcmp(g_progress.phase, "installing_dlcs") || !strcmp(g_progress.phase, "dlc_queued")) {
+        snprintf(msg, cap, "Another operation is running");
+        return -1;
+    }
+    if (!g_appinst_ready) {
+        snprintf(msg, cap, "PS5 AppInstUtil initialization failed; see startup log");
+        return -1;
+    }
+    if (find_root(tid, root, sizeof(root)) || !is_mountpoint(root)) {
+        snprintf(msg, cap, "%s: USB storage not connected", tid);
+        return -1;
+    }
+    if (title_running(tid) || installed_internally(tid)) {
+        snprintf(msg, cap, "Close the game and use an external USB game");
+        return -1;
+    }
+    if (!db_snapshot_healthy() || !db_is_registered(tid)) {
+        snprintf(msg, cap, "Base game must already be registered on PS5");
+        return -1;
+    }
+    snprintf(g_dlc_install_request, sizeof(g_dlc_install_request), "%s", tid);
+    g_dlc_percent = -1;
+    g_dlc_content[0] = 0;
+    g_progress = (progress_t){"dlc_queued", 0, 0, 0, 0, "", "Aguardando instalacao individual dos DLCs"};
+    snprintf(g_progress.current, sizeof(g_progress.current), "%s", tid);
+    printf("[dlc-install] %s queued (individual PKGs, never AppInstallAll)\n", tid);
+    snprintf(msg, cap, "Individual DLC installation queued for %s", tid);
+    return 0;
+}
+
+/* Selective layer release: an external nullfs add-on folder must not mask a
+ * native installer destination. Do not touch base/patch or non-owned mounts. */
+static int dlc_installer_release_external_layer(const char *dtid) {
+    char target[64], hold[PATH_MAX];
+    snprintf(target, sizeof(target), "/user/addcont/%s", dtid);
+    hold_path(hold, sizeof(hold), "addcont", dtid);
+    int n = owned_layer_count(target, hold);
+    int top = top_layer(target, hold);
+    if (n < 0 || top < 0 || dead_layer(target)) return -1;
+    if (n == 0) return top == 0 ? 0 : -1;
+    if (top != 1) return -1;
+    if (release_owned_layer(dtid, "addcont")) return -1;
+    printf("[dlc-install] released PS4Mount add-on overlay %s for native installer\n", dtid);
+    return 0;
+}
+
+static int dlc_status_terminal(const char *s) {
+    return !strcmp(s, "playable") || !strcmp(s, "completed") ||
+           !strcmp(s, "installed") || !strcmp(s, "done");
+}
+
+/* Returns 0 only when the native installer reports a successful terminal
+ * state. The independent database check is performed by the caller. */
+static int dlc_native_install_one(const dlc_src_t *dlc) {
+    struct stat st;
+    if (stat(dlc->path, &st) || !S_ISREG(st.st_mode) || st.st_size <= 0) {
+        printf("[dlc-install] %s missing source: %s\n", dlc->pkg.content_id, dlc->path);
+        return -1;
+    }
+    ps5_pkg_meta_t meta = {
+        .uri = dlc->path, .ex_uri = "", .playgo_scenario_id = "",
+        .content_id = "", .content_name = dlc->pkg.content_id, .icon_url = ""
+    };
+    ps5_pkg_info_t info = {0};
+    ps5_playgo_info_t *playgo = calloc(1, sizeof(*playgo));
+    if (!playgo) return -1;
+    printf("[dlc-install] START %s from %s (%llu bytes)\n", dlc->pkg.content_id,
+           dlc->path, (unsigned long long)st.st_size);
+    int rc = sceAppInstUtilInstallByPackage(&meta, &info, playgo);
+    free(playgo);
+    printf("[dlc-install] request %s rc=0x%08x returned_id=%.36s\n",
+           dlc->pkg.content_id, (unsigned)rc, info.content_id);
+    if (rc) return -1;
+    /* Use the actual content_id returned by AppInst; the requested ID is the
+     * fallback if an implementation leaves that field blank. */
+    info.content_id[sizeof(info.content_id)-1] = 0;
+    const char *cid = info.content_id[0] ? info.content_id : dlc->pkg.content_id;
+    if (strcmp(cid, dlc->pkg.content_id)) {
+        printf("[dlc-install] Content ID mismatch %s != %s (aborting)\n",
+               cid, dlc->pkg.content_id);
+        return -2; /* accepted task, but mismatched ID: do not start another */
+    }
+    for (int second = 0; second < 1800; ++second) {
+        ps5_install_status_t status = {0};
+        rc = sceAppInstUtilGetInstallStatus(cid, &status);
+        status.status[sizeof(status.status)-1] = 0;
+        if (rc) {
+            printf("[dlc-install] status query %s failed rc=0x%08x; task outcome unknown\n", cid, (unsigned)rc);
+            return -2;
+        }
+        if (status.total_size > 0) {
+            unsigned long long pct = status.downloaded_size * 100ULL / status.total_size;
+            g_dlc_percent = (int)(pct > 100 ? 100 : pct);
+        } else if (status.local_copy_percent >= 0 && status.local_copy_percent <= 100 &&
+                   status.local_copy_percent != 0) {
+            g_dlc_percent = status.local_copy_percent;
+        }
+        if (second % 5 == 0 || dlc_status_terminal(status.status) ||
+            !strcmp(status.status, "error") || !strcmp(status.status, "none"))
+            printf("[dlc-install] %s status=%s transfer=%llu/%llu progress=%d%% copy=%d promote=%u error=0x%08x\n",
+                   cid, status.status, (unsigned long long)status.downloaded_size,
+                   (unsigned long long)status.total_size, g_dlc_percent,
+                   status.local_copy_percent, status.promote_progress,
+                   (unsigned)status.error_info.error_code);
+        if (dlc_status_terminal(status.status)) return 0;
+        if (!strcmp(status.status, "error")) return -1;
+        /* A newly accepted task can briefly report none before its status
+         * becomes visible. Past that window, consider its fate uncertain. */
+        if (!strcmp(status.status, "none") && second >= 4) return -2;
+        pump_events(1000);
+    }
+    printf("[dlc-install] %s still processing after 30 minutes; no new package started\n", cid);
+    return -2;
+}
+
+static void install_dlcs_queued(void) {
+    if (!g_dlc_install_request[0]) return;
+    char tid[10], root[32];
+    snprintf(tid, sizeof(tid), "%s", g_dlc_install_request);
+    g_dlc_install_request[0] = 0;
+    snprintf(g_progress.current, sizeof(g_progress.current), "%s", tid);
+    progress_set("installing_dlcs", "Verificando registros dos DLCs");
+    title_src_t t = {0};
+    int opened = 0;
+    int fatal = 0;
+    int native_task_unknown = 0;
+    if (find_root(tid, root, sizeof(root)) || !is_mountpoint(root) ||
+        !db_snapshot_healthy() || !db_is_registered(tid) || title_running(tid)) {
+        printf("[dlc-install] %s invalid base registration, storage or running state\n", tid);
+        goto failed;
+    }
+    if (src_open(&t, root, tid)) goto failed;
+    opened = 1;
+    if (!t.ndlc) {
+        printf("[dlc-install] %s no DLC PKGs in organized USB folder\n", tid);
+        goto failed;
+    }
+    const char *ids[MAX_DLC];
+    int states[MAX_DLC];
+    for (int i = 0; i < t.ndlc; ++i) ids[i] = t.dlc[i].pkg.content_id;
+    db_dlc_registration(ids, t.ndlc, states);
+    int todo = 0;
+    for (int i = 0; i < t.ndlc; i++) if (states[i] != 1) todo++;
+    g_progress.total = todo;
+    g_progress.done = g_progress.failed = g_progress.ok = 0;
+    printf("[dlc-install] %s found=%d already_in_db=%d pending=%d\n", tid, t.ndlc, t.ndlc-todo, todo);
+    if (!todo) goto done;
+    /* External overlays would otherwise hide the installer's destination. */
+    for (int i = 0; i < t.ndlc_tids; ++i) {
+        if (other_active_title_uses_dlc(tid, t.dlc_tids[i]) ||
+            dlc_installer_release_external_layer(t.dlc_tids[i])) {
+            printf("[dlc-install] %s could not safely clear add-on overlay %s\n", tid, t.dlc_tids[i]);
+            fatal = 1;
+            goto done;
+        }
+    }
+    for (int i = 0; i < t.ndlc; ++i) {
+        if (states[i] == 1) continue;
+        if (!is_mountpoint(root) || title_running(tid)) { fatal = 1; break; }
+        snprintf(g_dlc_content, sizeof(g_dlc_content), "%s", t.dlc[i].pkg.content_id);
+        g_dlc_percent = -1;
+        snprintf(g_progress.detail, sizeof(g_progress.detail), "Instalando DLC %d/%d: %.36s",
+                 g_progress.done + 1, todo, g_dlc_content);
+        int rc = dlc_native_install_one(&t.dlc[i]);
+        if (!rc) {
+            /* Do not confuse accepted request with a DB registration. */
+            wait_db_quiet(2, 15);
+            const char *id = t.dlc[i].pkg.content_id;
+            int st = -1;
+            db_dlc_registration(&id, 1, &st);
+            if (st != 1) {
+                printf("[dlc-install] %s native task completed but addcont.db state=%d\n", id, st);
+                rc = -1;
+            }
+        }
+        if (rc) g_progress.failed++;
+        else g_progress.ok++;
+        if (rc == -2) {
+            fatal = 1;
+            native_task_unknown = 1; /* may still be running: do not remount add-on paths */
+        }
+        g_progress.done++;
+        printf("[dlc-install] %s result=%s (%d/%d)\n", t.dlc[i].pkg.content_id,
+               rc ? "FAILED_OR_NOT_REGISTERED" : "REGISTERED", g_progress.done, todo);
+        if (fatal) break;
+    }
+done:
+    /* Native add-ons take precedence. Rebuild our external mounts only for
+     * folders still without internal installed contents. */
+    if (opened && !native_task_unknown && mount_title(&t)) {
+        printf("[dlc-install] %s could not restore external bundle after installer\n", tid);
+        fatal = 1;
+    }
+    if (native_task_unknown)
+        printf("[dlc-install] %s native task status UNKNOWN: external add-on overlay not restored to avoid hiding an ongoing install\n", tid);
+    if (opened) {
+        report_dlc_registration(&t);
+        src_close(&t);
+    }
+    g_dlc_percent = -1;
+    g_dlc_content[0] = 0;
+    g_catalog_dirty = 1;
+    if (fatal || g_progress.failed) {
+        progress_set("dlc_error", "Instalacao incompleta; consulte o log de DLCs");
+        printf("[dlc-install] %s finished with errors: success=%d failed=%d fatal=%d\n",
+               tid, g_progress.ok, g_progress.failed, fatal);
+    } else {
+        progress_set("dlc_complete", "DLCs com registro confirmado no banco");
+        printf("[dlc-install] %s finished: %d/%d registered\n", tid, g_progress.ok, todo);
+    }
+    return;
+failed:
+    if (opened) src_close(&t);
+    g_dlc_percent = -1;
+    g_dlc_content[0] = 0;
+    g_progress.failed++;
+    progress_set("dlc_error", "Nao foi possivel iniciar instalacao de DLCs");
+    printf("[dlc-install] %s unable to start\n", tid);
+}
+
 void app_progress_json(buf_t *out) {
     buf_printf(out, "{\"phase\":"); json_str(out, g_progress.phase);
     buf_printf(out, ",\"total\":%d,\"done\":%d,\"ok\":%d,\"failed\":%d,\"current\":",
@@ -2365,6 +2604,8 @@ void app_progress_json(buf_t *out) {
     buf_printf(out, ",\"scan_folders\":%d,\"scan_pkgs\":%d,\"scan_organized\":%d,\"scan_path\":",
                g_scan_folders, g_scan_examined, g_scan_organized);
     json_str(out, g_scan_location);
+    buf_printf(out, ",\"dlc_percent\":%d,\"dlc_content\":", g_dlc_percent);
+    json_str(out, g_dlc_content);
     buf_printf(out, "}");
 }
 
@@ -2620,7 +2861,8 @@ int main(void) {
         return 0;
     }
     sceUserServiceInitialize(0);
-    sceAppInstUtilInitialize();
+    g_appinst_ready = sceAppInstUtilInitialize() == 0;
+    if (!g_appinst_ready) fprintf(stderr, "[dlc-install] AppInstUtil initialization unsuccessful\n");
     mkdirs(STATE_DIR, 0777);
     freopen(STATE_DIR "/log.txt", "a", stdout);
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -2672,6 +2914,7 @@ int main(void) {
             end_delete_window(); /* the line of the screen change was missed */
         if (!g_deleting && g_discover_requested) discover_usb();
         if (!g_deleting && g_activate_request[0]) activate_queued();
+        if (!g_deleting && g_dlc_install_request[0]) install_dlcs_queued();
         pump_events(1000);
         /* Lightweight USB polling: no PKG walk. Restore only known, active titles
          * after a genuinely new storage mount appears. Never discover automatically. */
@@ -2693,8 +2936,9 @@ int main(void) {
             }
         }
         if (restore_on_reconnect && !g_deleting && !g_discover_requested &&
-            !g_activate_request[0] && !g_restore_running &&
-            strcmp(g_progress.phase, "searching") && strcmp(g_progress.phase, "activating")) {
+            !g_activate_request[0] && !g_dlc_install_request[0] && !g_restore_running &&
+            strcmp(g_progress.phase, "searching") && strcmp(g_progress.phase, "activating") &&
+            strcmp(g_progress.phase, "installing_dlcs") && strcmp(g_progress.phase, "dlc_queued")) {
             restore_on_reconnect = 0;
             printf("[usb] newly connected storage; restoring previously active titles only\n");
             restore_active_games();
