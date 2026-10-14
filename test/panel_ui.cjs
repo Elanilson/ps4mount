@@ -53,7 +53,7 @@ const flush = async()=>{ for(let i=0;i<6;i++) await new Promise(resolve=>setImme
   const button = (action) => ({getAttribute:k=>k==='data-t'?tid:action});
   get('grid').onClick({target:{closest:()=>button('mount')}});
   assert.equal(confirms,0,'Mount must not request confirmation');
-  assert(get('grid').innerHTML.includes('Solicitando montagem'));
+  assert(get('grid').innerHTML.includes('Montando e registrando DLCs'));
   assert(get('grid').innerHTML.includes('class="card-progress"'));
   await flush();
   assert(get('grid').innerHTML.includes('Preparando jogo'));

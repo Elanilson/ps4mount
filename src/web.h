@@ -13,8 +13,6 @@ void app_progress_json(buf_t *out);
 int app_add(const char *tid, char *msg, size_t cap);
 int app_remove(const char *tid, char *msg, size_t cap);
 int app_register_dlcs(const char *tid, char *msg, size_t cap);
-int app_probe_options(const char *tid, buf_t *out);
-int app_probe_dlc(const char *tid, const char *cid, int method, char *msg, size_t cap);
 int app_install_dlcs(const char *tid, char *msg, size_t cap);
 int app_install_dlc_one(const char *tid,const char *cid,char *msg,size_t cap);
 int app_pilot_redirect(const char *tid,const char *cid,char *msg,size_t cap);

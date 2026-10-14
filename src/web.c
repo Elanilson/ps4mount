@@ -192,24 +192,6 @@ void web_serve(int listen_fd) {
             int rc = app_diagnose_db(tid, msg, sizeof(msg));
             json_msg(fd, !rc, msg);
         }
-    } else if (!post && !strncmp(path,"/api/probe-dlcs?",16)) {
-        if (title_param(path,tid)) json_msg(fd,0,"invalid title_id");
-        else {
-            buf_t b={0};
-            if (!app_probe_options(tid,&b)) reply(fd,"200 OK","application/json; charset=utf-8",b.data,b.len);
-            else json_msg(fd,0,"DLC sources not found on USB");
-            buf_free(&b);
-        }
-    } else if (post && !strncmp(path,"/api/probe-dlc?",15)) {
-        char cid[37];
-        const char *p = strstr(path,"method=");
-        int method = p ? atoi(p+7) : 0;
-        if (title_param(path,tid) || cid_param(path,cid) || !p || method < 1 || method > 5)
-            json_msg(fd,0,"invalid title/content/method");
-        else {
-            int rc=app_probe_dlc(tid,cid,method,msg,sizeof(msg));
-            json_msg(fd,!rc,msg);
-        }
     } else if (post && !strncmp(path, "/api/register-dlcs", 18)) {
         if (title_param(path, tid))
             json_msg(fd, 0, "invalid title_id");

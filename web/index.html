@@ -133,29 +133,8 @@ function render() {
     if (['removed', 'inactive', 'pending'].indexOf(g.state) >= 0) act = '<button class="primary" data-a="mount" data-t="' + g.title_id + '">Montar</button>';
     else if (g.state === 'ready') act = '<button class="danger" data-a="unmount" data-t="' + g.title_id + '">Desmontar</button>';
     else if (g.state === 'running') act = '<button disabled>Feche o jogo para desmontar</button>';
-    if (g.dlc > 0 && g.state === 'ready') {
-      act += '<details class="dlc-experiments"><summary>Testes de registro USB (5 metodos)</summary>';
-      var probeNames = ['Controle: titulo /app', 'Jogo /addcont', 'DLC titulo /addcont', 'DLC titulo /pasta', 'DLC titulo /pasta/label'];
-      for (var pm=1;pm<=5;pm++) act += '<button data-a="probe-'+pm+'" data-t="'+g.title_id+'" title="Experimental; AppInstallTitleDir direcionada, sem copia, sem AppInstallAll">M'+pm+': '+probeNames[pm-1]+'</button>';
-      act += '</details>';
-    }
-    if (g.dlc > 0 && g.state === 'ready')
-      act += '<button data-a="register-dlcs" data-t="' + g.title_id + '" title="Teste de revalidacao direcionada do titulo; sem instalacao nativa e sem AppInstallAll. Nao garante registro dos DLCs.">Registrar DLCs (USB)</button>';
-    if (g.dlc > 0 && g.state === 'ready' && g.title_id !== 'CUSA34384')
-      act += '<button data-a="install-dlcs" data-t="' + g.title_id + '" title="Instalacao nativa REAL; copia os PKGs para o SSD. Nao usa AppInstallAll.">Instalar DLCs (NATIVO / SSD)</button>';
-    if (g.title_id === 'CUSA34384' && g.dlc > 0) {
-      act += '<button data-a="pilot-install" data-t="' + g.title_id + '" title="Instala APENAS 1 DLC selecionado nativamente, copiando o PKG ao SSD, para criar o registro">Instalar 1 DLC (NATIVO)</button>';
-      act += '<button data-a="pilot-redirect" data-t="' + g.title_id + '" title="Teste reversivel de UM DLC: move ac.pkg nativo para nome de backup no mesmo SSD e sobrepoe via USB">Testar 1 DLC (USB)</button>';
-      act += '<button data-a="pilot-restore" data-t="' + g.title_id + '" title="Desmonta somente o overlay do piloto e restaura o nome ac.pkg no SSD">Restaurar 1 DLC (SSD)</button>';
-    }
-    if (g.title_id === 'CUSA03842') {
-      act += '<button data-a="test-dlc-usb" data-t="' + g.title_id + '" title="TESTE sequencial: para cada DLC, compara PKG nativo com USB, monta e so entao avanca ao proximo; rollback se falhar.">Testar 17 DLCs no USB</button>';
-      act += '<button data-a="restore-dlc-native" data-t="' + g.title_id + '" title="Desfaz todas as montagens temporarias dos DLCs de RE7 para exibir as instalacoes originais no SSD.">Restaurar 17 DLCs no SSD</button>';
-    }
-    if (g.dlc > 0)
-      act += '<button data-a="diagnose-db" data-t="' + g.title_id + '" title="Consultar SOMENTE LEITURA os registros do addcont.db deste jogo, sem instalacao nem alteracoes">Diagnosticar DB</button>';
     var job = busy[g.title_id];
-    if (job) act = '<button disabled>' + (job.action === 'unmount' ? 'Desmontando…' : job.action === 'register-dlcs' ? 'Revalidando DLCs no USB…' : job.action === 'install-dlcs' ? 'Instalando no SSD…' : 'Montando…') + '</button>';
+    if (job) act = '<button disabled>' + (job.action === 'unmount' ? 'Desmontando…' : 'Montando e processando DLCs…') + '</button>';
     html += '<div class="card"><div class="art" style="background-image:url(/icon/' + g.title_id + ')">' +
       '<span class="badge b-' + g.state + '">' + esc(labels[g.state] || g.state) + '</span></div>' +
       '<div class="info"><div class="name">' + esc(g.name) + '</div>' +
@@ -184,75 +163,15 @@ $('grid').addEventListener('click', function (e) {
   if (!b) return;
   var tid = b.getAttribute('data-t'), a = b.getAttribute('data-a');
   if (busy[tid]) return;
-  if (a.indexOf('probe-') === 0) {
-    var probeMethod = Number(a.slice(6));
-    api('/api/probe-dlcs?title_id=' + tid).then(function(j) {
-      if (!j.dlcs || !j.dlcs.length) throw Error('Nenhum DLC valido no USB');
-      var options=j.dlcs.map(function(d,i) { return (i+1)+'. '+d.content_id+(d.registered?' [NO BANCO]':' [AUSENTE]'); }).join('\n');
-      var selected=prompt('TESTE M'+probeMethod+' (SEM COPIA): escolha UM DLC\n'+options+'\nNumero:','1');
-      if (selected === null) return;
-      var index=Number(selected);
-      if (!Number.isInteger(index) || index<1 || index>j.dlcs.length) throw Error('Numero invalido');
-      var cid=j.dlcs[index-1].content_id;
-      if (!confirm('Executar M'+probeMethod+' direcionado para '+cid+'? Metodo EXPERIMENTAL, nao garante registro. Pode alterar metadados deste titulo. Nao afeta o PKG do USB.')) return;
-      api('/api/probe-dlc?title_id='+tid+'&content_id='+cid+'&method='+probeMethod,'POST').then(function(r) {
-        toast(r.message||'Teste na fila'); loadProgress(); $('logbtn').click();
-      }).catch(function(e){ toast('Teste M'+probeMethod+': '+e.message); $('logbtn').click(); });
-    }).catch(function(e) { toast('DLC: '+e.message); });
-    return;
-  }
-  if (a === 'pilot-restore') {
-    if (!confirm('Restaurar o unico DLC em teste? O jogo deve estar fechado. O USB nao e necessario para restaurar.')) return;
-    api('/api/pilot-restore?title_id=' + tid,'POST').then(function(j) {
-      toast(j.message || 'Restauracao solicitada');loadProgress();load();$('logbtn').click();
-    }).catch(function(err) {toast(err.message);$('logbtn').click();});
-    return;
-  }
-  if (a === 'pilot-install' || a === 'pilot-redirect') {
-    api('/api/pilot-dlcs?title_id=' + tid).then(function(j) {
-      if (!j.dlcs || !j.dlcs.length) throw Error('Nenhum DLC no USB');
-      var options = j.dlcs.map(function(d,i) { return (i+1) + '. ' + d.content_id + (d.registered ? ' [registrado]' : ' [NAO registrado]'); }).join('\n');
-      var selected = prompt('Escolha UM DLC para ' + (a === 'pilot-install' ? 'INSTALAR NO SSD' : a === 'pilot-redirect' ? 'REDIRECIONAR AO USB' : 'RESTAURAR') + ':\n' + options + '\nDigite o numero:', '1');
-      if (selected === null) return;
-      var ix = Number(selected);
-      if (!Number.isInteger(ix) || ix < 1 || ix > j.dlcs.length) { toast('Numero invalido'); return; }
-      var d = j.dlcs[ix-1];
-      var warning = a === 'pilot-install' ? 'Instalar NATIVAMENTE somente ' + d.content_id + '? O PKG sera copiado ao SSD.' :
-        a === 'pilot-redirect' ? 'Testar ' + d.content_id + ' no USB? O ac.pkg nativo sera RENOMEADO temporariamente, mantido no mesmo SSD, e coberto com nullfs. NAO libera espaco nesta fase. Nao desconecte o USB.' :
-        'Restaurar o ac.pkg nativo de ' + d.content_id + '? Feche o jogo antes.';
-      if (!confirm(warning)) return;
-      api('/api/' + a + '?title_id=' + tid + '&content_id=' + d.content_id,'POST').then(function(r) {
-        toast(r.message || 'Solicitacao aceita');loadProgress();load();$('logbtn').click();
-      }).catch(function(err) {toast(err.message);$('logbtn').click();});
-    }).catch(function(err) {toast('Selecao DLC: '+err.message);});
-    return;
-  }
-  if (a === 'diagnose-db') {
-    api('/api/diagnose-db?title_id=' + tid, 'POST').then(function (result) {
-      toast(result.message || 'Diagnostico do banco concluido');
-      $('logbtn').click();
-    }).catch(function (err) { toast('Falha ao consultar addcont.db: ' + err.message); });
-    return;
-  }
-  if (a === 'test-dlc-usb' || a === 'restore-dlc-native') {
-    var intro = a === 'test-dlc-usb' ? 'TESTE SEQUENCIAL: verificar e montar 1 DLC por vez, ate 17. Se alguma etapa falhar, tentar restaurar as montagens anteriores. O jogo deve estar fechado. SSD e banco nao serao modificados.' : 'Desmontar os overlays dos 17 DLCs para mostrar os arquivos nativos intactos do SSD? Feche Resident Evil 7 antes.';
-    if (!confirm(intro)) return;
-    api('/api/' + a + '?title_id=' + tid, 'POST').then(function (j) {
-      toast(j.message); loadProgress(); load();
-    }).catch(function (err) { toast('Falha no teste: ' + err.message); $('logbtn').click(); });
-    return;
-  }
-  if (a === 'install-dlcs' && !confirm('Instalar NATIVAMENTE todos os DLCs de ' + tid + '? O PS5 COPIA os pacotes para o SSD e ocupa espaco; desmontar NAO remove esses arquivos.')) return;
-  if (a === 'register-dlcs' && !confirm('Revalidar os registros dos DLCs de ' + tid + '? A chamada apenas revalida o titulo via AppInstallTitleDir e NAO tem eficacia comprovada para registrar DLCs. Nao executa instalacao nativa nem AppInstallAll.')) return;
-  if (a === 'unmount' && !confirm('Desmontar ' + tid + '? O registro no PS5 será mantido; a restauração automática deste jogo será desativada.')) return;
+  if (a === 'unmount' && !confirm('Desmontar ' + tid + '? O jogo sera removido da biblioteca do PS5. Os PKGs no USB nao serao apagados.')) return;
   // Mount is a single click. Unmount retains its safety confirmation.
-  busy[tid] = {action: a, percent:-1, detail: a === 'mount' ? 'Solicitando montagem…' : a === 'register-dlcs' ? 'Solicitando revalidacao USB…' : a === 'install-dlcs' ? 'Solicitando instalacao nativa…' : 'Desmontando jogo…'};
+  busy[tid] = {action: a, percent:-1, detail: a === 'mount' ? 'Montando e registrando DLCs…' : 'Desmontando jogo…'};
   render();
   api('/api/' + a + '?title_id=' + tid, 'POST').then(function () {
-    if (a === 'mount' || a === 'register-dlcs' || a === 'install-dlcs') {
+    if (a === 'mount') {
       // POST means queued, NOT completed: retain card progress until /api/progress says so.
-      if (busy[tid] && (busy[tid].detail === 'Solicitando montagem…' || busy[tid].detail === 'Solicitando revalidacao USB…' || busy[tid].detail === 'Solicitando instalacao nativa…')) {
-        busy[tid].detail = a === 'register-dlcs' ? 'Revalidacao USB na fila…' : a === 'install-dlcs' ? 'Instalacao nativa na fila…' : 'Montagem na fila…';
+      if (busy[tid] && busy[tid].detail === 'Montando e registrando DLCs…') {
+        busy[tid].detail = 'Montagem e registro dos DLCs na fila…';
         render();
       }
       loadProgress();
@@ -262,7 +181,7 @@ $('grid').addEventListener('click', function (e) {
     }
   }).catch(function (err) {
     delete busy[tid];
-    toast('Erro ao ' + (a === 'mount' ? 'montar' : a === 'register-dlcs' ? 'revalidar DLCs de' : a === 'install-dlcs' ? 'instalar DLCs de' : 'desmontar') + ' ' + tid + ': ' + err.message);
+    toast('Erro ao ' + (a === 'mount' ? 'montar' : 'desmontar') + ' ' + tid + ': ' + err.message);
     load();
   });
 });
@@ -295,7 +214,7 @@ $('stop').onclick = function () {
 };
 function loadProgress() {
   api('/api/progress').then(function (p) {
-    var active = ['restoring','searching','activating','queued','dlc_register_queued','registering_dlcs','dlc_queued','installing_dlcs','probe_queued','probing_dlc'].indexOf(p.phase) >= 0;
+    var active = ['restoring','searching','activating','queued','dlc_queued','installing_dlcs'].indexOf(p.phase) >= 0;
     $('rescan').disabled = active || !!p.redirect_running;
     // Only scanning/restoring uses the global progress. Mount/unmount uses its game card.
     var globalProgress = p.phase === 'searching' || p.phase === 'restoring' || !!p.redirect_running;
@@ -316,20 +235,21 @@ function loadProgress() {
         $('progress-detail').textContent = (p.current ? p.current + ' · ' : '') + p.detail;
       }
     }
-    var installingDlc = (['dlc_register_queued','registering_dlcs','dlc_queued','installing_dlcs','probe_queued','probing_dlc'].indexOf(p.phase) >= 0) && p.current;
+    var installingDlc = (['dlc_queued','installing_dlcs'].indexOf(p.phase) >= 0) && p.current;
     if (installingDlc) {
       serverDlc = p.current;
-      var dlcDetail = (p.phase === 'probe_queued' || p.phase === 'probing_dlc') ? ('Experimento USB: ' + p.detail) : p.phase === 'dlc_register_queued' ? 'Aguardando revalidacao dos DLCs…' : p.phase === 'dlc_queued' ? 'Aguardando instalacao nativa…' :
+      var dlcDetail = p.phase === 'dlc_queued' ? 'Aguardando registro e redirecionamento USB…' :
         ((p.done || 0) + '/' + (p.total || '?') + ' DLC(s) processados · ' + (p.detail || (p.phase === 'installing_dlcs' ? 'Instalando no SSD…' : 'Revalidando DLC…')));
-      var current = busy[serverDlc], actionDlc = (p.phase === 'dlc_queued' || p.phase === 'installing_dlcs') ? 'install-dlcs' : (p.phase === 'probing_dlc' || p.phase === 'probe_queued') ? 'probe-dlc' : 'register-dlcs';
+      var current = busy[serverDlc], actionDlc = 'mount';
       if (!current || current.action !== actionDlc || current.detail !== dlcDetail || current.percent !== p.dlc_percent) {
         busy[serverDlc] = {action:actionDlc, detail:dlcDetail, percent:p.dlc_percent};
         render();
       }
     } else if (serverDlc && (p.phase === 'dlc_complete' || p.phase === 'dlc_error' || p.phase === 'probe_complete')) {
       delete busy[serverDlc];
-      if (p.phase === 'dlc_error') toast('Registro dos DLCs nao confirmado: consulte o log.');
+      if (p.phase === 'dlc_error') toast('Falha no registro ou redirecionamento de DLC: consulte o log.');
       serverDlc = '';
+      serverMount = '';
       load(); render();
     }
     var mounting = (p.phase === 'queued' || p.phase === 'activating') && p.current;

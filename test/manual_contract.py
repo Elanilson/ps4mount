@@ -26,7 +26,7 @@ checks={
  'app.db freshness checked before staging': 'db_snapshot_healthy()' in main and 'g_last_good' in db,
  'no forced mount teardown': 'MNT_FORCE' not in main and 'unmount_all_layers(' not in main,
  'foreign mounts are rejected': 'target_mounts_safe(&t)' in main and 'top_layer(target, dir)' in main,
- 'manual disable retains DB registration': 'registration retained' in main,
+ 'unmount unregisters only selected title': 'uninstall_title_one(tid)' in main and 'release_title_bundle(&t)' in main,
  'progress GET is read only': 'app_progress_json(&b)' in web and '"/api/progress") && !post' in web,
  'explicit POST search': 'post && !strcmp(path, "/api/rescan")' in web,
  'search and mount buttons present': 'Buscar jogos no USB' in page and '>Montar</button>' in page,

@@ -37,12 +37,11 @@
 #include "crypto.h"
 #include "db.h"
 #include "pkg.h"
-#include "dlc_probe.h"
 #include "scan_walk.h"
 #include "web.h"
 #include "icon_data.h"
 
-#define VERSION "PS4Mount 0.4.19-targeted-dlc-probes"
+#define VERSION "PS4Mount 0.4.20-one-click-offload"
 #define LOCK_PORT 9032
 #define SCAN_SECONDS 10 /* legacy value; polling for PKGs is disabled */
 #define STATE_DIR "/data/ps4mount"
@@ -1645,7 +1644,7 @@ static char g_dlc_register_request[10];
 static char g_dlc_install_request[10];
 static char g_dlc_install_only_cid[37];
 /* Independent one-DLC/one-method experiment, processed in main loop. */
-static struct { char tid[10]; char cid[37]; int method; } g_probe_request;
+
 static int g_restore_running;
 typedef struct {
     const char *phase;
@@ -1658,7 +1657,6 @@ static int g_dlc_percent = -1;    /* -1 means indeterminate */
 static char g_dlc_content[48];
 static int g_appinst_ready = 0;
 static void register_dlcs_queued(void);
-static void probe_dlc_queued(void);
 static void install_dlcs_queued(void);
 static int redirect_mounted(void);
 static int redirect_locked(void);
@@ -1677,7 +1675,7 @@ int app_rescan(void) {
         printf("[dlc-redirect] search refused while temporary native overlay active\n");
         return -1;
     }
-    if (g_discover_requested || g_restore_running || g_activate_request[0] || g_dlc_register_request[0] || g_dlc_install_request[0] || g_probe_request.tid[0] ||
+    if (g_discover_requested || g_restore_running || g_activate_request[0] || g_dlc_register_request[0] || g_dlc_install_request[0] ||
         !strcmp(g_progress.phase, "searching") || !strcmp(g_progress.phase, "activating") ||
         !strcmp(g_progress.phase, "registering_dlcs") || !strcmp(g_progress.phase, "dlc_register_queued"))
         return -1;
@@ -1872,9 +1870,10 @@ int app_add(const char *tid, char *msg, size_t cap) {
         return -1;
     }
     char root[32];
-    if (g_restore_running || g_discover_requested || g_activate_request[0] || g_dlc_register_request[0] || g_dlc_install_request[0] || g_probe_request.tid[0] ||
+    if (g_restore_running || g_discover_requested || g_activate_request[0] || g_dlc_register_request[0] || g_dlc_install_request[0] ||
         !strcmp(g_progress.phase, "activating") || !strcmp(g_progress.phase, "searching") ||
-        !strcmp(g_progress.phase, "registering_dlcs") || !strcmp(g_progress.phase, "dlc_register_queued")) {
+        !strcmp(g_progress.phase, "registering_dlcs") || !strcmp(g_progress.phase, "dlc_register_queued") ||
+        !strcmp(g_progress.phase,"installing_dlcs") || !strcmp(g_progress.phase,"dlc_queued")) {
         snprintf(msg, cap, "Busy restoring, searching, or activating another game");
         return -1;
     }
@@ -1893,6 +1892,37 @@ int app_add(const char *tid, char *msg, size_t cap) {
     progress_set("queued", "Preparing selected game");
     snprintf(msg, cap, "Mount queued for %s (game + update + associated DLC metadata)", tid);
     return 0;
+}
+
+/* Original v0.5.0 strategy: targeted unregister in a worker thread to avoid
+ * freezing the control panel. Timeout deliberately blocks another uninstall. */
+static volatile int g_one_uninstall_busy;
+static volatile int g_one_uninstall_rc;
+static char g_one_uninstall_tid[10];
+static void *uninstall_one_worker(void *arg) {
+    (void)arg;
+    g_one_uninstall_rc = sceAppInstUtilAppUnInstall(g_one_uninstall_tid);
+    __atomic_store_n(&g_one_uninstall_busy,0,__ATOMIC_RELEASE);
+    return NULL;
+}
+static int uninstall_title_one(const char *tid) {
+    if (__atomic_load_n(&g_one_uninstall_busy,__ATOMIC_ACQUIRE)) return -1;
+    snprintf(g_one_uninstall_tid,sizeof(g_one_uninstall_tid),"%s",tid);
+    __atomic_store_n(&g_one_uninstall_busy,1,__ATOMIC_RELEASE);
+    pthread_t thread;
+    if (pthread_create(&thread,NULL,uninstall_one_worker,NULL)) {
+        __atomic_store_n(&g_one_uninstall_busy,0,__ATOMIC_RELEASE);
+        printf("[oneclick] uninstall thread creation failed; no unsafe inline fallback\n");
+        return -1;
+    }
+    pthread_detach(thread);
+    for (int i=0;i<600;i++) {
+        if (!__atomic_load_n(&g_one_uninstall_busy,__ATOMIC_ACQUIRE))
+            return g_one_uninstall_rc;
+        pump_events(100);
+    }
+    printf("[oneclick] uninstall %s still pending after 60s; no overlapping retry\n",tid);
+    return -1;
 }
 
 /* Never unmount unknown/foreign layers and never uninstall via Disable. */
@@ -2001,12 +2031,15 @@ static int release_title_bundle(const title_src_t *t) {
     return 0;
 }
 
+static int offload_unmount_title(const char *tid);
+static int uninstall_title_one(const char *tid);
+static int uninstall_title_one(const char *tid);
 int app_remove(const char *tid, char *msg, size_t cap) {
     if (redirect_locked()) {
         snprintf(msg, cap, "Restore temporary native DLC overlay first");
         return -1;
     }
-    if (g_restore_running || g_activate_request[0] || g_dlc_register_request[0] || g_dlc_install_request[0] || g_probe_request.tid[0] || g_discover_requested ||
+    if (g_restore_running || g_activate_request[0] || g_dlc_register_request[0] || g_dlc_install_request[0] || g_discover_requested ||
         !strcmp(g_progress.phase, "activating") || !strcmp(g_progress.phase, "searching") ||
         !strcmp(g_progress.phase, "registering_dlcs") || !strcmp(g_progress.phase, "dlc_register_queued")) {
         snprintf(msg, cap, "Wait until the current operation ends");
@@ -2035,14 +2068,26 @@ int app_remove(const char *tid, char *msg, size_t cap) {
         snprintf(msg, cap, "Could not safely release %s bundle; restore disabled, inspect mounts", tid);
         return -1;
     }
-    /* Release all title-owned external DLC mounts unless another active game needs them. */
+    /* A system unregistration must not see a dangling native DLC nullfs mount.
+     * Zero-byte stubs remain as installation metadata; USB bytes are untouched. */
+    if (offload_unmount_title(tid)) {
+        snprintf(msg,cap,"Could not release DLC USB redirections for %s",tid);
+        return -1;
+    }
+    /* Upstream 0.5.0 behavior: remove *only this title* from the library. */
+    int urc = db_is_registered(tid) ? uninstall_title_one(tid) : 0;
+    if (urc) {
+        printf("[oneclick] %s targeted uninstall error=0x%08x\n",tid,(unsigned)urc);
+        snprintf(msg,cap,"PS5 refused targeted removal of %s (0x%08x)",tid,(unsigned)urc);
+        return -1;
+    }
     snprintf(path, sizeof(path), STATE_DIR "/%s.active", tid);
     unlink(path);
     managed_t *m = managed_by(tid, NULL);
     if (m) m->used = 0;
-    printf("[manual] %s disabled; game+patch+DLC bundle released, system registration retained\n", tid);
+    printf("[oneclick] %s removed from PS5 library; original USB PKGs untouched\n", tid);
     g_catalog_dirty = 1;
-    snprintf(msg, cap, "%s unmounted (registration retained, automatic restore off)", tid);
+    snprintf(msg, cap, "%s removed from the library; USB PKGs preserved", tid);
     return 0;
 }
 
@@ -2224,6 +2269,13 @@ static int hold_link_is(const char *kind, const char *tid, const char *name, con
 /* Reports database evidence only.  Mounting ac.pkg is not equivalent to a
  * registered entitlement; do not call AppInstallAll or install packages to
  * internal storage as a hidden side effect of the Mount button. */
+/* One-click native registration -> USB offload helpers (implemented below). */
+static int offload_one(const dlc_src_t *dlc, const char *tid);
+static int offload_resume_title(const char *tid);
+static void offload_resume_all(void);
+static int offload_unmount_title(const char *tid);
+static int uninstall_title_one(const char *tid);
+
 static void report_dlc_registration(const title_src_t *t) {
     if (!t->ndlc) return;
     const char *ids[MAX_DLC];
@@ -2419,19 +2471,24 @@ static void activate_queued(void) {
         printf("[manual][activate] %s activated: game+update+DLC mounts checked; %d DLC source(s) staged\n",
                tid, t.ndlc);
         report_dlc_registration(&t);
-        if (t.ndlc) {
-            int drc = usb_dlc_revalidate(&t, "MOUNT");
-            printf("[manual][activate] %s DLC registration probe %s (game stays mounted)\n",
-                   tid, drc ? "NOT_CONFIRMED" : "DB_CONFIRMED");
-        }
     }
+    int found_dlcs = t.ndlc;
     src_close(&t);
     if (rc) goto failed;
     g_progress.ok = 1;
     g_progress.done = 1;
     g_catalog_dirty = 1;
-    progress_set("complete", "Jogo base, atualizacao e DLCs montados; consultar log de registro DLC");
-    notify("PS4Mount: %s mounted (DLC status in log)", tid);
+    /* Same click: after base registration, install missing DLCs then offload.
+     * A second main-loop iteration handles this without blocking the panel. */
+    if (found_dlcs) {
+        snprintf(g_dlc_install_request, sizeof(g_dlc_install_request), "%s", tid);
+        g_progress = (progress_t){"dlc_queued", found_dlcs, 0, 0, 0, "", "Montagem concluida; instalando e mapeando DLCs"};
+        snprintf(g_progress.current, sizeof(g_progress.current), "%s", tid);
+        printf("[oneclick] %s stage 1/2 base mounted; stage 2/2 queued DLC native register + USB offload (%d)\n",tid,found_dlcs);
+    } else {
+        progress_set("complete", "Jogo e atualizacao montados (sem DLCs)");
+        notify("PS4Mount: %s montado sem DLCs", tid);
+    }
     return;
 failed:
     g_progress.failed = 1;
@@ -2448,7 +2505,7 @@ failed:
  * God of War Ragnarök add-on rows. */
 int app_diagnose_db(const char *tid, char *msg, size_t cap) {
     if (g_discover_requested || g_restore_running || g_activate_request[0] ||
-        g_dlc_register_request[0] || g_dlc_install_request[0] || g_probe_request.tid[0] || !strcmp(g_progress.phase, "registering_dlcs") ||
+        g_dlc_register_request[0] || g_dlc_install_request[0] || !strcmp(g_progress.phase, "registering_dlcs") ||
         !strcmp(g_progress.phase, "activating") || !strcmp(g_progress.phase, "searching")) {
         snprintf(msg, cap, "An operation is running. Retry when idle");
         return -1;
@@ -2470,119 +2527,6 @@ int app_diagnose_db(const char *tid, char *msg, size_t cap) {
  * A successful API return is not considered proof; the read-only addcont.db
  * snapshot before/after is the only evidence for NEW_DB_RECORD.
  * IMPORTANT: these unverified call shapes can still have OS side effects. */
-int app_probe_options(const char *tid, buf_t *out) {
-    char root[32];
-    title_src_t *t = calloc(1,sizeof(*t));
-    if (!t) return -1;
-    if (find_root(tid,root,sizeof(root)) || !is_mountpoint(root) || src_open(t,root,tid)) {
-        free(t); return -1;
-    }
-    const char *ids[MAX_DLC]; int states[MAX_DLC] = {0};
-    for (int i=0;i<t->ndlc;i++) ids[i]=t->dlc[i].pkg.content_id;
-    if (t->ndlc) db_dlc_registration(ids,t->ndlc,states);
-    buf_printf(out,"{\"dlcs\":[");
-    for (int i=0;i<t->ndlc;i++) {
-        if (i) buf_printf(out,",");
-        buf_printf(out,"{\"content_id\":"); json_str(out,ids[i]);
-        buf_printf(out,",\"registered\":%s}",states[i]==1?"true":"false");
-    }
-    buf_printf(out,"]}"); src_close(t);free(t);
-    return 0;
-}
-
-int app_probe_dlc(const char *tid,const char *cid,int method,char *msg,size_t cap) {
-    if (method<1 || method>DLC_PROBE_METHODS || !g_appinst_ready || !one_title_install_api()) {
-        snprintf(msg,cap,"Method or targeted API unavailable"); return -1;
-    }
-    if (g_probe_request.tid[0] || g_dlc_register_request[0] || g_dlc_install_request[0] ||
-        g_activate_request[0] || g_discover_requested || g_restore_running || g_deleting ||
-        redirect_locked() || !strcmp(g_progress.phase,"activating") ||
-        !strcmp(g_progress.phase,"installing_dlcs") || !strcmp(g_progress.phase,"probing_dlc") ||
-        !strcmp(g_progress.phase,"registering_dlcs")) {
-        snprintf(msg,cap,"Another operation is active"); return -1;
-    }
-    /* No DB registered-state gate: even an already registered DLC is probed. */
-    if (strlen(cid)!=36 || title_running(tid)) {
-        snprintf(msg,cap,"DLC must belong to selected closed game"); return -1;
-    }
-    snprintf(g_probe_request.tid,sizeof(g_probe_request.tid),"%s",tid);
-    snprintf(g_probe_request.cid,sizeof(g_probe_request.cid),"%s",cid);
-    g_probe_request.method=method;
-    snprintf(g_progress.current,sizeof(g_progress.current),"%s",tid);
-    g_progress.total=1;g_progress.done=g_progress.ok=g_progress.failed=0;
-    progress_set("probe_queued","Preparando teste direcionado sem copiar PKG");
-    printf("[dlc-probe] QUEUED M%d %s title=%s DLC=%s NO_COPY NO_GLOBAL\n",
-           method,dlc_probe_name(method),tid,cid);
-    snprintf(msg,cap,"Experiment M%d queued for %s",method,cid);
-    return 0;
-}
-
-static void probe_dlc_queued(void) {
-    if (!g_probe_request.tid[0]) return;
-    char tid[10],cid[37],root[32];
-    int method=g_probe_request.method, rc=-1, before=-1, after=-1, staged=0;
-    snprintf(tid,sizeof(tid),"%s",g_probe_request.tid);
-    snprintf(cid,sizeof(cid),"%s",g_probe_request.cid);
-    /* Keep request pending while synchronous API is executing: other panel actions
-     * must see the busy flag even if pump_events serves HTTP during DB settle. */
-    progress_set("probing_dlc","Verificando origem USB e preparando metadados");
-    printf("[dlc-probe] M%d BEGIN game=%s cid=%s\n",method,tid,cid);
-    title_src_t *t=calloc(1,sizeof(*t));
-    if (!t) goto done;
-    if (find_root(tid,root,sizeof(root)) || !is_mountpoint(root) ||
-        src_open(t,root,tid)) goto cleanup;
-    dlc_src_t *selected=NULL;
-    for (int i=0;i<t->ndlc;i++)
-        if (!strcmp(t->dlc[i].pkg.content_id,cid)) { selected=&t->dlc[i];break; }
-    if (!selected) {
-        printf("[dlc-probe] M%d NO_USB_DLC %s\n",method,cid);
-        goto cleanup;
-    }
-    if (!db_snapshot_healthy() || !db_is_registered(tid) || title_running(tid) ||
-        installed_internally(tid) || target_mounts_safe(t)) {
-        printf("[dlc-probe] M%d BASE_NOT_READY: mount game first; native app/unsafe layers not modified\n",method);
-        goto cleanup;
-    }
-    /* For diagnostics, we deliberately never suppress an already-known DLC. */
-    const char *ids[1]={cid}; int states[1]={-1};
-    db_dlc_registration(ids,1,states);before=states[0];
-    printf("[dlc-probe] M%d BEFORE cid=%s db=%d (1=present 0=missing -1=unknown)\n",method,cid,before);
-    if (place_files(t) || mount_title(t) || !title_layers_mounted(t)) {
-        printf("[dlc-probe] M%d PREPARE_FAILED: no API request\n",method);
-        goto cleanup;
-    }
-    staged=1;
-    dlc_probe_target_t target;
-    if (dlc_probe_target(method,tid,selected->pkg.title_id,cid+20,&target)) goto cleanup;
-    char hold_path_buf[256];
-    snprintf(hold_path_buf,sizeof(hold_path_buf),"/user/addcont/%s/%s/ac.pkg",selected->pkg.title_id,cid+20);
-    printf("[dlc-probe] M%d STAGED=%d content=%s package=%s visible=%d registered_before=%d\n",
-           method,staged,cid,hold_path_buf,exists(hold_path_buf),before);
-    printf("[dlc-probe] M%d CALL AppInstallTitleDir(title=%s,root=%s,NULL) -- EXPERIMENTAL\n",
-           method,target.title,target.root);
-    progress_set("probing_dlc","Solicitando API direcionada e verificando addcont.db");
-    app_install_title_dir_fn single=one_title_install_api();
-    if (!single) goto cleanup;
-    rc=single(target.title,target.root,NULL);
-    printf("[dlc-probe] M%d RETURN rc=0x%08x -- API result is NOT DLC success proof\n",method,(unsigned)rc);
-    /* Give AppInst time to write only this DLC; no writes by PS4Mount to DB. */
-    wait_db_quiet(2,12);
-    db_dlc_registration(ids,1,states);after=states[0];
-    printf("[dlc-probe] M%d RESULT cid=%s BEFORE=%d AFTER=%d NEW_DB_RECORD=%d STILL_MISSING=%d API_RC=0x%08x\n",
-           method,cid,before,after,before==0 && after==1,after==0,(unsigned)rc);
-cleanup:
-    src_close(t);free(t);
-done:
-    g_progress.done=1;
-    g_progress.ok=(before==0 && after==1) ? 1 : 0;
-    g_progress.failed=g_progress.ok ? 0 : 1;
-    progress_set("probe_complete",g_progress.ok?"Novo DLC encontrado no addcont.db":"Sem novo registro; consulte [dlc-probe]");
-    g_catalog_dirty=1;
-    g_probe_request.tid[0]=0;
-    printf("[dlc-probe] M%d END game=%s cid=%s registered_before=%d registered_after=%d success=%d\n",
-           method,tid,cid,before,after,g_progress.ok);
-}
-
 /* Independent Retry button. The same targeted no-copy revalidation is also
  * attempted on Mount. We NEVER uninstall and NEVER run a package installer. */
 int app_register_dlcs(const char *tid, char *msg, size_t cap) {
@@ -2591,7 +2535,7 @@ int app_register_dlcs(const char *tid, char *msg, size_t cap) {
         return -1;
     }
     char root[32];
-    if (g_dlc_register_request[0] || g_dlc_install_request[0] || g_probe_request.tid[0] || g_activate_request[0] || g_discover_requested ||
+    if (g_dlc_register_request[0] || g_dlc_install_request[0] || g_activate_request[0] || g_discover_requested ||
         g_restore_running || !strcmp(g_progress.phase, "registering_dlcs") ||
         !strcmp(g_progress.phase, "activating") || !strcmp(g_progress.phase, "searching") ||
         !strcmp(g_progress.phase, "dlc_register_queued")) {
@@ -2662,7 +2606,7 @@ out:
  * Unlike external mounts, internal add-on installations are not removed on Unmount. */
 int app_install_dlcs(const char *tid, char *msg, size_t cap) {
     char root[32];
-    if (g_dlc_install_request[0] || g_probe_request.tid[0] || g_dlc_register_request[0] || g_activate_request[0] || g_discover_requested ||
+    if (g_dlc_install_request[0] || g_dlc_register_request[0] || g_activate_request[0] || g_discover_requested ||
         g_restore_running || !strcmp(g_progress.phase, "installing_dlcs") ||
         !strcmp(g_progress.phase, "activating") || !strcmp(g_progress.phase, "searching") ||
         !strcmp(g_progress.phase, "installing_dlcs") || !strcmp(g_progress.phase, "dlc_queued")) {
@@ -2828,9 +2772,8 @@ static void install_dlcs_queued(void) {
     int states[MAX_DLC];
     for (int i = 0; i < t.ndlc; ++i) ids[i] = t.dlc[i].pkg.content_id;
     db_dlc_registration(ids, t.ndlc, states);
-    /* Explicit Instalar DLCs retries every valid USB PKG, even if its record
-     * already exists. Let the native per-package API decide whether it can be
-     * reinstalled; never silently skip a user-requested DLC. */
+    /* One click processes each DLC. Already-registered DLCs are not reinstalled:
+     * they may already have a zero-byte native stub from previous offloading. */
     int todo = only_cid[0] ? 1 : t.ndlc;
     if (only_cid[0]) {
         int found = 0;
@@ -2865,17 +2808,23 @@ static void install_dlcs_queued(void) {
         g_dlc_percent = -1;
         snprintf(g_progress.detail, sizeof(g_progress.detail), "Instalando DLC %d/%d: %.36s",
                  g_progress.done + 1, todo, g_dlc_content);
-        int rc = dlc_native_install_one(&t.dlc[i]);
-        if (!rc) {
-            /* Do not confuse accepted request with a DB registration. */
-            wait_db_quiet(2, 15);
-            const char *id = t.dlc[i].pkg.content_id;
-            int st = -1;
-            db_dlc_registration(&id, 1, &st);
-            if (st != 1) {
-                printf("[dlc-install] %s native task completed but addcont.db state=%d\n", id, st);
-                rc = -1;
+        const char *id = t.dlc[i].pkg.content_id;
+        int state = -1;
+        db_dlc_registration(&id, 1, &state);
+        int rc = 0;
+        if (state == 1) {
+            printf("[oneclick] %s already registered, skipping installer\n", id);
+        } else if (state == 0) {
+            rc = dlc_native_install_one(&t.dlc[i]);
+            if (!rc) {
+                wait_db_quiet(2,15);
+                db_dlc_registration(&id,1,&state);
+                if (state != 1) rc = -1;
             }
+        } else rc = -1; /* never delete a file if the DB is unreadable */
+        if (!rc) {
+            progress_set("installing_dlcs", "Registro confirmado; redirecionando e liberando SSD");
+            rc = offload_one(&t.dlc[i],tid);
         }
         if (rc) g_progress.failed++;
         else g_progress.ok++;
@@ -2909,7 +2858,7 @@ done:
         printf("[dlc-install] %s finished with errors: success=%d failed=%d fatal=%d\n",
                tid, g_progress.ok, g_progress.failed, fatal);
     } else {
-        progress_set("dlc_complete", "DLCs com registro confirmado no banco");
+        progress_set("dlc_complete", "DLCs registrados, apontados ao USB e SSD liberado (consulte log)");
         printf("[dlc-install] %s finished: %d/%d registered\n", tid, g_progress.ok, todo);
     }
     return;
@@ -3000,7 +2949,7 @@ static int redirect_title_running(void) {
 static int redirect_busy(void) {
     return __atomic_load_n(&g_redirect_job_active, __ATOMIC_ACQUIRE) ||
            g_discover_requested || g_restore_running || g_activate_request[0] ||
-           g_dlc_register_request[0] || g_dlc_install_request[0] || g_probe_request.tid[0] || g_deleting ||
+           g_dlc_register_request[0] || g_dlc_install_request[0] || g_deleting ||
            !strcmp(g_progress.phase, "activating") ||
            !strcmp(g_progress.phase, "installing_dlcs") ||
            !strcmp(g_progress.phase, "registering_dlcs") ||
@@ -3087,6 +3036,321 @@ static int redirect_copy_meta(const char *native, const char *source, const char
 
 /* Can be called after daemon restart: does not rely on a process-local mount
  * counter. Never force-unmount; preserve unknown/foreign layers. */
+/* --- One-click native DLC registration -> persistent USB offload ---------
+ * This is independent of the historical RE7 and GoW reversible experiments.
+ * No AppInstallAll and no direct SQLite modification. Each DLC is treated alone.
+ * The native ac.pkg is replaced by an empty stub only after byte comparison,
+ * journaling and successful USB nullfs mount, then its held copy is unlinked.
+ * The journal is NOT deleted after success: it is required after a PS5 reboot.
+ */
+typedef struct {
+    char cid[37], native[PATH_MAX], stage[PATH_MAX], usb[PATH_MAX];
+} offload_record_t;
+
+static void offload_journal_path(const char *cid, char *dst, size_t cap) {
+    snprintf(dst,cap,STATE_DIR "/offload_%.36s.txt",cid);
+}
+static int offload_cid_valid(const char *cid) {
+    if (!cid || strlen(cid)!=36 || strncmp(cid+7,"CUSA",4) ||
+        cid[16]!='_' || cid[17]!='0' || cid[18]!='0' || cid[19]!='-') return 0;
+    for (int i=0;i<36;i++) {
+        char c=cid[i];
+        if (!(c=='_' || c=='-' || (c>='0'&&c<='9') || (c>='A'&&c<='Z'))) return 0;
+    }
+    return 1;
+}
+static int offload_record_valid(const offload_record_t *r) {
+    if (!offload_cid_valid(r->cid)) return 0;
+    char label[17], tid[10], expected[PATH_MAX];
+    snprintf(label,sizeof(label),"%.16s",r->cid+20);
+    snprintf(tid,sizeof(tid),"%.9s",r->cid+7);
+    snprintf(expected,sizeof(expected),HOLD_DIR "/offload/%s/%s",tid,label);
+    if (strcmp(expected,r->stage)) return 0;
+    if (strncmp(r->usb,"/mnt/usb",8) || !strstr(r->usb,"/ps4/") ||
+        !strstr(r->usb,"/addcont/") || strcmp(r->usb+strlen(r->usb)-7,"/ac.pkg")) return 0;
+    char rel[64]; snprintf(rel,sizeof(rel),"/user/addcont/%s/%s",tid,label);
+    if (strcmp(r->native,rel)) {
+        int good=0;
+        for (int i=0;i<8;i++) {
+            char path[PATH_MAX];
+            snprintf(path,sizeof(path),"/mnt/ext%d%s",i,rel);
+            if (!strcmp(path,r->native)) good=1;
+        }
+        if (!good) return 0;
+    }
+    return 1;
+}
+static int offload_read(const char *journal,offload_record_t *r) {
+    memset(r,0,sizeof(*r));
+    FILE *f=fopen(journal,"r"); if (!f) return -1;
+    char *items[]={r->cid,r->native,r->stage,r->usb};
+    size_t cap[]={sizeof(r->cid),sizeof(r->native),sizeof(r->stage),sizeof(r->usb)};
+    char line[PATH_MAX+128];int good=1;
+    for (int i=0;i<4;i++) {
+        if (!fgets(line,sizeof(line),f)) {good=0;break;}
+        size_t n=strlen(line);
+        if (!n || line[n-1]!='\n' || n>cap[i]) {good=0;break;}
+        line[--n]=0; memcpy(items[i],line,n+1);
+    }
+    fclose(f);
+    return good && offload_record_valid(r) ? 0:-1;
+}
+static int offload_write(const offload_record_t *r) {
+    char journal[PATH_MAX],tmp[PATH_MAX];
+    offload_journal_path(r->cid,journal,sizeof(journal));
+    snprintf(tmp,sizeof(tmp),"%s.tmp",journal);
+    int fd=open(tmp,O_WRONLY|O_CREAT|O_EXCL,0600);
+    if (fd<0) return -1;
+    char data[PATH_MAX*3+80];
+    int n=snprintf(data,sizeof(data),"%s\n%s\n%s\n%s\n",r->cid,r->native,r->stage,r->usb);
+    int ok=n>0 && (size_t)n<sizeof(data);
+    if (ok) {
+        int wrote=0;
+        while (wrote<n) {
+            ssize_t w=write(fd,data+wrote,(size_t)(n-wrote));
+            if (w<0 && errno==EINTR) continue;
+            if (w<=0) {ok=0;break;}
+            wrote+=(int)w;
+        }
+    }
+    if (ok && fsync(fd)) ok=0;
+    close(fd);
+    if (!ok || rename(tmp,journal)) {unlink(tmp);return -1;}
+    int dfd=open(STATE_DIR,O_RDONLY);if (dfd>=0){fsync(dfd);close(dfd);}
+    return 0;
+}
+/* Move the huge file to a sibling, not under native/, so it remains accessible
+ * even after native/ is covered by nullfs. Never cross filesystems. */
+static int offload_held(const offload_record_t *r, char *held,size_t cap) {
+    char parent[PATH_MAX];snprintf(parent,sizeof(parent),"%s",r->native);
+    char *end=strrchr(parent,'/');if(!end)return -1;*end=0;
+    snprintf(held,cap,"%s/.ps4mount-held/%s.pkg",parent,r->cid+20);
+    return 0;
+}
+static int offload_confirm_overlay(const offload_record_t *r) {
+    char pkg[PATH_MAX],target[PATH_MAX];
+    snprintf(pkg,sizeof(pkg),"%s/ac.pkg",r->native);
+    ssize_t n=readlink(pkg,target,sizeof(target)-1);
+    if(n<=0)return -1;target[n]=0;
+    return strcmp(target,r->usb) || top_layer(r->native,r->stage)!=1 ||
+           owned_layer_count(r->native,r->stage)!=1 ? -1 : 0;
+}
+static int offload_reconnect(const offload_record_t *r,int finish_held) {
+    char pkg[PATH_MAX],held[PATH_MAX];
+    struct stat st;
+    snprintf(pkg,sizeof(pkg),"%s/ac.pkg",r->native);
+    offload_held(r,held,sizeof(held));
+    struct stat held_st, pkg_st;
+    if (!lstat(held,&held_st) && S_ISREG(held_st.st_mode) &&
+        (lstat(pkg,&pkg_st) || (S_ISREG(pkg_st.st_mode) && pkg_st.st_size == 0)) &&
+        top_layer(r->native,r->stage) == 0) {
+        /* Journal was created but deletion was not committed. Always prefer
+         * restoring the huge original over leaving an accidental empty stub. */
+        if (!lstat(pkg,&pkg_st) && unlink(pkg)) return -1;
+        if (rename(held,pkg)) return -1;
+        printf("[offload] %s interrupted staging rolled back to full native PKG\n",r->cid);
+        return -1;
+    }
+    if (stat(r->usb,&st) || !S_ISREG(st.st_mode) || !st.st_size) {
+        printf("[offload] %s USB PKG unavailable or empty: %s\n",r->cid,r->usb);
+        return -1;
+    }
+    /* USB mount points can be reused for another disk; verify that the saved
+     * file still has the same content ID, not just the same pathname. */
+    pkg_t pkg_verify={0};
+    if (pkg_open(&pkg_verify,r->usb)) {
+        printf("[offload] %s USB package could not be parsed\n",r->cid);
+        return -1;
+    }
+    int same_cid=!strcmp(pkg_verify.content_id,r->cid);
+    pkg_close(&pkg_verify);
+    if (!same_cid) {
+        printf("[offload] %s USB path now points to another package; not mounting\n",r->cid);
+        return -1;
+    }
+    if (top_layer(r->native,r->stage)==1) {
+        if (offload_confirm_overlay(r))return -1;
+    } else {
+        if (layers_on(r->native) || dead_layer(r->native)) return -1;
+        if (stat(r->usb,&st) || !S_ISREG(st.st_mode) || !st.st_size) {
+            printf("[offload] %s USB absent; cannot activate blank SSD stub\n",r->cid);
+            return -1;
+        }
+        if (lstat(pkg,&st) || !S_ISREG(st.st_mode) || st.st_size) {
+            printf("[offload] %s native stub missing/invalid; not mounting\n",r->cid);
+            return -1;
+        }
+        if (nullfs_mount(r->stage,r->native) || offload_confirm_overlay(r)) return -1;
+    }
+    if (finish_held && !lstat(held,&st) && S_ISREG(st.st_mode)) {
+        /* A previous run was interrupted after mount. Only finalize if DB is
+         * registered and our USB overlay is validated again. */
+        const char *id=r->cid;int registered=-1;
+        db_dlc_registration(&id,1,&registered);
+        if (registered!=1 || offload_confirm_overlay(r))return -1;
+        if (unlink(held))return -1;
+        printf("[offload] %s interrupted transaction completed: held SSD file deleted\n",id);
+    }
+    printf("[offload] ACTIVE %s: native ac.pkg is 0 bytes under the overlay; USB=%s\n",r->cid,r->usb);
+    return 0;
+}
+static int offload_locate_native(const char *tid,const char *label,char *dst,size_t cap) {
+    char path[PATH_MAX]; struct stat st;
+    /* Prefer real native directories (especially the expansion SSD); skip an
+     * external nullfs layer masquerading as an installed DLC. */
+    for (int i=0;i<9;i++) {
+        if (i<8)snprintf(path,sizeof(path),"/mnt/ext%d/user/addcont/%s/%s",i,tid,label);
+        else snprintf(path,sizeof(path),"/user/addcont/%s/%s",tid,label);
+        if (layers_on(path) || dead_layer(path))continue;
+        char pkg[PATH_MAX];snprintf(pkg,sizeof(pkg),"%s/ac.pkg",path);
+        if(!lstat(pkg,&st) && S_ISREG(st.st_mode) && st.st_size>0) {
+            snprintf(dst,cap,"%s",path);return 0;
+        }
+    }
+    return -1;
+}
+static int offload_one(const dlc_src_t *dlc,const char *tid) {
+    const char *cid=dlc->pkg.content_id;
+    char journal[PATH_MAX],pkg[PATH_MAX],held[PATH_MAX],root[32];
+    offload_record_t rec={0};struct stat st;
+    if (!offload_cid_valid(cid) || strncmp(cid+7,tid,9) || title_running(tid))return -1;
+    offload_journal_path(cid,journal,sizeof(journal));
+    if (exists(journal)) {
+        if (offload_read(journal,&rec) || strcmp(rec.usb,dlc->path)) {
+            printf("[offload] %s invalid/stale journal or different USB device; no deletion\n",cid);
+            return -1;
+        }
+        /* If this title was unregistered then reinstalled, the installer may
+         * have recreated the large native PKG. Re-run verified offload rather
+         * than treating a stale zero-stub journal as current. */
+        char oldpkg[PATH_MAX];struct stat oldst;
+        snprintf(oldpkg,sizeof(oldpkg),"%s/ac.pkg",rec.native);
+        if (top_layer(rec.native,rec.stage)==0 && !lstat(oldpkg,&oldst) &&
+            S_ISREG(oldst.st_mode) && oldst.st_size>0) {
+            printf("[offload] %s native file recreated after reinstallation; refreshing journal\n",cid);
+            if (unlink(journal))return -1;
+        } else return offload_reconnect(&rec,1);
+    }
+    if (find_root(tid,root,sizeof(root)) || !is_mountpoint(root))return -1;
+    snprintf(rec.cid,sizeof(rec.cid),"%s",cid);
+    snprintf(rec.usb,sizeof(rec.usb),"%s",dlc->path);
+    snprintf(rec.stage,sizeof(rec.stage),HOLD_DIR "/offload/%s/%s",tid,cid+20);
+    if (offload_locate_native(tid,cid+20,rec.native,sizeof(rec.native))) {
+        printf("[offload] %s no native ac.pkg found after successful DB registration\n",cid);
+        return -1;
+    }
+    snprintf(pkg,sizeof(pkg),"%s/ac.pkg",rec.native);
+    offload_held(&rec,held,sizeof(held));
+    if (!lstat(held,&st)) {printf("[offload] %s stale held file: manual recovery needed\n",cid);return -1;}
+    if (redirect_same_file_bytes(pkg,rec.usb)) {
+        printf("[offload] %s SSD/USB PKG differs or IO error; preserving SSD\n",cid);
+        return -1;
+    }
+    printf("[offload] %s NATIVE/USB MATCH; preparing redirect\n",cid);
+    mkdirs(rec.stage,0770);
+    const char *meta[]={"ac.json","ac.pbm","ac.pbm.backup"};
+    for (int i=0;i<3;i++) if (redirect_copy_meta(rec.native,rec.stage,meta[i]))return -1;
+    char link[PATH_MAX];snprintf(link,sizeof(link),"%s/ac.pkg",rec.stage);
+    if (!lstat(link,&st) && !S_ISLNK(st.st_mode))return -1;
+    if ((!lstat(link,&st) && unlink(link)) || symlink(rec.usb,link))return -1;
+    if (layers_on(rec.native) || dead_layer(rec.native) || !offload_record_valid(&rec))return -1;
+    /* Write-ahead journal must be durable BEFORE rename / stub creation. */
+    if (offload_write(&rec)) {
+        printf("[offload] %s cannot persist journal; SSD untouched\n",cid);return -1;
+    }
+    int moved=0, stub=0, mounted=0;
+    char dir[PATH_MAX];snprintf(dir,sizeof(dir),"%s",held);
+    char *slash=strrchr(dir,'/');if(!slash)goto rollback;*slash=0;
+    mkdirs(dir,0770);
+    if(rename(pkg,held))goto rollback;
+    moved=1;
+    int fd=open(pkg,O_CREAT|O_EXCL|O_WRONLY,0600);
+    if (fd<0)goto rollback;
+    stub=1;
+    if (fsync(fd)) {close(fd);goto rollback;}
+    close(fd);
+    if(nullfs_mount(rec.stage,rec.native))goto rollback;
+    mounted=1;
+    if(offload_confirm_overlay(&rec))goto rollback;
+    /* Only now is deletion allowed. Native PKG still has a zero-size entry
+     * under nullfs; the huge original lives at held until this unlink. */
+    if(unlink(held)) {
+        printf("[offload] %s mounted, but held-file unlink failed; retry on next mount\n",cid);
+        return -1;
+    }
+    printf("[offload] DONE %s SSD bytes released, native stub 0 bytes, real PKG served by USB\n",cid);
+    return 0;
+rollback:
+    printf("[offload] %s operation failed; attempting rollback errno=%d\n",cid,errno);
+    if(mounted && top_layer(rec.native,rec.stage)==1) {
+        if(unmount(rec.native,0)) {
+            printf("[offload] %s rollback blocked by mounted layer; journal preserved\n",cid);
+            return -1;
+        }
+    }
+    if(stub && unlink(pkg))return -1;
+    if(moved && rename(held,pkg)) {
+        printf("[offload] %s CRITICAL: held copy preserved at %s\n",cid,held);
+        return -1;
+    }
+    unlink(journal);
+    return -1;
+}
+static int offload_resume_title(const char *tid) {
+    if (title_running(tid))return -1;
+    DIR *dir=opendir(STATE_DIR);if(!dir)return -1;
+    int result=0;struct dirent *e;
+    while ((e=readdir(dir))) {
+        if (strncmp(e->d_name,"offload_",8) || strlen(e->d_name)!=8+36+4 ||
+            strcmp(e->d_name+44,".txt"))continue;
+        char journal[PATH_MAX];snprintf(journal,sizeof(journal),STATE_DIR "/%s",e->d_name);
+        offload_record_t rec;
+        if (offload_read(journal,&rec)) {printf("[offload] invalid journal %s\n",journal);result=-1;continue;}
+        if(strncmp(rec.cid+7,tid,9))continue;
+        const char *id=rec.cid;int registered=-1;
+        db_dlc_registration(&id,1,&registered);
+        if (registered!=1) {
+            printf("[offload] %s no current DB registration; remount postponed\n",id);result=-1;continue;
+        }
+        if (offload_reconnect(&rec,1))result=-1;
+    }
+    closedir(dir);
+    return result;
+}
+static void offload_resume_all(void) {
+    DIR *d=opendir(STATE_DIR);if(!d)return;
+    char (*tids)[10]=calloc(MAX_TITLES,sizeof(*tids));int n=0;
+    struct dirent *e;
+    while (tids && (e=readdir(d)) && n<MAX_TITLES) {
+        if (strncmp(e->d_name,"offload_",8) || strlen(e->d_name)!=48 ||
+            strcmp(e->d_name+44,".txt"))continue;
+        char tid[10];snprintf(tid,sizeof(tid),"%.9s",e->d_name+8+7);
+        int existing=0;for(int i=0;i<n;i++)if(!strcmp(tids[i],tid))existing=1;
+        if(!existing)snprintf(tids[n++],10,"%s",tid);
+    }
+    closedir(d);
+    for(int i=0;i<n;i++)if(active_status(tids[i]) && !title_running(tids[i]))
+        offload_resume_title(tids[i]);
+    free(tids);
+}
+static int offload_unmount_title(const char *tid) {
+    DIR *d=opendir(STATE_DIR);if(!d)return 0;
+    struct dirent *e;int failed=0;
+    while((e=readdir(d))) {
+        if(strncmp(e->d_name,"offload_",8) || strlen(e->d_name)!=48 || strcmp(e->d_name+44,".txt"))continue;
+        char path[PATH_MAX];snprintf(path,sizeof(path),STATE_DIR "/%s",e->d_name);
+        offload_record_t rec;if(offload_read(path,&rec)) {failed=1;continue;}
+        if(strncmp(rec.cid+7,tid,9))continue;
+        int top=top_layer(rec.native,rec.stage), count=owned_layer_count(rec.native,rec.stage);
+        if(top==1 && count==1) {
+            if(unmount(rec.native,0))failed=1;
+            else printf("[offload] %s layer released; native stub still zero; journal kept\n",rec.cid);
+        } else if(top || count)failed=1;
+    }
+    closedir(d);
+    return failed?-1:0;
+}
+
 int app_restore_native_dlc(const char *tid, char *msg, size_t cap) {
     if (strcmp(tid, REDIRECT_TID)) {
         snprintf(msg, cap, "Teste restrito a " REDIRECT_TID);
@@ -3973,6 +4237,7 @@ int main(void) {
     time_t last_usb_check = 0;
     int restore_on_reconnect = 0;
     int previously_active = restore_active_games();
+    offload_resume_all();
     for (int i = 0; i < 10; ++i) {
         char root[32];
         if (i < 8) snprintf(root, sizeof(root), "/mnt/usb%d", i);
@@ -4027,8 +4292,7 @@ int main(void) {
         if (!g_deleting && g_activate_request[0]) activate_queued();
         if (!g_deleting && g_dlc_register_request[0]) register_dlcs_queued();
         if (!g_deleting && g_dlc_install_request[0]) install_dlcs_queued();
-        if (!g_deleting && g_probe_request.tid[0]) probe_dlc_queued();
-        pump_events(1000);
+                pump_events(1000);
         /* Lightweight USB polling: no PKG walk. Restore only known, active titles
          * after a genuinely new storage mount appears. Never discover automatically. */
         time_t now = time(NULL);
@@ -4067,6 +4331,7 @@ int main(void) {
             !g_activate_request[0] && !g_dlc_register_request[0] && !g_restore_running &&
             strcmp(g_progress.phase, "searching") && strcmp(g_progress.phase, "activating") &&
             strcmp(g_progress.phase, "registering_dlcs") && strcmp(g_progress.phase, "dlc_register_queued")) {
+            offload_resume_all();
             restore_on_reconnect = 0;
             printf("[usb] newly connected storage; restoring previously active titles only\n");
             restore_active_games();

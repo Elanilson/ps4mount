@@ -1,3 +1,7 @@
+## Alterações locais v0.4.20 (proposta experimental)
+
+Interface por jogo: **Montar / Desmontar**. Montar faz registro do jogo + instalação nativa individual dos DLCs ainda não registrados + comparação e offload para USB, substituindo o ac.pkg nativo por entrada vazia de 0 bytes sob nullfs. Desmontar remove o jogo da biblioteca por chamada direcionada. **Ainda não comprovado no PS5**; veja [TESTE-0420-UM-CLIQUE.md](TESTE-0420-UM-CLIQUE.md).
+
 **v0.4.19**: experimentos direcionados M1–M5 de registro de um DLC sem instalacao nativa; veja [TESTES-REGISTRO-DLC-0419.md](TESTES-REGISTRO-DLC-0419.md). Nenhum metodo experimental comprovado no PS5.
 
 # PS4Mount v0.4.15 — DLC nativo ↔ USB (experimento reversível)
