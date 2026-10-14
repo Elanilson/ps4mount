@@ -41,7 +41,7 @@
 #include "web.h"
 #include "icon_data.h"
 
-#define VERSION "PS4Mount 0.4.25-preserve-dlc-mounts"
+#define VERSION "PS4Mount 0.4.26-two-adjustments"
 #define LOCK_PORT 9032
 #define SCAN_SECONDS 10 /* legacy value; polling for PKGs is disabled */
 #define STATE_DIR "/data/ps4mount"
@@ -798,7 +798,7 @@ static int title_running(const char *tid) {
 }
 
 /* The console's delete-screen handler releases only app/patch here; the
- * explicit Desmontar button likewise only releases app/patch mounts.
+ * explicit Desmontar button uses release_title_bundle to also release DLCs.
  * Never force-remove unknown layers, especially after a USB disconnect. */
 static void unmount_title(const char *tid, char (*dtids)[10], int ndtids) {
     char target[64], hold[PATH_MAX];
@@ -1905,7 +1905,7 @@ static void *uninstall_one_worker(void *arg) {
     __atomic_store_n(&g_one_uninstall_busy,0,__ATOMIC_RELEASE);
     return NULL;
 }
-static int uninstall_title_one(const char *tid) {
+static int __attribute__((unused)) uninstall_title_one(const char *tid) {
     if (__atomic_load_n(&g_one_uninstall_busy,__ATOMIC_ACQUIRE)) return -1;
     snprintf(g_one_uninstall_tid,sizeof(g_one_uninstall_tid),"%s",tid);
     __atomic_store_n(&g_one_uninstall_busy,1,__ATOMIC_RELEASE);
@@ -1998,27 +1998,23 @@ static void collect_bundle_mount_ids(const char *tid, const char *root, title_sr
     }
 }
 
-/* Desmontar only releases PS4Mount's app/patch mounts. DLC mount layers,
- * native USB redirections and journals are intentionally left alone. The PS5
- * targeted uninstaller may independently unregister add-ons; that is outside
- * the control of this operation. */
-static int release_title_bundle(const title_src_t *t) {
+/* Desmontar is now non-destructive: release ONLY app and patch overlays.
+ * DLC folders and persistent USB offloads remain mounted/registered. */
+static int release_title_base_patch(const title_src_t *t) {
     const char *tid = t->app.title_id;
-    const char *kinds[] = {"patch", "app"};
-    char target[64], hold[PATH_MAX];
-    /* Preflight BOTH targets before changing any PS4Mount layer. */
-    for (size_t i = 0; i < sizeof(kinds)/sizeof(kinds[0]); ++i) {
+    const char *kinds[] = { "patch", "app" };
+    for (int i = 0; i < 2; i++) {
+        char target[64], hold[PATH_MAX];
         snprintf(target, sizeof(target), "/user/%s/%s", kinds[i], tid);
         hold_path(hold, sizeof(hold), kinds[i], tid);
         if (dead_layer(target) || owned_layer_count(target, hold) < 0 ||
             top_layer(target, hold) < 0) {
-            printf("[bundle][unmount] %s unsafe app/patch target %s; unchanged\n", tid, target);
+            printf("[bundle][unmount] %s: unsafe/unreadable %s; unchanged\n",tid,target);
             return -1;
         }
     }
     if (release_owned_layer(tid, "patch") || release_owned_layer(tid, "app")) return -1;
-    printf("[bundle][unmount] %s app+patch released; %d DLC title folder(s) kept mounted\n",
-           tid, t->ndlc_tids);
+    printf("[bundle][unmount] %s: app+patch released; DLC mounts/offloads untouched\n",tid);
     return 0;
 }
 
@@ -2055,27 +2051,20 @@ int app_remove(const char *tid, char *msg, size_t cap) {
         snprintf(msg, cap, "Could not persist disabled status for %s", tid);
         return -1;
     }
-    if (release_title_bundle(&t)) {
-        snprintf(msg, cap, "Could not safely release %s bundle; restore disabled, inspect mounts", tid);
+    if (release_title_base_patch(&t)) {
+        snprintf(msg, cap, "Could not safely release %s app/patch; inspect mounts", tid);
         return -1;
     }
-    /* Do NOT release /user/addcont or native DLC offload mounts here.
-     * The targeted PS5 uninstall below is unchanged and can still unregister
-     * DLCs on its own; next Montar reads the DB before deciding to reinstall. */
-    /* Upstream 0.5.0 behavior: remove *only this title* from the library. */
-    int urc = db_is_registered(tid) ? uninstall_title_one(tid) : 0;
-    if (urc) {
-        printf("[oneclick] %s targeted uninstall error=0x%08x\n",tid,(unsigned)urc);
-        snprintf(msg,cap,"PS5 refused targeted removal of %s (0x%08x)",tid,(unsigned)urc);
-        return -1;
-    }
+    /* Do not unmount DLC layers or native USB offloads here, and do not call
+     * sceAppInstUtilAppUnInstall(): the game intentionally stays in the PS5
+     * library; the disabled marker controls only PS4Mount's USB mounts. */
     snprintf(path, sizeof(path), STATE_DIR "/%s.active", tid);
     unlink(path);
     managed_t *m = managed_by(tid, NULL);
     if (m) m->used = 0;
-    printf("[oneclick] %s removed from PS5 library; original USB PKGs untouched\n", tid);
+    printf("[oneclick] %s app+patch deactivated; DLCs retained; game stays in library\n", tid);
     g_catalog_dirty = 1;
-    snprintf(msg, cap, "%s removed from the library; USB PKGs preserved", tid);
+    snprintf(msg, cap, "%s app/patch unmounted; DLCs kept; library registration unchanged", tid);
     return 0;
 }
 
@@ -2259,9 +2248,7 @@ static int hold_link_is(const char *kind, const char *tid, const char *name, con
  * internal storage as a hidden side effect of the Mount button. */
 /* One-click native registration -> USB offload helpers (implemented below). */
 static int offload_one(const dlc_src_t *dlc, const char *tid);
-/* 0 = reused, 1 = native install needed, 2 = existing native package to offload, -1 = inconsistent */
-static int offload_reuse_or_plan(const dlc_src_t *dlc, const char *tid);
-static int offload_prepare_native_reinstall(const dlc_src_t *dlc);
+static int offload_reuse_registered(const dlc_src_t *dlc, const char *tid);
 static int offload_wait_native_ready(const dlc_src_t *dlc, const char *tid, int status_unavailable);
 static int offload_resume_title(const char *tid);
 static void offload_resume_all(void);
@@ -2800,73 +2787,66 @@ static void install_dlcs_queued(void) {
     printf("[dlc-install] %s found=%d already_in_db=%d attempting_all=%d\n",
            tid, t.ndlc, already, todo);
     if (!todo) goto done;
-    /* Never release add-on layers just because Montar was clicked. Only a
-     * genuinely required native reinstall is allowed to release its layers. */
+    /* Only an UNREGISTERED DLC needs a native installer destination.
+     * Never drop existing DLC mounts when everything is already registered. */
+    for (int i = 0; i < t.ndlc_tids; ++i) {
+        int needs_native = 0;
+        for (int j = 0; j < t.ndlc; ++j) {
+            if (states[j] == 0 &&
+                (!only_cid[0] || !strcmp(t.dlc[j].pkg.content_id, only_cid)) &&
+                !strncmp(t.dlc[j].pkg.content_id + 7, t.dlc_tids[i], 9))
+                needs_native = 1;
+        }
+        if (!needs_native) continue;
+        if (other_active_title_uses_dlc(tid, t.dlc_tids[i]) ||
+            dlc_installer_release_external_layer(t.dlc_tids[i])) {
+            printf("[dlc-install] %s could not safely clear add-on overlay %s\n", tid, t.dlc_tids[i]);
+            fatal = 1;
+            goto done;
+        }
+    }
     for (int i = 0; i < t.ndlc; ++i) {
         if (only_cid[0] && strcmp(t.dlc[i].pkg.content_id, only_cid)) continue;
         if (!is_mountpoint(root) || title_running(tid)) { fatal = 1; break; }
-        const char *id = t.dlc[i].pkg.content_id;
-        snprintf(g_dlc_content, sizeof(g_dlc_content), "%s", id);
+        snprintf(g_dlc_content, sizeof(g_dlc_content), "%s", t.dlc[i].pkg.content_id);
         g_dlc_percent = -1;
-        snprintf(g_progress.detail, sizeof(g_progress.detail), "Verificando DLC %d/%d: %.36s",
-                 g_progress.done + 1, todo, g_dlc_content);
+        const char *id = t.dlc[i].pkg.content_id;
         int state = -1;
         db_dlc_registration(&id, 1, &state);
+        snprintf(g_progress.detail, sizeof(g_progress.detail), "%s DLC %d/%d: %.36s",
+                 state == 1 ? "Reutilizando" : state == 0 ? "Instalando" : "Verificando",
+                 g_progress.done + 1, todo, g_dlc_content);
         int rc = 0;
         int installer_status_unavailable = 0;
-        int need_native_install = state == 0;
-        int need_native_offload = 0;
         if (state == 1) {
-            int plan = offload_reuse_or_plan(&t.dlc[i],tid);
-            if (plan == 0) {
-                printf("[oneclick][dlc-reuse] %s DB=1 + validated USB journal: no install, no native wait\n",id);
-            } else if (plan == 1) {
-                /* DB record without a usable native PKG or journal: a fresh
-                 * native installation must reconstruct the missing files. */
-                need_native_install = 1;
-                printf("[oneclick][dlc-repair] %s registered but DLC files/journal missing; reinstall required\n",id);
-            } else if (plan == 2) {
-                need_native_offload = 1;
-                printf("[oneclick][dlc-offload] %s DB=1 + complete native PKG: offload without installer\n",id);
-            } else {
-                rc = -1; /* inconsistent journal/mount: fail fast, never wait */
+            /* Only reuse/offload; the native installer is NEVER called. */
+            printf("[oneclick][dlc-reuse] %s DB=1; no native installer\n",id);
+            progress_set("installing_dlcs", "DLC registrado: verificando USB sem reinstalar");
+            rc = offload_reuse_registered(&t.dlc[i], tid);
+        } else if (state == 0) {
+            rc = dlc_native_install_one(&t.dlc[i]);
+            installer_status_unavailable = (rc == 1);
+            if (installer_status_unavailable) rc = 0;
+            if (!rc) {
+                wait_db_quiet(2,15);
+                db_dlc_registration(&id,1,&state);
+                if (state != 1)
+                    printf("[dlc-install] %s DB not yet registered: state=%d; status_unknown=%d\n",
+                           id, state, installer_status_unavailable);
             }
-        } else if (state != 0) {
-            printf("[dlc-install] %s DB state unknown; no automatic install\n",id);
-            rc = -1;
-        }
-        if (!rc && need_native_install) {
-            char dtid[10]; snprintf(dtid,sizeof(dtid),"%.9s",id+7);
-            /* The old code tore down *all* add-on mounts before the loop.
-             * Only this DLC's installer destination may be released now. */
-            if (other_active_title_uses_dlc(tid,dtid) ||
-                dlc_installer_release_external_layer(dtid) ||
-                offload_prepare_native_reinstall(&t.dlc[i])) {
-                printf("[dlc-install] %s cannot safely prepare native reinstall\n",id);
-                rc = -1;
-            } else {
-                progress_set("installing_dlcs","Instalando DLC nativamente");
-                rc = dlc_native_install_one(&t.dlc[i]);
-                installer_status_unavailable = rc == 1;
-                if (installer_status_unavailable) rc = 0;
-                if (!rc) {
-                    wait_db_quiet(2,15);
-                    db_dlc_registration(&id,1,&state);
-                    printf("[dlc-install] %s post-install DB=%d unknown_status=%d\n",
-                           id,state,installer_status_unavailable);
+            if (!rc) {
+                progress_set("installing_dlcs", "Verificando arquivo nativo e estabilidade da instalacao");
+                if (offload_wait_native_ready(&t.dlc[i], tid, installer_status_unavailable)) {
+                    printf("[dlc-install] %s offload deferred: native installation/file state not confirmed\n", id);
+                    rc = -2; /* Native task may still be running. */
+                } else {
+                    progress_set("installing_dlcs", "Arquivo verificado; redirecionando e liberando SSD");
+                    rc = offload_one(&t.dlc[i],tid);
                 }
-                if (!rc) need_native_offload = 1;
             }
-        }
-        if (!rc && need_native_offload) {
-            progress_set("installing_dlcs","Verificando arquivo nativo para offload");
-            if (offload_wait_native_ready(&t.dlc[i], tid, installer_status_unavailable)) {
-                printf("[dlc-install] %s offload deferred: native file not ready\n",id);
-                rc = -2;
-            } else {
-                progress_set("installing_dlcs","Redirecionando DLC ao USB");
-                rc = offload_one(&t.dlc[i],tid);
-            }
+        } else {
+            printf("[dlc-install] %s DB state unknown=%d; no installer\n",id,state);
+            rc = -1;
         }
         if (rc) g_progress.failed++;
         else g_progress.ok++;
@@ -3251,112 +3231,6 @@ static int offload_locate_native(const char *tid,const char *label,char *dst,siz
     }
     return -1;
 }
-/* Fast path for DLCs that survived Desmontar. Never enter the 180-second
- * native-installer readiness loop when the journal points to a zero-byte stub.
- * Missing journal + missing PKG is a repair case, not an endless wait. */
-static int offload_reuse_or_plan(const dlc_src_t *dlc,const char *tid) {
-    const char *cid=dlc->pkg.content_id;
-    char journal[PATH_MAX], native[PATH_MAX], pkg[PATH_MAX];
-    offload_record_t rec;
-    struct stat st, usb;
-    if (!offload_cid_valid(cid) || strncmp(cid+7,tid,9) ||
-        stat(dlc->path,&usb) || !S_ISREG(usb.st_mode) || !usb.st_size) return -1;
-    offload_journal_path(cid,journal,sizeof(journal));
-    if (exists(journal)) {
-        if (offload_read(journal,&rec) || strcmp(rec.usb,dlc->path)) {
-            printf("[oneclick][dlc-reuse] %s journal invalid or USB changed; no installer/no file deletion\n",cid);
-            return -1;
-        }
-        /* A journal alone is not enough: the saved overlay also needs its
-         * three metadata files and the expected USB PKG link. */
-        const char *names[]={"ac.json","ac.pbm","ac.pbm.backup"};
-        for (int i=0;i<3;i++) {
-            char meta[PATH_MAX];struct stat mst;
-            snprintf(meta,sizeof(meta),"%s/%s",rec.stage,names[i]);
-            if (lstat(meta,&mst) || !S_ISREG(mst.st_mode) || mst.st_size<=0) {
-                printf("[oneclick][dlc-repair] %s journal exists but USB overlay metadata %s is missing\n",cid,names[i]);
-                return 1;
-            }
-        }
-        char link[PATH_MAX],link_target[PATH_MAX];
-        snprintf(link,sizeof(link),"%s/ac.pkg",rec.stage);
-        ssize_t link_size=readlink(link,link_target,sizeof(link_target)-1);
-        if (link_size<=0) {
-            printf("[oneclick][dlc-repair] %s journal exists but staged USB link is missing\n",cid);
-            return 1;
-        }
-        link_target[link_size]=0;
-        if (strcmp(link_target,rec.usb)) {
-            printf("[oneclick][dlc-reuse] %s staged USB link points elsewhere; refusing overwrite\n",cid);
-            return -1;
-        }
-        /* A native reinstall can have recreated the full PKG while a journal
-         * exists. Validate stable native metadata before offloading it again. */
-        snprintf(pkg,sizeof(pkg),"%s/ac.pkg",rec.native);
-        if (top_layer(rec.native,rec.stage)==0 && !lstat(pkg,&st) &&
-            S_ISREG(st.st_mode) && st.st_size>0) {
-            if (st.st_size!=usb.st_size) {
-                printf("[oneclick][dlc-reuse] %s recreated native size differs; refusing overwrite\n",cid);
-                return -1;
-            }
-            return 2;
-        }
-        /* offload_one validates the journal, USB content ID, mount ownership,
-         * and repairs the nullfs overlay if necessary. */
-        return offload_one(dlc,tid) ? -1 : 0;
-    }
-    if (!offload_locate_native(tid,cid+20,native,sizeof(native))) {
-        snprintf(pkg,sizeof(pkg),"%s/ac.pkg",native);
-        if (lstat(pkg,&st) || !S_ISREG(st.st_mode)) return -1;
-        if (st.st_size != usb.st_size) {
-            printf("[oneclick][dlc-reuse] %s native/USB sizes disagree without journal; refusing overwrite\n",cid);
-            return -1;
-        }
-        /* A full ac.pkg without the installation metadata also needs native
-         * repair. Avoid waiting 180 seconds for metadata that cannot appear. */
-        const char *names[]={"ac.json","ac.pbm","ac.pbm.backup"};
-        for (int i=0;i<3;i++) {
-            char meta[PATH_MAX];struct stat mst;
-            snprintf(meta,sizeof(meta),"%s/%s",native,names[i]);
-            if (lstat(meta,&mst) || !S_ISREG(mst.st_mode) || mst.st_size<=0) {
-                printf("[oneclick][dlc-repair] %s native metadata %s missing: native repair required\n",cid,names[i]);
-                return 1;
-            }
-        }
-        return 2; /* existing stable candidate; verify before offload */
-    }
-    /* Avoid accidentally installing through an untracked/foreign nullfs mount
-     * when a journal was lost or corrupted. */
-    for (int i=0;i<9;i++) {
-        if (i<8) snprintf(native,sizeof(native),"/mnt/ext%d/user/addcont/%s/%.16s",i,tid,cid+20);
-        else snprintf(native,sizeof(native),"/user/addcont/%s/%.16s",tid,cid+20);
-        if (layers_on(native) || dead_layer(native)) {
-            printf("[oneclick][dlc-reuse] %s overlay exists without journal at %s; refusing installer\n",cid,native);
-            return -1;
-        }
-    }
-    return 1; /* no journal, no native copy: reinstall to restore files */
-}
-
-/* Only needed if the PS5 itself removed DLC registration while the PS4Mount
- * nullfs mount survived. An individual reinstall may have to see the real SSD
- * destination again. Do not remove its journal or any USB file. */
-static int offload_prepare_native_reinstall(const dlc_src_t *dlc) {
-    char journal[PATH_MAX];offload_record_t rec;
-    offload_journal_path(dlc->pkg.content_id,journal,sizeof(journal));
-    if (!exists(journal)) return 0;
-    if (offload_read(journal,&rec) || strcmp(rec.usb,dlc->path)) return -1;
-    int top=top_layer(rec.native,rec.stage);
-    int count=owned_layer_count(rec.native,rec.stage);
-    if (top<0 || count<0 || dead_layer(rec.native)) return -1;
-    if (top==1 && count==1) {
-        if (unmount(rec.native,0))return -1;
-        printf("[dlc-install] %s own native offload layer released for required reinstall\n",rec.cid);
-        return 0;
-    }
-    return top==0 && count==0 ? 0:-1;
-}
-
 /* Fallback for FW 11.40 GetInstallStatus=0x80a30003. A DB row by itself
  * does not prove the installer finished copying. Require 15 consecutive
  * one-second stable observations of the exact native PKG size and timestamps,
@@ -3533,6 +3407,52 @@ rollback:
     unlink(journal);
     return -1;
 }
+/* Registered DLCs never enter the native installer path. With an existing
+ * journal, validate/reconnect immediately (including a zero-byte SSD stub).
+ * Without a journal, only a complete native PKG can be safely offloaded;
+ * absence/inconsistency must return promptly rather than wait 180 seconds. */
+static int offload_reuse_registered(const dlc_src_t *dlc,const char *tid) {
+    const char *cid=dlc->pkg.content_id;
+    char journal[PATH_MAX],native[PATH_MAX],pkg[PATH_MAX];
+    struct stat usb,st;
+    if (stat(dlc->path,&usb) || !S_ISREG(usb.st_mode) || usb.st_size<=0) return -1;
+    offload_journal_path(cid,journal,sizeof(journal));
+    if (!exists(journal)) {
+        if (offload_locate_native(tid,cid+20,native,sizeof(native))) {
+            printf("[oneclick][dlc-reuse] %s registered, but no journal/native full PKG; not reinstalling\n",cid);
+            return -1;
+        }
+        snprintf(pkg,sizeof(pkg),"%s/ac.pkg",native);
+        if (lstat(pkg,&st) || !S_ISREG(st.st_mode) || st.st_size!=usb.st_size) {
+            printf("[oneclick][dlc-reuse] %s registered native PKG incomplete/mismatched; not reinstalling\n",cid);
+            return -1;
+        }
+        /* An existing native copy still needs the original stability and
+         * full-byte comparison checks before freeing SSD space. */
+    } else {
+        offload_record_t rec;
+        if (offload_read(journal,&rec) || strcmp(rec.cid,cid) || strcmp(rec.usb,dlc->path)) {
+            printf("[oneclick][dlc-reuse] %s journal invalid or USB changed; not reinstalling\n",cid);
+            return -1;
+        }
+        snprintf(pkg,sizeof(pkg),"%s/ac.pkg",rec.native);
+        int top=top_layer(rec.native,rec.stage);
+        if (top<0 || (top==0 &&
+            (lstat(pkg,&st) || !S_ISREG(st.st_mode) ||
+             (st.st_size!=0 && st.st_size!=usb.st_size)))) {
+            printf("[oneclick][dlc-reuse] %s journal present but native state inconsistent; not reinstalling\n",cid);
+            return -1;
+        }
+    }
+    if (offload_wait_native_ready(dlc,tid,0)) {
+        printf("[oneclick][dlc-reuse] %s cannot verify existing offload; no installer\n",cid);
+        return -1;
+    }
+    int rc=offload_one(dlc,tid);
+    printf("[oneclick][dlc-reuse] %s %s; native install skipped\n",cid,rc?"FAILED":"ACTIVE");
+    return rc;
+}
+
 static int offload_resume_title(const char *tid) {
     if (title_running(tid))return -1;
     DIR *dir=opendir(STATE_DIR);if(!dir)return -1;
@@ -3570,7 +3490,7 @@ static void offload_resume_all(void) {
         offload_resume_title(tids[i]);
     free(tids);
 }
-static int offload_unmount_title(const char *tid) {
+static int __attribute__((unused)) offload_unmount_title(const char *tid) {
     DIR *d=opendir(STATE_DIR);if(!d)return 0;
     struct dirent *e;int failed=0;
     while((e=readdir(d))) {

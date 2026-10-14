@@ -402,3 +402,14 @@ Veja [TESTE-SEQUENCIAL-0417.md](TESTE-SEQUENCIAL-0417.md). O fluxo verifica, mon
 ## v0.4.18 — piloto God of War (1 DLC)
 
 Veja `TESTE-GOW-1-DLC-0418.md`. Instalacao nativa selecionada, redirecionamento reversivel individual, preservacao do PKG e recuperacao via journal. O teste nao libera espaco e nao usa AppInstallAll.
+
+## v0.4.26 — Desmontagem simples e DLCs sem reinstalação quando registrados
+
+Esta versão parte da v0.4.21. `Desmontar` libera somente as montagens controladas
+pelo PS4Mount do jogo e da atualização, sem desinstalar o título da biblioteca
+nem soltar montagens dos DLCs. O ícone continua no PS5, mas o jogo só deve ser
+aberto após `Montar`. Durante `Montar`, o instalador nativo de DLC só será
+acionado se `addcont.db` informar ausência do registro. Com registro existente,
+a rotina tenta reutilizar journal/USB; na ausência de arquivos válidos, registra
+erro sem reinstalar, sem esperar um stub de 0 bytes crescer. Veja
+`TESTE-0426-DUAS-ALTERACOES.md`.

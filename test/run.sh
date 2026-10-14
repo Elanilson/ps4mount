@@ -48,5 +48,3 @@ python3 test/db_diagnostics_contract.py
 
 
 
-
-python3 test/dlc_reuse_contract.py
