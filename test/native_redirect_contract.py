@@ -1,22 +1,25 @@
 #!/usr/bin/env python3
 from pathlib import Path
-r = Path(__file__).resolve().parent.parent
-m = (r/'src/main.c').read_text()
-w = (r/'src/web.c').read_text()
-u = (r/'web/index.html').read_text()
-s = m[m.index('/* One-item reversible experiment'):m.index('void app_progress_json(buf_t *out)')]
-assert 'CUSA03842' in s and 'BH70000000DLC001' in s
-assert 'REDIRECT_TARGET "/ac.pkg"' in s and 'S_ISREG(native.st_mode)' in s
-assert 'redirect_same_file_bytes' in s and 'memcmp(x, y, (size_t)n)' in s
-assert 'db_dlc_registration(&cid, 1, &db)' in s and 'db != 1' in s
-assert 'nullfs_mount(REDIRECT_SOURCE, REDIRECT_TARGET)' in s
-assert 'unmount(REDIRECT_TARGET, 0)' in s
-assert 'S_ISREG(st.st_mode)' in s
-assert 'unlink(REDIRECT_TARGET' not in s and 'rename(REDIRECT_TARGET' not in s
+r=Path(__file__).resolve().parent.parent
+m=(r/'src/main.c').read_text(); w=(r/'src/web.c').read_text(); u=(r/'web/index.html').read_text()
+s=m[m.index('/* Reversible experiment for the 17'):m.index('void app_progress_json(buf_t *out)')]
+assert '#define REDIRECT_COUNT 17' in s
+assert s.count('"BH7') >= 17
+assert 'pthread_create(&worker, NULL, redirect_all_worker, NULL)' in s
+assert 'redirect_same_file_bytes(pkg, usb[i])' in s
+assert 'memcmp(x, y, (size_t)n)' in s
+assert 'db_dlc_registration(ids, REDIRECT_COUNT, db)' in s and 'db[i] != 1' in s
+assert s.index('db_dlc_registration(ids, REDIRECT_COUNT, db)') > s.index('int app_redirect_native_dlc(')
+assert s.index('redirect_same_file_bytes(pkg, usb[i])') < s.index('nullfs_mount(source, native)')
+assert 'if (failed)' in s and 'ROLLBACK' in s and 'unmount(native, 0)' in s
+assert 'top_layer(native, source) != 1 || owned_layer_count(native, source) != 1' in s
+assert 'if (redirect_busy() || title_running(tid))' in s
+assert 'unlink(native' not in s and 'rename(native' not in s
 assert 'sceAppInstUtilAppInstallAll(' not in m
-assert 'if (redirect_mounted())' in m[m.index('int app_install_dlcs('):m.index('static int dlc_installer_release_external_layer')]
+assert 'if (redirect_locked())' in m[m.index('int app_add('):m.index('int app_remove(')]
 assert 'post && !strncmp(path, "/api/test-dlc-usb?", 18)' in w
 assert 'post && !strncmp(path, "/api/restore-dlc-native?", 24)' in w
-assert 'Testar 1 DLC no USB' in u and 'Restaurar DLC no SSD' in u
+assert 'Testar 17 DLCs no USB' in u and 'Restaurar 17 DLCs no SSD' in u
 assert 'Instalar DLCs (NATIVO / SSD)' in u
-print('Pilot 1-DLC nullfs overlay, native restore and explicit install contracts OK')
+assert 'redirect_running' in m and 'redirect_stage' in u
+print('17-DLC reversible async nullfs overlay contracts OK')

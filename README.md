@@ -378,3 +378,8 @@ folder); this is not a read-only scan. It does not copy game PKGs to PS5 interna
 storage. Group registration, DLC install, automatic scans and web UI remain
 upstream behavior. Directory symlinks and other filesystem devices are not
 followed, and managed title folders are skipped during discovery.
+
+
+## Teste 17 DLCs RE7 via USB (v0.4.16)
+
+Ver `TESTE-17-DLCS-SSD-USB-0416.md`. Substitui o teste de apenas um DLC por preflight integral dos 17 e restauração em lote, sem escrita no banco de dados.
