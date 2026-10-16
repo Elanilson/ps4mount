@@ -12,6 +12,7 @@ struct iovec;
 #define MNT_FORCE 0x80000
 #define MNT_RDONLY 1
 int statfs(const char *path, struct statfs *buf);
+int fstatfs(int fd, struct statfs *buf);
 int getfsstat(struct statfs *buf, long bufsize, int flags);
 int nmount(struct iovec *iov, unsigned int niov, int flags);
 int unmount(const char *path, int flags);

@@ -11,6 +11,10 @@ worker=main[start:end]
 pnt=worker[worker.index('if (manual_pointing) {'):worker.index('} else if (state == 1 && !force_reinstall)')]
 native=worker[worker.index('} else if (state == 0 || (state == 1 && force_reinstall))'):worker.index('} else {\n            printf("[dlc-install] %s DB state unknown')]
 assert 'offload_one(&t.dlc[i],tid,1)' in pnt
+assert 'state != 1' not in pnt, 'Manual pointing MUST NOT require DB registration'
+assert 'native/source size or mount mismatch' not in main, 'No native/USB size equality check'
+assert 'matched.st_size!=source.st_size' not in main, 'Native and USB sizes may differ on manual pointing'
+assert '(!manual_pointing && (!db_snapshot_healthy() || !db_is_registered(tid)))' in main
 assert 'dlc_native_install_one' not in pnt
 assert 'offload_native_ready_fast' not in pnt
 assert 'offload_one(' not in native
@@ -21,8 +25,8 @@ assert 'g_dlc_manual_pointing = 1' in main
 assert 'queue_dlc_job(tid, msg, cap, 0)' in main
 assert 'api/point-dlcs?' in web and 'app_manual_point_dlcs(' in web
 assert 'data-a="point-dlcs"' in ui
-assert 'ATENCAO:' in ui and 'TERMINARAM no PS5' in ui
+assert 'APONTAMENTO de ' in ui and 'USB NAO sera alterado' in ui
 assert main.index('if (offload_write(&rec))') < main.index('if(rename(pkg,held))')
-assert main.index('if(offload_confirm_overlay(&rec))goto rollback;') < main.index('if(unlink(held))')
+assert main.index('if(offload_confirm_overlay(&rec))goto rollback;') < main.index('if(moved && unlink(held))')
 assert 'SCE_OK' not in pnt # must not misread accepted request as completion
 print('Manual pointing contracts passed')

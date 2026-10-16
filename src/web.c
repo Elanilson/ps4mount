@@ -260,6 +260,9 @@ void web_serve(int listen_fd) {
             int rc = app_remove(tid, msg, sizeof(msg));
             json_msg(fd, !rc, msg);
         }
+    } else if (post && !strcmp(path, "/api/clean-dlcs")) {
+        int rc = app_clean_dlcs(msg, sizeof(msg));
+        json_msg(fd, !rc, msg);
     } else if (post && !strcmp(path, "/api/rescan")) {
         int rc = app_rescan();
         json_msg(fd, !rc, rc ? "Busy: wait until current job finishes" : "Search queued; only manual discovery, no registration");

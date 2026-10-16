@@ -63,6 +63,7 @@ form.settings .row{display:flex;gap:8px;justify-content:flex-end}
   <div class="bar">
     <input id="q" type="search" placeholder="Buscar nome ou CUSA">
     <button id="rescan" class="primary">Buscar jogos no USB</button>
+    <button id="pointall" title="Zera SOMENTE os ac.pkg nativos no armazenamento interno e expansao do PS5. O HD USB nunca e modificado.">Limpar DLCs</button>
     <button id="settingsbtn">Configurações</button>
     <button id="logbtn">Log</button>
     <button id="stop" class="danger">Encerrar ELF</button>
@@ -171,7 +172,7 @@ $('grid').addEventListener('click', function (e) {
   if (busy[tid]) return;
   if (a === 'unmount' && !confirm('Desmontar ' + tid + '? O jogo permanece na biblioteca. Os DLCs e seus PKGs no USB serao mantidos.')) return;
   if (a === 'reinstall-dlcs' && !confirm('Reinstalar os DLCs de ' + tid + ' usando o instalador nativo? O SSD NAO sera liberado automaticamente. Depois de receber a notificacao de conclusao do PS5, use Apontamento. Feche o jogo.')) return;
-  if (a === 'point-dlcs' && !confirm('ATENCAO: voce confirmou que TODAS as instalacoes dos DLCs de ' + tid + ' TERMINARAM no PS5? Apontamento nao compara bytes nem espera estabilidade. Ele remove a copia nativa depois de ativar o USB, o que pode causar perda de DLC se a instalacao ainda estiver em andamento.')) return;
+  if (a === 'point-dlcs' && !confirm('APONTAMENTO de ' + tid + ': usa a pasta nativa do DLC e o ac.pkg original do USB SOMENTE COMO ORIGEM DE LEITURA. Nao exige registro nem compara bytes/tamanhos. Pode apontar um ac.pkg nativo que ja esteja em 0B. O HD USB NAO sera alterado. Prossiga apenas com instalacoes encerradas.')) return;
   // Mount is a single click. Unmount retains its safety confirmation.
   busy[tid] = {action: a, percent:-1,
     detail: a === 'mount' ? 'Montando e verificando DLCs…' :
@@ -194,6 +195,16 @@ $('grid').addEventListener('click', function (e) {
 });
 $('q').addEventListener('input', render);
 $('rescan').onclick = function () { if (!confirm('Buscar PKGs em subpastas e organizá-los dentro do mesmo HD? Nenhum jogo será registrado nessa etapa.')) return; $('progress-wrap').hidden = false; $('progress-title').textContent = 'Solicitando busca no USB…'; $('progress-bar').removeAttribute('value'); $('progress-detail').textContent = 'Aguardando início da busca'; api('/api/rescan', 'POST').then(function () { loadProgress(); }).catch(function (e) { toast('Erro: ' + e.message); loadProgress(); }); };
+$('pointall').onclick = function () {
+  if (!confirm('LIMPAR DLCS NO PS5: deixar com 0 bytes os ac.pkg do SSD INTERNO e da EXPANSAO?\n\nO HD USB NAO sera tocado, mesmo se estiver conectado. Nao verifica registro, versao, comparacao, nem se existe copia USB.\n\nATENCAO: pode apagar definitivamente DLCs instalados no PS5 se nao houver copia original no USB. Feche os jogos e termine instalacoes antes.')) return;
+  if (!confirm('CONFIRMACAO FINAL: ZERAR ac.pkg NATIVOS (interno e expansao), sem apontamento automatico? Conteudo eliminado do PS5; USB completamente intocado. Este comando nao garante que as DLCs funcionem depois.')) return;
+  $('progress-wrap').hidden = false;
+  $('progress-title').textContent = 'Solicitando Limpar DLCs…';
+  $('progress-bar').removeAttribute('value');
+  $('progress-detail').textContent = 'Aguardando processamento';
+  api('/api/clean-dlcs','POST').then(function(){ loadProgress(); })
+    .catch(function(e){toast('Erro em Limpar DLCs: ' + e.message); loadProgress();});
+};
 $('logbtn').onclick = function () { api('/api/log').then(function (j) { $('log').textContent = j.log; $('logdlg').showModal(); }); };
 $('settingsbtn').onclick = function () {
   api('/api/config').then(function (c) {
@@ -222,13 +233,20 @@ $('stop').onclick = function () {
 function loadProgress() {
   api('/api/progress').then(function (p) {
     var active = ['restoring','searching','activating','queued','dlc_queued','installing_dlcs'].indexOf(p.phase) >= 0;
-    $('rescan').disabled = active || !!p.redirect_running;
+    $('rescan').disabled = active || !!p.redirect_running || !!p.point_all_running;
+    $('pointall').disabled = active || !!p.redirect_running || !!p.point_all_running;
     // Only scanning/restoring uses the global progress. Mount/unmount uses its game card.
-    var globalProgress = p.phase === 'searching' || p.phase === 'restoring' || !!p.redirect_running;
+    var pointAllVisible = p.point_all_running || ['point_all_queued','point_all_running','point_all_complete','point_all_error'].indexOf(p.phase) >= 0;
+    var globalProgress = pointAllVisible || p.phase === 'searching' || p.phase === 'restoring' || !!p.redirect_running;
     $('progress-wrap').hidden = !globalProgress;
     if (globalProgress) {
       $('progress-bar').max = Math.max(p.redirect_running ? p.redirect_total : p.total, 1);
-      if (p.redirect_running) {
+      if (pointAllVisible) {
+        $('progress-bar').max = Math.max(p.point_all_total,1);
+        $('progress-bar').value = p.point_all_done;
+        $('progress-title').textContent = (p.point_all_running ? 'Limpando copias nativas das DLCs' : 'Limpeza de DLCs finalizada') + ' — ' + p.point_all_done + '/' + p.point_all_total + ' jogos';
+        $('progress-detail').textContent = 'Copias nativas limpas: ' + p.point_all_ok + ' · Não limpas: ' + p.point_all_failed + ' (sem registro/CUSA diferente: ' + p.point_all_skipped_dlcs + ')' + ' · Jogos pulados: ' + p.point_all_skipped_games + ' · ' + (p.current || '') + ' · ' + (p.detail || '');
+      } else if (p.redirect_running) {
         $('progress-bar').value = p.redirect_done;
         $('progress-title').textContent = (p.redirect_stage === 2 ? 'Montando DLC ' : 'Verificando DLC ') + (p.redirect_current || 1) + '/' + p.redirect_total + ' — ' + (p.redirect_done || 0) + ' concluído(s)';
         $('progress-detail').textContent = p.redirect_stage === 2 ? 'Aplicando nullfs para este DLC no SSD' : 'Comparando este PKG (SSD x USB) antes de montar; alguns sao grandes';
@@ -243,7 +261,7 @@ function loadProgress() {
       }
     }
     var installingDlc = (['dlc_queued','installing_dlcs'].indexOf(p.phase) >= 0) && p.current;
-    if (installingDlc) {
+    if (installingDlc && !p.point_all_running) {
       serverDlc = p.current;
       var dlcDetail = p.phase === 'dlc_queued' ? 'Aguardando processamento de DLCs…' :
         ((p.done || 0) + '/' + (p.total || '?') + ' DLC(s) processados · ' + (p.detail || 'Verificando DLC…'));
@@ -257,7 +275,7 @@ function loadProgress() {
     // A fast DLC job can finish BEFORE the browser's first progress poll.
     // Completion must not depend on having seen an installing_dlcs phase.
     var terminalDlc = ['dlc_complete','dlc_error'].indexOf(p.phase) >= 0;
-    if (terminalDlc) {
+    if (terminalDlc && !p.point_all_running) {
       var completedTid = p.current || serverDlc || serverMount;
       var completedJob = busy[completedTid];
       if (completedJob && (completedJob.action === 'mount' || completedJob.action === 'reinstall-dlcs' || completedJob.action === 'point-dlcs')) {

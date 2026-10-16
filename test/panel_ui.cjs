@@ -131,6 +131,12 @@ const flush = async()=>{ for(let i=0;i<6;i++) await new Promise(resolve=>setImme
   await flush();
   assert(!get('grid').innerHTML.includes('Apontando DLCs…'));
   assert(get('toast').textContent.includes('Apontamento'));
+  // Batch Limpar DLCs has TWO explicit confirmations and a new endpoint.
+  const beforeClean = confirms;
+  get('pointall').onclick();
+  await flush();
+  assert.equal(confirms, beforeClean + 2, 'Bulk native cleaning requires two confirmations');
+  assert(requests.includes('/api/clean-dlcs'), 'Bulk cleaning uses dedicated new endpoint');
   // USB scan remains global and visible only while scanning.
   progress = {...progress,phase:'searching',scan_folders:7,scan_pkgs:12,scan_organized:3,scan_path:'/mnt/usb0'};
   vm.runInContext('loadProgress()',context);
