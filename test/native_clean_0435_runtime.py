@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""v0.4.37: host test of independent recursive unlink/create/verify routine.
-No mount/unmount calls are permitted. A mounted subtree must be skipped rather
-than modifying a USB backing file or reporting success.
+"""v0.4.38: host test of forced visible unlink/create/verify routine.
+Mounted directories must NOT be skipped; no mount/unmount calls. A symlinked
+ac.pkg must be replaced without following it, but files in a mounted view
+are deliberately modified, possibly including USB.
 """
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -9,10 +10,11 @@ from subprocess import run
 import os
 p = Path(__file__).resolve().parent.parent
 s = (p/'src/main.c').read_text()
-core = s[s.index('static int native_clean_safe_fs('):s.index('/* Operates on a whole native storage root')]
+core = s[s.index('static int native_clean_replace('):s.index('/* Operates on a whole native storage root')]
 assert 'unmount(' not in core and 'nmount(' not in core and 'mount(' not in core
 assert 'native_clean_collect' not in core and 'hold_path(' not in core
 assert 'unlink(path)' in core and 'O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW' in core
+assert 'layers_on(' not in core and 'native_clean_safe_fs' not in core
 prefix = r'''
 #define _GNU_SOURCE
 #include <assert.h>
@@ -28,10 +30,7 @@ prefix = r'''
 #include <sys/mount.h>
 #include <unistd.h>
 static int g_stop=0,g_point_all_seen=0;
-static char mock_mount[PATH_MAX];
 static int calls_unmount=0,calls_mount=0;
-static int layers_on(const char *p) {return !strcmp(p,mock_mount);}
-static int dead_layer(const char *p) {(void)p;return 0;}
 int unmount(const char *path, int flags){(void)path;(void)flags;calls_unmount++;return -1;}
 int nmount(struct iovec *iov, unsigned int niov, int flags){(void)iov;(void)niov;(void)flags;calls_mount++;return -1;}
 int statfs(const char *path,struct statfs *sf){
@@ -50,13 +49,12 @@ int fstatfs(int fd,struct statfs *sf){
 '''
 suffix = r'''
 int main(int argc,char **argv){
- assert(argc==3);
- snprintf(mock_mount,sizeof(mock_mount),"%s",argv[2]);
+ assert(argc==2);
  int recreated=0,already=0,failed=0;
  native_clean_walk(argv[1],0,NULL,&recreated,&already,&failed);
  printf("HOST_RECREATE recreated=%d already=%d failed=%d seen=%d mount_calls=%d unmount_calls=%d\n",
         recreated,already,failed,g_point_all_seen,calls_mount,calls_unmount);fflush(stdout);
- assert(recreated==4 && already==0 && failed==2 && g_point_all_seen==4);
+ assert(recreated==6 && already==0 && failed==0 && g_point_all_seen==6);
  assert(calls_unmount==0 && calls_mount==0);
  return 0;
 }
@@ -84,17 +82,17 @@ with TemporaryDirectory() as folder:
     c = d/'test.c';c.write_text(prefix+core+suffix)
     exe = d/'test'
     run(['cc','-std=gnu11','-D_DEFAULT_SOURCE','-Wall','-Wextra','-Werror',
-         '-I'+str(p/'test/host_include'),str(c),'-o',str(exe)],check=True,capture_output=True,text=True)
-    result=run([str(exe),str(root),str(mount)],capture_output=True,text=True)
+         '-I'+str(p/'test/host_include'),str(c),'-o',str(exe)],check=True,text=True)
+    result=run([str(exe),str(root)],capture_output=True,text=True)
     assert result.returncode==0, result.stdout+result.stderr
     assert (root/'NOT_CUSA'/'weird_label'/'nested_more'/'ac.pkg').stat().st_size==0
     assert (root/'abc'/'999'/'ac.pkg').stat().st_size==0
     assert (root/'already'/'0'/'ac.pkg').stat().st_size==0
     assert (root/'notpkg'/'ac.pkg').is_file() and not (root/'notpkg'/'ac.pkg').is_symlink()
     assert (root/'notpkg'/'ac.pkg').stat().st_size==0
-    assert (mount/'DLC_A'/'ac.pkg').read_bytes()==b'MOUNTED_DATA_PRESERVED'
+    assert (mount/'DLC_A'/'ac.pkg').stat().st_size==0
     assert (root/'abc'/'999'/'other.pkg').read_bytes()==b'DO_NOT_TOUCH'
-    assert (root/'fake_usb_view'/'one'/'ac.pkg').read_bytes()==b'USB_SAFE'
+    assert (root/'fake_usb_view'/'one'/'ac.pkg').stat().st_size==0
     assert (d/'external_usb'/'ac.pkg').read_bytes()==b'ORIGINAL_USB'
     print(result.stdout.strip().splitlines()[-1])
-    print('Host test: files recreated as 0B, overlays skipped and logged, no mounts/unmounts performed.')
+    print('Host test: all visible ac.pkg recreated as 0B, mounted paths included, symlink original untouched, no mount/unmount calls.')

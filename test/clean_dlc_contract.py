@@ -12,10 +12,10 @@ assert 'strlen(tid)!=9' not in a and 'strncmp(tid,"CUSA",4)' not in a
 assert 'db_snapshot_healthy()' not in a and 'db_is_registered(' not in a
 assert 'g_native_dlc_roots[storage]' in step and 'strcmp(name,"ac.pkg")' in step
 assert 'strlen(label)!=16' not in step and 'if (strlen(label)' not in step
-assert 'unlink(path)' in step and 'O_EXCL|O_NOFOLLOW' in step and 'RECREATED_0B_VERIFIED' in step
-assert 'O_NOFOLLOW' in step and 'fstatfs(fd,&fs)' in step
-assert 'native_clean_safe_fs' in step and 'SKIPPED_MOUNTED_OR_UNSAFE_DIR' in step
-assert 'layers_on(dir)' in step and 'layers_on(path)' in step
+assert 'unlink(path)' in step and 'O_EXCL|O_NOFOLLOW' in step and 'RECREATED_VISIBLE_0B_VERIFIED' in step
+assert 'O_NOFOLLOW' in step and 'statfs(parent,&fs)' in step
+assert 'native_clean_safe_fs' not in step and 'SKIPPED_MOUNTED_OR_UNSAFE_DIR' not in step
+assert 'layers_on(dir)' not in step and 'layers_on(path)' not in step
 assert 'unmount(' not in step and 'nmount(' not in step and 'mount(' not in step
 assert 'native_clean_collect' not in step and 'hold_path(' not in step
 assert 'stat(rec.usb' not in step and 'unlink(rec.usb' not in step
@@ -28,4 +28,6 @@ assert 'NATIVE_CLEAN_MARKER' not in s and 'AUTO_OFFLOAD_REMOUNT_SUPPRESSED' not 
 assert 'AUTO_RESTORE_SKIPPED_DLCS' not in s
 assert 'Limpar DLCs' in u and '/api/clean-dlcs' in u and '/api/clean-dlcs' in w
 assert "if (!confirm('CONFIRMACAO FINAL:" in u
+assert "APAGAR ac.pkg nesses casos pode DESTRUIR" in u
+assert "USB completamente intocado" not in u
 print('Native-only destructive cleanup contract: OK')

@@ -63,7 +63,7 @@ form.settings .row{display:flex;gap:8px;justify-content:flex-end}
   <div class="bar">
     <input id="q" type="search" placeholder="Buscar nome ou CUSA">
     <button id="rescan" class="primary">Buscar jogos no USB</button>
-    <button id="pointall" title="Zera SOMENTE os ac.pkg nativos no armazenamento interno e expansao do PS5. O HD USB nunca e modificado.">Limpar DLCs</button>
+    <button id="pointall" title="Limpeza FORCADA de ac.pkg nos caminhos visiveis; pastas montadas incluidas. Pode alterar arquivos do USB!">Limpar DLCs</button>
     <button id="settingsbtn">Configurações</button>
     <button id="logbtn">Log</button>
     <button id="stop" class="danger">Encerrar ELF</button>
@@ -196,8 +196,8 @@ $('grid').addEventListener('click', function (e) {
 $('q').addEventListener('input', render);
 $('rescan').onclick = function () { if (!confirm('Buscar PKGs em subpastas e organizá-los dentro do mesmo HD? Nenhum jogo será registrado nessa etapa.')) return; $('progress-wrap').hidden = false; $('progress-title').textContent = 'Solicitando busca no USB…'; $('progress-bar').removeAttribute('value'); $('progress-detail').textContent = 'Aguardando início da busca'; api('/api/rescan', 'POST').then(function () { loadProgress(); }).catch(function (e) { toast('Erro: ' + e.message); loadProgress(); }); };
 $('pointall').onclick = function () {
-  if (!confirm('LIMPAR DLCS NO PS5: EXCLUIR e RECRIAR com 0 bytes os ac.pkg do SSD INTERNO e da EXPANSAO?\n\nO HD USB NAO sera tocado, mesmo se estiver conectado. Nao verifica registro, versao, comparacao, nem se existe copia USB.\n\nATENCAO: pode apagar definitivamente DLCs instalados no PS5 se nao houver copia original no USB. Feche os jogos e termine instalacoes antes.')) return;
-  if (!confirm('CONFIRMACAO FINAL: ZERAR ac.pkg NATIVOS (interno e expansao), sem apontamento automatico? Conteudo eliminado do PS5; USB completamente intocado. Este comando nao garante que as DLCs funcionem depois.')) return;
+  if (!confirm('LIMPAR DLCS - MODO FORCADO: EXCLUIR e RECRIAR com 0 bytes cada ac.pkg VISIVEL em /user/addcont e /mnt/ext*/user/addcont, INCLUSIVE pastas com nullfs?\n\nSEM montar/desmontar, SEM consultar DB, SEM pular pastas montadas.\n\nATENCAO: arquivos visiveis atraves de nullfs podem ser do USB ou de outra pasta de origem. APAGAR ac.pkg nesses casos pode DESTRUIR a copia original no USB; NAO garante zerar arquivos nativos escondidos por montagens. Feche todos os jogos.')) return;
+  if (!confirm('CONFIRMACAO FINAL: EU ACEITO A EXCLUSAO IRREVERSIVEL dos ac.pkg VISIVEIS, inclusive os que estiverem em pastas montadas e eventualmente no USB. Nao ha backup automatico; pode inutilizar DLCs e nao liberar espaco fisico. Continuar?')) return;
   $('progress-wrap').hidden = false;
   $('progress-title').textContent = 'Solicitando Limpar DLCs…';
   $('progress-bar').removeAttribute('value');
@@ -244,7 +244,7 @@ function loadProgress() {
       if (pointAllVisible) {
         $('progress-bar').max = Math.max(p.point_all_total,1);
         $('progress-bar').value = p.point_all_done;
-        $('progress-title').textContent = (p.point_all_running ? 'Recriando ac.pkg nativos com 0 bytes' : 'Limpeza de DLCs finalizada') + ' — ' + p.point_all_done + '/' + p.point_all_total + ' unidades';
+        $('progress-title').textContent = (p.point_all_running ? 'Recriando ac.pkg visiveis com 0 bytes (forcado)' : 'Limpeza de DLCs finalizada') + ' — ' + p.point_all_done + '/' + p.point_all_total + ' unidades';
         $('progress-detail').textContent = 'Encontrados: ' + p.point_all_seen + ' · Recriados com 0 B: ' + p.point_all_zeroed + ' · Falhas: ' + p.point_all_failed + ' · ' + (p.current || '') + ' · ' + (p.detail || '');
       } else if (p.redirect_running) {
         $('progress-bar').value = p.redirect_done;
