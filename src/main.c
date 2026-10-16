@@ -42,7 +42,7 @@
 #include "web.h"
 #include "icon_data.h"
 
-#define VERSION "PS4Mount 0.4.38-force-visible-acpkg-0B-TEST"
+#define VERSION "PS4Mount 0.4.39-organize-installed-usb-pkgs-TEST"
 #define LOCK_PORT 9032
 #define SCAN_SECONDS 10 /* legacy value; polling for PKGs is disabled */
 #define STATE_DIR "/data/ps4mount"
@@ -1384,11 +1384,9 @@ static int adopt_dir_pkgs(const char *root, const char *dir) {
                 printf("[scan] skip %s (not a fake PS4 game or update pkg)\n", path);
             continue;
         }
-        if (installed_internally(tid)) {
-            if (first_time(path))
-                printf("[scan] skip %s (%s is installed internally)\n", path, tid);
-            continue;
-        }
+        /* Discovery only organizes the PKGs on this drive. An internal installation
+         * must not prevent staging an external copy of app.pkg/patch.pkg.
+         * Mount/registration preflight still checks installed_internally(). */
         snprintf(dst, sizeof(dst), "%s/ps4/%s", root, tid);
         mkdirs(dst, 0777);
         snprintf(dst, sizeof(dst), "%s/ps4/%s/%s", root, tid, is_app ? "app.pkg" : "patch.pkg");
@@ -1459,6 +1457,51 @@ static int adopt_pkg_dir(const char *dir, void *context) {
 }
 
 
+/* The directory walk can visit DLC folders before the game folder. After the
+ * walk, retry the waiting add-ons on THIS drive: newly organized app.pkg files
+ * can now resolve them without requiring another click on USB discovery. */
+static int adopt_waiting_dlcs(const char *root) {
+    int moved = 0;
+    size_t len = strlen(root);
+    g_lib_sig = lib_signature(root);
+    for (size_t i = 0; i < g_nwaiting && !g_scan_abort && !g_stop;) {
+        const char *waiting_path = g_waiting[i].path;
+        if (strncmp(waiting_path, root, len) || waiting_path[len] != '/') {
+            i++;
+            continue;
+        }
+        /* A copy is essential: adopt_dlc() may remove the waiting entry. */
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path), "%s", waiting_path);
+        if (!exists(path)) {
+            waiting_drop(path);
+            continue;
+        }
+        pkg_t pkg;
+        if (pkg_open(&pkg, path)) {
+            i++;
+            continue;
+        }
+        sfo_t sfo;
+        const sfo_item_t *cat = NULL;
+        if (!read_sfo(&pkg, &sfo)) cat = sfo_get(&sfo, "CATEGORY");
+        int ok = cat && !strcmp(cat->sval, "ac") &&
+                 !strncmp(pkg.title_id, "CUSA", 4) && pkg_fake_key(&pkg);
+        if (ok) {
+            const char *name = strrchr(path, '/');
+            int count = adopt_dlc(root, name ? name + 1 : path, path, &pkg);
+            moved += count;
+            g_scan_organized += count;
+        } else {
+            waiting_drop(path);
+        }
+        pkg_close(&pkg);
+        /* When the entry is removed, the last entry moves into its slot. */
+        if (waiting_find(path)) i++;
+    }
+    return moved;
+}
+
 static int adopt_root_pkgs(const char *root) {
     char dir[PATH_MAX], lib[PATH_MAX];
     int moved = 0;
@@ -1472,9 +1515,12 @@ static int adopt_root_pkgs(const char *root) {
                                               scan_progress_folder, (void *)root,
                                               scan_should_stop, (void *)root);
     }
-    if (g_dlc_orphans)
-        notify("%s: %d add-on(s) wait for their game, which is not on this drive (see the log)", root + 5,
-               waiting_count(root));
+    if (!g_scan_abort && !g_stop)
+        moved += adopt_waiting_dlcs(root);
+    int still_waiting = waiting_count(root);
+    if (still_waiting)
+        notify("%s: %d add-on(s) wait for their game, which is not on this drive (see the log)",
+               root + 5, still_waiting);
     if (g_dlc_dupes)
         notify("%s: %d add-on copy(ies) were left in place because the game already has them", root + 5, g_dlc_dupes);
     return moved;
