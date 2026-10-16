@@ -244,8 +244,8 @@ function loadProgress() {
       if (pointAllVisible) {
         $('progress-bar').max = Math.max(p.point_all_total,1);
         $('progress-bar').value = p.point_all_done;
-        $('progress-title').textContent = (p.point_all_running ? 'Limpando copias nativas das DLCs' : 'Limpeza de DLCs finalizada') + ' — ' + p.point_all_done + '/' + p.point_all_total + ' jogos';
-        $('progress-detail').textContent = 'Copias nativas limpas: ' + p.point_all_ok + ' · Não limpas: ' + p.point_all_failed + ' (sem registro/CUSA diferente: ' + p.point_all_skipped_dlcs + ')' + ' · Jogos pulados: ' + p.point_all_skipped_games + ' · ' + (p.current || '') + ' · ' + (p.detail || '');
+        $('progress-title').textContent = (p.point_all_running ? 'Limpando copias nativas das DLCs' : 'Limpeza de DLCs finalizada') + ' — ' + p.point_all_done + '/' + p.point_all_total + ' unidades';
+        $('progress-detail').textContent = 'Encontrados: ' + p.point_all_seen + ' · Zerados agora: ' + p.point_all_zeroed + ' · Já estavam 0B: ' + p.point_all_already + ' · Falhas: ' + p.point_all_failed + ' · ' + (p.current || '') + ' · ' + (p.detail || '');
       } else if (p.redirect_running) {
         $('progress-bar').value = p.redirect_done;
         $('progress-title').textContent = (p.redirect_stage === 2 ? 'Montando DLC ' : 'Verificando DLC ') + (p.redirect_current || 1) + '/' + p.redirect_total + ' — ' + (p.redirect_done || 0) + ' concluído(s)';

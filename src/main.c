@@ -42,7 +42,7 @@
 #include "web.h"
 #include "icon_data.h"
 
-#define VERSION "PS4Mount 0.4.34-unrestricted-native-point-TEST"
+#define VERSION "PS4Mount 0.4.35-native-recursive-all-acpkg-TEST"
 #define LOCK_PORT 9032
 #define SCAN_SECONDS 10 /* legacy value; polling for PKGs is disabled */
 #define STATE_DIR "/data/ps4mount"
@@ -1762,11 +1762,11 @@ static const char *g_native_dlc_roots[] = {
     "/mnt/ext4/user/addcont", "/mnt/ext5/user/addcont",
     "/mnt/ext6/user/addcont", "/mnt/ext7/user/addcont"
 };
-#define NATIVE_CLEAN_MAX 8192
-static char g_point_all_titles[NATIVE_CLEAN_MAX][10];
-static unsigned char g_point_all_storage[NATIVE_CLEAN_MAX];
+/* The cleanup queues storage roots, not CUSA directories: scan ALL paths. */
+static unsigned char g_point_all_storage[sizeof(g_native_dlc_roots)/sizeof(g_native_dlc_roots[0])];
 static int g_point_all_count, g_point_all_index;
 static int g_point_all_ok, g_point_all_failed, g_point_all_skipped_games, g_point_all_skipped_dlcs;
+static int g_point_all_zeroed, g_point_all_already, g_point_all_seen;
 
 static int g_catalog_count, g_catalog_dirty = 1;
 static int active_status(const char *tid);
@@ -1834,42 +1834,25 @@ int app_clean_dlcs(char *msg, size_t cap) {
     }
     g_point_all_count = g_point_all_index = 0;
     g_point_all_ok = g_point_all_failed = g_point_all_skipped_games = g_point_all_skipped_dlcs = 0;
+    g_point_all_zeroed = g_point_all_already = g_point_all_seen = 0;
+    /* Queue each existing native addcont root directly, even if it has no
+     * CUSA-named children. No DB, name/label/size or USB-library filtering. */
     for (size_t storage=0; storage<sizeof(g_native_dlc_roots)/sizeof(g_native_dlc_roots[0]); ++storage) {
         const char *root=g_native_dlc_roots[storage];
         struct stat st;
-        if (lstat(root,&st) || !S_ISDIR(st.st_mode) || layers_on(root) || dead_layer(root)) continue;
-        DIR *d=opendir(root);
-        if (!d) continue;
-        struct dirent *e;
-        while ((e=readdir(d))) {
-            const char *tid=e->d_name;
-            if (strlen(tid)!=9 || strncmp(tid,"CUSA",4)) continue;
-            int valid=1;
-            for (int j=4;j<9;j++) if (tid[j]<'0' || tid[j]>'9') valid=0;
-            if (!valid) continue;
-            char dir[PATH_MAX];
-            snprintf(dir,sizeof(dir),"%s/%s",root,tid);
-            if (lstat(dir,&st) || !S_ISDIR(st.st_mode)) continue;
-            if (g_point_all_count>=NATIVE_CLEAN_MAX) {
-                printf("[dlc-clean] LIMIT %d native folders; remaining not queued\n",NATIVE_CLEAN_MAX);
-                break;
-            }
-            snprintf(g_point_all_titles[g_point_all_count],sizeof(g_point_all_titles[0]),"%s",tid);
-            g_point_all_storage[g_point_all_count]=(unsigned char)storage;
-            g_point_all_count++;
-        }
-        closedir(d);
+        if (lstat(root,&st) || !S_ISDIR(st.st_mode)) continue;
+        g_point_all_storage[g_point_all_count++]=(unsigned char)storage;
     }
     if (!g_point_all_count) {
-        snprintf(msg,cap,"Nenhuma pasta nativa CUSA encontrada no SSD interno ou expansao");
+        snprintf(msg,cap,"Nenhum diretorio addcont nativo encontrado (interno ou expansao)");
         return -1;
     }
     g_point_all_active=1;
     g_progress=(progress_t){"point_all_queued",g_point_all_count,0,0,0,"",
-        "Limpar DLCs: zerar ac.pkg SOMENTE no SSD interno e expansao; USB intocado"};
+        "Limpar DLCs: varredura recursiva de TODO ac.pkg nativo; USB intocado"};
     snprintf(g_dlc_action,sizeof(g_dlc_action),"clean-dlcs");
-    printf("[dlc-clean] START native_title_folders=%d; USB IS NEVER OPENED FOR WRITE; no DB or USB checks\n",g_point_all_count);
-    snprintf(msg,cap,"Limpar DLCs: %d pastas nativas na fila (USB intocado)",g_point_all_count);
+    printf("[dlc-clean] START native_storage_roots=%d; recursive any ac.pkg; no DB, CUSA, label or USB check\n",g_point_all_count);
+    snprintf(msg,cap,"Limpar DLCs: varredura de %d unidades nativas (USB intocado)",g_point_all_count);
     return 0;
 }
 
@@ -3124,135 +3107,170 @@ failed:
 
 
 
-/* Native-only 0-byte cleanup. Intentionally no PKG comparison/DB/USB
- * eligibility checks: the user decides whether these DLCs can be discarded.
- * SAFETY: skip symlinks and *any* mounted nullfs layer; an apparent PS5
- * directory can actually be a view of the USB. fstatfs on the opened fd is
- * the final backstop, preventing an accidental ftruncate on a USB file. */
-static int clean_native_title(unsigned storage,const char *tid,int *skipped) {
-    if (storage >= sizeof(g_native_dlc_roots)/sizeof(g_native_dlc_roots[0])) return 0;
-    const char *root=g_native_dlc_roots[storage];
-    char dir[PATH_MAX];
-    snprintf(dir,sizeof(dir),"%s/%s",root,tid);
-    if (layers_on(root) || dead_layer(root)) {
-        printf("[dlc-clean] SKIP %s: storage root overlaid\n",dir);
-        (*skipped)++;
-        return 0;
+/* Native-only 0-byte cleanup: recursive, every file literally named ac.pkg below
+ * every internal/expansion /user/addcont, with no CUSA/label/DB filtering.
+ * The ONLY exclusion is the physical boundary: never truncate USB content,
+ * nullfs views, symlinks, or an unknown/busy mount that could expose USB. */
+static int native_clean_safe_fs(const struct statfs *sf) {
+    return strcmp(sf->f_fstypename,"nullfs") != 0 &&
+           strncmp(sf->f_mntonname,"/mnt/usb",8) != 0 &&
+           strncmp(sf->f_mntfromname,"/mnt/usb",8) != 0;
+}
+
+/* Depth 0 = addcont root, 1 = immediate child (normally CUSA),
+ * 2 = add-on label (normally 16 characters), deeper = other directories.
+ * No folder-name criteria are applied. Owned PS4Mount overlays are released
+ * temporarily so the real PS5 file is visible, then restored. */
+static void native_clean_walk(const char *dir, unsigned depth, const char *tid,
+                              int *zeroed,int *already,int *skipped) {
+    if (g_stop) return;
+    if (depth > 32) {
+        printf("[dlc-clean] DEPTH_LIMIT %s\n",dir);
+        (*skipped)++;return;
     }
-    /* A title-level addcont overlay may obscure the native directory. Only
-     * release a layer belonging to PS4Mount, then remount it after cleanup. */
-    char top_hold[PATH_MAX];int parent_removed=0;
-    hold_path(top_hold,sizeof(top_hold),"addcont",tid);
-    int layer_count=owned_layer_count(dir,top_hold);
+    struct stat st;
+    if (lstat(dir,&st) || !S_ISDIR(st.st_mode)) {
+        printf("[dlc-clean] DIRECTORY_UNAVAILABLE %s\n",dir);
+        (*skipped)++;return;
+    }
+    char stage[PATH_MAX]={0};
+    int released=0;
     if (layers_on(dir) || dead_layer(dir)) {
-        if (storage!=0 || top_layer(dir,top_hold)!=1 || layer_count!=1 ||
-            unmount(dir,0)) {
-            printf("[dlc-clean] SKIP unknown parent overlay %s\n",dir);
-            (*skipped)++;return 0;
+        int recognized=0;
+        if (depth==1) {
+            hold_path(stage,sizeof(stage),"addcont",tid);
+            recognized=1;
+        } else if (depth==2) {
+            snprintf(stage,sizeof(stage),HOLD_DIR "/offload/%s/%s",tid,
+                     strrchr(dir,'/') ? strrchr(dir,'/')+1 : dir);
+            recognized=1;
         }
-        parent_removed=1;
-        printf("[dlc-clean] temporarily released PS4Mount addcont overlay %s\n",dir);
+        if (!recognized || top_layer(dir,stage)!=1 ||
+            owned_layer_count(dir,stage)!=1 || unmount(dir,0)) {
+            printf("[dlc-clean] SKIP_NONNATIVE_OR_BUSY_MOUNT %s\n",dir);
+            (*skipped)++;return;
+        }
+        released=1;
+        printf("[dlc-clean] TEMPORARILY_UNMOUNTED_OWN_LAYER %s\n",dir);
+    }
+    struct statfs sf;
+    if (statfs(dir,&sf) || !native_clean_safe_fs(&sf)) {
+        printf("[dlc-clean] SKIP_NONNATIVE_DIR %s\n",dir);
+        (*skipped)++;
+        goto restore;
     }
     DIR *d=opendir(dir);
     if (!d) {
-        if (parent_removed && nullfs_mount(top_hold,dir))(*skipped)++;
-        (*skipped)++; return 0;
+        printf("[dlc-clean] OPENDIR_FAILED %s errno=%d\n",dir,errno);
+        (*skipped)++;
+        goto restore;
     }
-    int cleaned=0;
     struct dirent *e;
-    while ((e=readdir(d))) {
-        const char *label=e->d_name;
-        if (strlen(label)!=16) continue;
-        int valid=1;
-        for (int j=0;j<16;j++) {
-            char ch=label[j];
-            if (!((ch>='A'&&ch<='Z') || (ch>='0'&&ch<='9') || ch=='_')) valid=0;
-        }
-        if (!valid) continue;
-        char addon[PATH_MAX],pkg[PATH_MAX];
-        struct stat st;
-        snprintf(addon,sizeof(addon),"%s/%s",dir,label);
-        if (lstat(addon,&st) || !S_ISDIR(st.st_mode)) continue;
-        char own_stage[PATH_MAX];int addon_removed=0;
-        snprintf(own_stage,sizeof(own_stage),HOLD_DIR "/offload/%s/%s",tid,label);
-        if (layers_on(addon) || dead_layer(addon)) {
-            if (top_layer(addon,own_stage)!=1 || owned_layer_count(addon,own_stage)!=1 ||
-                unmount(addon,0)) {
-                printf("[dlc-clean] SKIP nonowned or busy overlay %s\n",addon);
-                (*skipped)++;continue;
-            }
-            addon_removed=1;
-        }
-        snprintf(pkg,sizeof(pkg),"%s/ac.pkg",addon);
-        if (layers_on(pkg) || dead_layer(pkg) || lstat(pkg,&st) || !S_ISREG(st.st_mode)) {
-            if (addon_removed && nullfs_mount(own_stage,addon))(*skipped)++;
+    while (!g_stop && (e=readdir(d))) {
+        const char *name=e->d_name;
+        if (!strcmp(name,".") || !strcmp(name,"..")) continue;
+        char path[PATH_MAX];
+        int written=snprintf(path,sizeof(path),"%s/%s",dir,name);
+        if (written<0 || (size_t)written>=sizeof(path)) {
+            printf("[dlc-clean] PATH_TOO_LONG %s/%s\n",dir,name);
             (*skipped)++;continue;
         }
-        if (st.st_size==0) {
-            printf("[dlc-clean] ALREADY_0B %s\n",pkg);
-            cleaned++;
-            if (addon_removed && nullfs_mount(own_stage,addon))(*skipped)++;
+        if (lstat(path,&st)) {
+            printf("[dlc-clean] LSTAT_FAILED %s errno=%d\n",path,errno);
+            (*skipped)++;continue;
+        }
+        if (S_ISDIR(st.st_mode)) {
+            native_clean_walk(path,depth+1,depth==0?name:tid,zeroed,already,skipped);
             continue;
         }
-        int fd=open(pkg,O_WRONLY|O_NOFOLLOW);
-        if (fd<0) { printf("[dlc-clean] OPEN_FAILED %s errno=%d\n",pkg,errno);(*skipped)++;if(addon_removed && nullfs_mount(own_stage,addon))(*skipped)++;continue; }
-        struct statfs sf;
-        int unsafe = fstat(fd,&st) || !S_ISREG(st.st_mode) || fstatfs(fd,&sf) ||
-                     !strcmp(sf.f_fstypename,"nullfs") ||
-                     !strncmp(sf.f_mntonname,"/mnt/usb",8) ||
-                     layers_on(addon) || dead_layer(addon);
-        if (unsafe) {
-            printf("[dlc-clean] SKIP unsafe mount/target %s\n",pkg);
-            close(fd); (*skipped)++;if(addon_removed && nullfs_mount(own_stage,addon))(*skipped)++; continue;
+        if (strcmp(name,"ac.pkg")) continue;
+        g_point_all_seen++;
+        if (!S_ISREG(st.st_mode) || layers_on(path) || dead_layer(path)) {
+            printf("[dlc-clean] SKIP_NONREGULAR_OR_MOUNTED_FILE %s\n",path);
+            (*skipped)++;continue;
+        }
+        int opened_for_write=st.st_size>0;
+        int fd=open(path,(opened_for_write?O_WRONLY:O_RDONLY)|O_NOFOLLOW);
+        if (fd<0) {
+            printf("[dlc-clean] OPEN_FAILED %s errno=%d\n",path,errno);
+            (*skipped)++;continue;
+        }
+        struct statfs filefs;
+        int invalid=fstat(fd,&st) || !S_ISREG(st.st_mode) ||
+                    fstatfs(fd,&filefs) || !native_clean_safe_fs(&filefs) ||
+                    layers_on(path) || dead_layer(path);
+        if (invalid || (st.st_size>0 && !opened_for_write)) {
+            printf("[dlc-clean] SKIP_UNSAFE_TARGET %s\n",path);
+            close(fd);(*skipped)++;continue;
+        }
+        if (st.st_size==0) {
+            printf("[dlc-clean] ALREADY_0B %s\n",path);
+            (*already)++;
+            close(fd);continue;
         }
         unsigned long long oldsize=(unsigned long long)st.st_size;
         int rc=ftruncate(fd,0);
-        if (!rc) rc=fsync(fd);
+        int saved_errno=errno;
+        if (!rc) {rc=fsync(fd); saved_errno=errno;}
         close(fd);
         if (rc) {
-            printf("[dlc-clean] TRUNCATE_FAILED %s errno=%d\n",pkg,errno);
+            printf("[dlc-clean] ZERO_FAILED %s errno=%d\n",path,saved_errno);
             (*skipped)++;
         } else {
-            printf("[dlc-clean] ZEROED_NATIVE %s old_bytes=%llu new_bytes=0 (USB untouched)\n",pkg,oldsize);
-            cleaned++;
-        }
-        if (addon_removed && nullfs_mount(own_stage,addon)) {
-            printf("[dlc-clean] REMOUNT_FAILED %s; USB still untouched\n",addon);
-            (*skipped)++;
+            printf("[dlc-clean] ZEROED_NATIVE %s old_bytes=%llu new_bytes=0 USB_UNTOUCHED\n",
+                   path,oldsize);
+            (*zeroed)++;
         }
     }
     closedir(d);
-    if (parent_removed && nullfs_mount(top_hold,dir)) {
-        printf("[dlc-clean] parent overlay restore failed %s\n",dir);
+restore:
+    if (released && nullfs_mount(stage,dir)) {
+        printf("[dlc-clean] RESTORE_OWN_LAYER_FAILED %s\n",dir);
         (*skipped)++;
     }
-    return cleaned;
 }
 
-/* Only native add-on directories are traversed. The USB is never consulted,
- * read, renamed, unlinked, truncated, or mounted by this button. */
+/* Operates on a whole native storage root; tid is intentionally not involved. */
+static int clean_native_title(unsigned storage,const char *tid,int *skipped) {
+    (void)tid;
+    if (storage>=sizeof(g_native_dlc_roots)/sizeof(g_native_dlc_roots[0])) {
+        (*skipped)++;return 0;
+    }
+    int zeroed=0,already=0;
+    const char *root=g_native_dlc_roots[storage];
+    printf("[dlc-clean] SCAN_ROOT %s\n",root);
+    native_clean_walk(root,0,NULL,&zeroed,&already,skipped);
+    g_point_all_zeroed+=zeroed;
+    g_point_all_already+=already;
+    printf("[dlc-clean] ROOT_DONE %s zeroed=%d already_0B=%d errors=%d\n",
+           root,zeroed,already,*skipped);
+    return zeroed+already;
+}
+
+/* Only native add-on directories are traversed. The USB library is not
+ * consulted or written to by this button. */
 static void point_all_step(void) {
     if (!g_point_all_active) return;
-    if (g_point_all_index >= g_point_all_count || g_stop) {
-        int interrupted = g_stop || g_point_all_index < g_point_all_count;
-        g_point_all_active = 0;
-        g_progress.total = g_point_all_count;
-        g_progress.done = g_point_all_index;
-        g_progress.ok = g_point_all_ok;
-        g_progress.failed = g_point_all_failed;
-        progress_set(interrupted ? "point_all_error" : "point_all_complete",
-                     interrupted ? "Limpar DLCs interrompido" :
-                                   "Limpar DLCs finalizado: somente arquivos nativos, USB intocado");
-        printf("[dlc-clean] %s native_folders=%d/%d files_0B=%d unsafe_or_failed=%d\n",
+    if (g_point_all_index>=g_point_all_count || g_stop) {
+        int interrupted=g_stop || g_point_all_index<g_point_all_count;
+        g_point_all_active=0;
+        g_progress.total=g_point_all_count;
+        g_progress.done=g_point_all_index;
+        g_progress.ok=g_point_all_ok;
+        g_progress.failed=g_point_all_failed;
+        progress_set(interrupted?"point_all_error":
+                     g_point_all_failed?"point_all_error":"point_all_complete",
+                     interrupted?"Limpeza interrompida":
+                     "Varredura nativa encerrada; veja zeroed/already/errors no log");
+        printf("[dlc-clean] %s roots=%d/%d ac_pkg_found=%d ZEROED_NOW=%d ALREADY_0B=%d FAILURES=%d USB_UNTOUCHED\n",
                interrupted?"INTERRUPTED":"DONE",g_point_all_index,g_point_all_count,
-               g_point_all_ok,g_point_all_failed);
+               g_point_all_seen,g_point_all_zeroed,g_point_all_already,g_point_all_failed);
         g_catalog_dirty=1;
         return;
     }
-    const char *tid=g_point_all_titles[g_point_all_index];
     unsigned storage=g_point_all_storage[g_point_all_index];
     int skipped=0;
-    int cleaned=clean_native_title(storage,tid,&skipped);
+    int cleaned=clean_native_title(storage,NULL,&skipped);
     g_point_all_ok+=cleaned;
     g_point_all_failed+=skipped;
     g_point_all_index++;
@@ -3260,10 +3278,14 @@ static void point_all_step(void) {
     g_progress.done=g_point_all_index;
     g_progress.ok=g_point_all_ok;
     g_progress.failed=g_point_all_failed;
-    snprintf(g_progress.current,sizeof(g_progress.current),"%s",tid);
+    if (storage==0)
+        snprintf(g_progress.current,sizeof(g_progress.current),"interno");
+    else
+        snprintf(g_progress.current,sizeof(g_progress.current),"ext%u",storage-1);
     char detail[192];
-    snprintf(detail,sizeof(detail),"Pastas nativas %d/%d; ac.pkg em 0B=%d; pulados/erros=%d; USB intocado",
-             g_point_all_index,g_point_all_count,g_point_all_ok,g_point_all_failed);
+    snprintf(detail,sizeof(detail),"Unidades %d/%d; encontrados=%d; zerados agora=%d; ja 0B=%d; erros=%d; USB intocado",
+             g_point_all_index,g_point_all_count,g_point_all_seen,g_point_all_zeroed,
+             g_point_all_already,g_point_all_failed);
     progress_set("point_all_running",detail);
 }
 
@@ -4869,6 +4891,8 @@ void app_progress_json(buf_t *out) {
     buf_printf(out, ",\"point_all_running\":%s,\"point_all_total\":%d,\"point_all_done\":%d,\"point_all_ok\":%d,\"point_all_failed\":%d,\"point_all_skipped_games\":%d,\"point_all_skipped_dlcs\":%d",
                g_point_all_active?"true":"false", g_point_all_count,g_point_all_index,
                g_point_all_ok,g_point_all_failed,g_point_all_skipped_games,g_point_all_skipped_dlcs);
+    buf_printf(out, ",\"point_all_seen\":%d,\"point_all_zeroed\":%d,\"point_all_already\":%d",
+               g_point_all_seen,g_point_all_zeroed,g_point_all_already);
     buf_printf(out, ",\"dlc_action\":"); json_str(out, g_dlc_action);
     buf_printf(out, ",\"dlc_percent\":%d,\"dlc_content\":", g_dlc_percent);
     json_str(out, g_dlc_content);

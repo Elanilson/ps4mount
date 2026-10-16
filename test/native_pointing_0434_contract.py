@@ -7,7 +7,7 @@ s = (r/'src/main.c').read_text(); u = (r/'web/index.html').read_text()
 def between(start, end):
     return s[s.index(start):s.index(end, s.index(start))]
 clean = between('int app_clean_dlcs(', 'void app_games_json(')
-clean_worker = between('static int clean_native_title(', '/* Reversible, SEQUENTIAL experiment')
+clean_worker = between('/* Native-only 0-byte cleanup', '/* Reversible, SEQUENTIAL experiment')
 manual = between('static void install_dlcs_queued(void)', '/* Native-only 0-byte cleanup')
 point = manual[manual.index('if (manual_pointing) {\n            /* No DB read'): manual.index('} else if (state == 1')]
 mount = between('static int mount_registered_title(', 'static void activate_queued(')
