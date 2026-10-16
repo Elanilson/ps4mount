@@ -196,7 +196,7 @@ $('grid').addEventListener('click', function (e) {
 $('q').addEventListener('input', render);
 $('rescan').onclick = function () { if (!confirm('Buscar PKGs em subpastas e organizá-los dentro do mesmo HD? Nenhum jogo será registrado nessa etapa.')) return; $('progress-wrap').hidden = false; $('progress-title').textContent = 'Solicitando busca no USB…'; $('progress-bar').removeAttribute('value'); $('progress-detail').textContent = 'Aguardando início da busca'; api('/api/rescan', 'POST').then(function () { loadProgress(); }).catch(function (e) { toast('Erro: ' + e.message); loadProgress(); }); };
 $('pointall').onclick = function () {
-  if (!confirm('LIMPAR DLCS NO PS5: deixar com 0 bytes os ac.pkg do SSD INTERNO e da EXPANSAO?\n\nO HD USB NAO sera tocado, mesmo se estiver conectado. Nao verifica registro, versao, comparacao, nem se existe copia USB.\n\nATENCAO: pode apagar definitivamente DLCs instalados no PS5 se nao houver copia original no USB. Feche os jogos e termine instalacoes antes.')) return;
+  if (!confirm('LIMPAR DLCS NO PS5: EXCLUIR e RECRIAR com 0 bytes os ac.pkg do SSD INTERNO e da EXPANSAO?\n\nO HD USB NAO sera tocado, mesmo se estiver conectado. Nao verifica registro, versao, comparacao, nem se existe copia USB.\n\nATENCAO: pode apagar definitivamente DLCs instalados no PS5 se nao houver copia original no USB. Feche os jogos e termine instalacoes antes.')) return;
   if (!confirm('CONFIRMACAO FINAL: ZERAR ac.pkg NATIVOS (interno e expansao), sem apontamento automatico? Conteudo eliminado do PS5; USB completamente intocado. Este comando nao garante que as DLCs funcionem depois.')) return;
   $('progress-wrap').hidden = false;
   $('progress-title').textContent = 'Solicitando Limpar DLCs…';
@@ -244,8 +244,8 @@ function loadProgress() {
       if (pointAllVisible) {
         $('progress-bar').max = Math.max(p.point_all_total,1);
         $('progress-bar').value = p.point_all_done;
-        $('progress-title').textContent = (p.point_all_running ? 'Limpando copias nativas das DLCs' : 'Limpeza de DLCs finalizada') + ' — ' + p.point_all_done + '/' + p.point_all_total + ' unidades';
-        $('progress-detail').textContent = 'Encontrados: ' + p.point_all_seen + ' · Zerados agora: ' + p.point_all_zeroed + ' · Já estavam 0B: ' + p.point_all_already + ' · Falhas: ' + p.point_all_failed + ' · ' + (p.current || '') + ' · ' + (p.detail || '');
+        $('progress-title').textContent = (p.point_all_running ? 'Recriando ac.pkg nativos com 0 bytes' : 'Limpeza de DLCs finalizada') + ' — ' + p.point_all_done + '/' + p.point_all_total + ' unidades';
+        $('progress-detail').textContent = 'Encontrados: ' + p.point_all_seen + ' · Recriados com 0 B: ' + p.point_all_zeroed + ' · Falhas: ' + p.point_all_failed + ' · ' + (p.current || '') + ' · ' + (p.detail || '');
       } else if (p.redirect_running) {
         $('progress-bar').value = p.redirect_done;
         $('progress-title').textContent = (p.redirect_stage === 2 ? 'Montando DLC ' : 'Verificando DLC ') + (p.redirect_current || 1) + '/' + p.redirect_total + ' — ' + (p.redirect_done || 0) + ' concluído(s)';

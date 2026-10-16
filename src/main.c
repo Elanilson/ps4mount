@@ -42,7 +42,7 @@
 #include "web.h"
 #include "icon_data.h"
 
-#define VERSION "PS4Mount 0.4.35-native-recursive-all-acpkg-TEST"
+#define VERSION "PS4Mount 0.4.37-independent-acpkg-0B-TEST"
 #define LOCK_PORT 9032
 #define SCAN_SECONDS 10 /* legacy value; polling for PKGs is disabled */
 #define STATE_DIR "/data/ps4mount"
@@ -1755,6 +1755,8 @@ typedef struct {
 static catalog_item_t g_catalog[CATALOG_MAX];
 /* "Limpar DLCs" walks ONLY native PS5 add-on folders, never the USB library.
  * /user = internal; /mnt/extN = expansion storage. */
+/* Prevent automatic PS4Mount nullfs DLC overlays from concealing native 0B
+ * stubs after a restart. Explicit user-initiated mount/pointing is unchanged. */
 static const char *g_native_dlc_roots[] = {
     "/user/addcont",
     "/mnt/ext0/user/addcont", "/mnt/ext1/user/addcont",
@@ -1849,10 +1851,10 @@ int app_clean_dlcs(char *msg, size_t cap) {
     }
     g_point_all_active=1;
     g_progress=(progress_t){"point_all_queued",g_point_all_count,0,0,0,"",
-        "Limpar DLCs: varredura recursiva de TODO ac.pkg nativo; USB intocado"};
+        "Limpar DLCs: apagar/recriar ac.pkg (0B), sem montar/desmontar"};
     snprintf(g_dlc_action,sizeof(g_dlc_action),"clean-dlcs");
-    printf("[dlc-clean] START native_storage_roots=%d; recursive any ac.pkg; no DB, CUSA, label or USB check\n",g_point_all_count);
-    snprintf(msg,cap,"Limpar DLCs: varredura de %d unidades nativas (USB intocado)",g_point_all_count);
+    printf("[dlc-clean] START roots=%d; action=unlink+create+verify; NO_MOUNT_NO_UNMOUNT; NO_DB; no USB writes\n",g_point_all_count);
+    snprintf(msg,cap,"Limpar DLCs: %d unidades; sem montar/desmontar",g_point_all_count);
     return 0;
 }
 
@@ -2178,14 +2180,18 @@ static int restore_one(const char *tid) {
     int rc = -1;
     if (!db_snapshot_healthy() || title_state(&t) != 0) {
         printf("[restore] %s: database/marker/files incomplete. No automatic repair\n", tid);
-    } else if (mount_title(&t) || !title_layers_mounted(&t)) {
-        printf("[restore] %s: mount failed or foreign layer; stopped for this title\n", tid);
     } else {
-        manage(&t);
-        if (save_active(tid))
-            printf("[restore] %s mounted, but could not save active flag\n", tid);
-        else
-            rc = 0;
+        int mount_error=mount_title(&t);
+        int verified=title_layers_mounted(&t);
+        if(mount_error || !verified) {
+            printf("[restore] %s: mount failed or foreign layer; stopped for this title\n", tid);
+        } else {
+            manage(&t);
+            if (save_active(tid))
+                printf("[restore] %s mounted, but could not save active flag\n", tid);
+            else
+                rc = 0;
+        }
     }
     src_close(&t);
     return rc;
@@ -3107,127 +3113,108 @@ failed:
 
 
 
-/* Native-only 0-byte cleanup: recursive, every file literally named ac.pkg below
- * every internal/expansion /user/addcont, with no CUSA/label/DB filtering.
- * The ONLY exclusion is the physical boundary: never truncate USB content,
- * nullfs views, symlinks, or an unknown/busy mount that could expose USB. */
+/* Independent native ac.pkg cleaner. It ONLY walks files and executes
+ * unlink() + open(O_CREAT|O_EXCL) + checks size == 0. No database, USB scan,
+ * mount system calls, overlay inventory, or state/marker updates.
+ * An existing nullfs overlay makes underlying files invisible. To avoid
+ * deleting USB-backed packages, SKIP its subtree and REPORT A FAILURE.
+ * Never silently report success when a path cannot be cleaned. */
 static int native_clean_safe_fs(const struct statfs *sf) {
     return strcmp(sf->f_fstypename,"nullfs") != 0 &&
            strncmp(sf->f_mntonname,"/mnt/usb",8) != 0 &&
            strncmp(sf->f_mntfromname,"/mnt/usb",8) != 0;
 }
 
-/* Depth 0 = addcont root, 1 = immediate child (normally CUSA),
- * 2 = add-on label (normally 16 characters), deeper = other directories.
- * No folder-name criteria are applied. Owned PS4Mount overlays are released
- * temporarily so the real PS5 file is visible, then restored. */
-static void native_clean_walk(const char *dir, unsigned depth, const char *tid,
-                              int *zeroed,int *already,int *skipped) {
-    if (g_stop) return;
-    if (depth > 32) {
-        printf("[dlc-clean] DEPTH_LIMIT %s\n",dir);
-        (*skipped)++;return;
+static int native_clean_replace(const char *path,int *recreated) {
+    struct stat before, now={0}, after;
+    struct statfs fs;
+    if(lstat(path,&before) || !(S_ISREG(before.st_mode)||S_ISLNK(before.st_mode)) ||
+       layers_on(path)||dead_layer(path)) {
+        printf("[dlc-clean] FILE_NOT_ACCESSIBLE %s errno=%d\n",path,errno);
+        return -1;
     }
-    struct stat st;
-    if (lstat(dir,&st) || !S_ISDIR(st.st_mode)) {
-        printf("[dlc-clean] DIRECTORY_UNAVAILABLE %s\n",dir);
-        (*skipped)++;return;
+    char parent[PATH_MAX];
+    if(snprintf(parent,sizeof(parent),"%s",path)>=(int)sizeof(parent))return -1;
+    char *slash=strrchr(parent,'/');if(!slash)return -1;*slash=0;
+    if(lstat(parent,&now)||!S_ISDIR(now.st_mode)||layers_on(parent)||dead_layer(parent)||
+       statfs(parent,&fs)||!native_clean_safe_fs(&fs)) {
+        printf("[dlc-clean] PARENT_MOUNTED_OR_UNSAFE %s\n",parent);
+        return -1;
     }
-    char stage[PATH_MAX]={0};
-    int released=0;
-    if (layers_on(dir) || dead_layer(dir)) {
-        int recognized=0;
-        if (depth==1) {
-            hold_path(stage,sizeof(stage),"addcont",tid);
-            recognized=1;
-        } else if (depth==2) {
-            snprintf(stage,sizeof(stage),HOLD_DIR "/offload/%s/%s",tid,
-                     strrchr(dir,'/') ? strrchr(dir,'/')+1 : dir);
-            recognized=1;
-        }
-        if (!recognized || top_layer(dir,stage)!=1 ||
-            owned_layer_count(dir,stage)!=1 || unmount(dir,0)) {
-            printf("[dlc-clean] SKIP_NONNATIVE_OR_BUSY_MOUNT %s\n",dir);
-            (*skipped)++;return;
-        }
-        released=1;
-        printf("[dlc-clean] TEMPORARILY_UNMOUNTED_OWN_LAYER %s\n",dir);
+    if(S_ISREG(before.st_mode)) {
+        int fd=open(path,O_RDONLY|O_NOFOLLOW);
+        if(fd<0) {printf("[dlc-clean] CHECK_OPEN_FAILED %s errno=%d\n",path,errno);return -1;}
+        int bad=fstat(fd,&now)||!S_ISREG(now.st_mode)||now.st_dev!=before.st_dev||
+                now.st_ino!=before.st_ino||fstatfs(fd,&fs)||!native_clean_safe_fs(&fs);
+        if(close(fd))bad=1;
+        if(bad) {printf("[dlc-clean] SOURCE_MOUNTED_OR_UNSAFE %s\n",path);return -1;}
     }
-    struct statfs sf;
-    if (statfs(dir,&sf) || !native_clean_safe_fs(&sf)) {
-        printf("[dlc-clean] SKIP_NONNATIVE_DIR %s\n",dir);
-        (*skipped)++;
-        goto restore;
+    unsigned long long bytes=S_ISREG(before.st_mode)?(unsigned long long)before.st_size:0;
+    mode_t mode=S_ISREG(before.st_mode)?(before.st_mode&07777):0644;
+    if(unlink(path)) {
+        printf("[dlc-clean] DELETE_FAILED %s errno=%d\n",path,errno);
+        return -1;
+    }
+    int fd=open(path,O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW,mode);
+    if(fd<0) {
+        printf("[dlc-clean] CRITICAL_CREATE_FAILED %s errno=%d (original removed)\n",path,errno);
+        return -1;
+    }
+    int err=0;
+    if(S_ISREG(before.st_mode) && fchown(fd,before.st_uid,before.st_gid))err=errno;
+    if(!err && fchmod(fd,mode))err=errno;
+    if(!err && fsync(fd))err=errno;
+    if(!err && (fstat(fd,&now)||!S_ISREG(now.st_mode)||now.st_size!=0||
+                fstatfs(fd,&fs)||!native_clean_safe_fs(&fs)))err=EIO;
+    dev_t dev=now.st_dev;ino_t ino=now.st_ino;
+    if(close(fd)&&!err)err=errno;
+    if(!err && (lstat(path,&after)||!S_ISREG(after.st_mode)||after.st_size!=0||
+                after.st_dev!=dev||after.st_ino!=ino||layers_on(path)||dead_layer(path)||
+                statfs(path,&fs)||!native_clean_safe_fs(&fs)))err=EIO;
+    if(err) {
+        printf("[dlc-clean] VERIFY_FAILED %s errno=%d\n",path,err);
+        return -1;
+    }
+    (*recreated)++;
+    printf("[dlc-clean] RECREATED_0B_VERIFIED %s old_bytes=%llu new_bytes=0 NO_MOUNT_NO_UNMOUNT\n",path,bytes);
+    return 0;
+}
+
+/* Recursive path scan; no CUSA or label filtering, no mounts or unmounts.
+ * Never follow symlinked directories or any existing overlay filesystem. */
+static void native_clean_walk(const char *dir,unsigned depth,const char *unused_tid,
+                              int *recreated,int *unused_already,int *failed) {
+    (void)unused_tid;(void)unused_already;
+    if(g_stop)return;
+    if(depth>32) {printf("[dlc-clean] DEPTH_LIMIT %s\n",dir);(*failed)++;return;}
+    struct stat st;struct statfs fs;
+    if(lstat(dir,&st)||!S_ISDIR(st.st_mode)||statfs(dir,&fs)||
+       !native_clean_safe_fs(&fs)||layers_on(dir)||dead_layer(dir)) {
+        printf("[dlc-clean] SKIPPED_MOUNTED_OR_UNSAFE_DIR %s (NO_UNMOUNT)\n",dir);
+        (*failed)++;return;
     }
     DIR *d=opendir(dir);
-    if (!d) {
-        printf("[dlc-clean] OPENDIR_FAILED %s errno=%d\n",dir,errno);
-        (*skipped)++;
-        goto restore;
-    }
+    if(!d){printf("[dlc-clean] OPENDIR_FAILED %s errno=%d\n",dir,errno);(*failed)++;return;}
     struct dirent *e;
-    while (!g_stop && (e=readdir(d))) {
+    while(!g_stop && (e=readdir(d))) {
         const char *name=e->d_name;
-        if (!strcmp(name,".") || !strcmp(name,"..")) continue;
+        if(!strcmp(name,".")||!strcmp(name,".."))continue;
         char path[PATH_MAX];
-        int written=snprintf(path,sizeof(path),"%s/%s",dir,name);
-        if (written<0 || (size_t)written>=sizeof(path)) {
-            printf("[dlc-clean] PATH_TOO_LONG %s/%s\n",dir,name);
-            (*skipped)++;continue;
+        int n=snprintf(path,sizeof(path),"%s/%s",dir,name);
+        if(n<0||(size_t)n>=sizeof(path)) {
+            printf("[dlc-clean] PATH_TOO_LONG %s/%s\n",dir,name);(*failed)++;continue;
         }
-        if (lstat(path,&st)) {
-            printf("[dlc-clean] LSTAT_FAILED %s errno=%d\n",path,errno);
-            (*skipped)++;continue;
+        if(lstat(path,&st)) {
+            printf("[dlc-clean] LSTAT_FAILED %s errno=%d\n",path,errno);(*failed)++;continue;
         }
-        if (S_ISDIR(st.st_mode)) {
-            native_clean_walk(path,depth+1,depth==0?name:tid,zeroed,already,skipped);
-            continue;
-        }
-        if (strcmp(name,"ac.pkg")) continue;
-        g_point_all_seen++;
-        if (!S_ISREG(st.st_mode) || layers_on(path) || dead_layer(path)) {
-            printf("[dlc-clean] SKIP_NONREGULAR_OR_MOUNTED_FILE %s\n",path);
-            (*skipped)++;continue;
-        }
-        int opened_for_write=st.st_size>0;
-        int fd=open(path,(opened_for_write?O_WRONLY:O_RDONLY)|O_NOFOLLOW);
-        if (fd<0) {
-            printf("[dlc-clean] OPEN_FAILED %s errno=%d\n",path,errno);
-            (*skipped)++;continue;
-        }
-        struct statfs filefs;
-        int invalid=fstat(fd,&st) || !S_ISREG(st.st_mode) ||
-                    fstatfs(fd,&filefs) || !native_clean_safe_fs(&filefs) ||
-                    layers_on(path) || dead_layer(path);
-        if (invalid || (st.st_size>0 && !opened_for_write)) {
-            printf("[dlc-clean] SKIP_UNSAFE_TARGET %s\n",path);
-            close(fd);(*skipped)++;continue;
-        }
-        if (st.st_size==0) {
-            printf("[dlc-clean] ALREADY_0B %s\n",path);
-            (*already)++;
-            close(fd);continue;
-        }
-        unsigned long long oldsize=(unsigned long long)st.st_size;
-        int rc=ftruncate(fd,0);
-        int saved_errno=errno;
-        if (!rc) {rc=fsync(fd); saved_errno=errno;}
-        close(fd);
-        if (rc) {
-            printf("[dlc-clean] ZERO_FAILED %s errno=%d\n",path,saved_errno);
-            (*skipped)++;
-        } else {
-            printf("[dlc-clean] ZEROED_NATIVE %s old_bytes=%llu new_bytes=0 USB_UNTOUCHED\n",
-                   path,oldsize);
-            (*zeroed)++;
+        if(S_ISDIR(st.st_mode)) {
+            native_clean_walk(path,depth+1,NULL,recreated,unused_already,failed);
+        } else if(!strcmp(name,"ac.pkg")) {
+            g_point_all_seen++;
+            if(native_clean_replace(path,recreated))(*failed)++;
         }
     }
     closedir(d);
-restore:
-    if (released && nullfs_mount(stage,dir)) {
-        printf("[dlc-clean] RESTORE_OWN_LAYER_FAILED %s\n",dir);
-        (*skipped)++;
-    }
 }
 
 /* Operates on a whole native storage root; tid is intentionally not involved. */
@@ -3242,8 +3229,8 @@ static int clean_native_title(unsigned storage,const char *tid,int *skipped) {
     native_clean_walk(root,0,NULL,&zeroed,&already,skipped);
     g_point_all_zeroed+=zeroed;
     g_point_all_already+=already;
-    printf("[dlc-clean] ROOT_DONE %s zeroed=%d already_0B=%d errors=%d\n",
-           root,zeroed,already,*skipped);
+    printf("[dlc-clean] ROOT_DONE %s recreated_0B=%d errors=%d\n",
+           root,zeroed,*skipped);
     return zeroed+already;
 }
 
@@ -3261,10 +3248,10 @@ static void point_all_step(void) {
         progress_set(interrupted?"point_all_error":
                      g_point_all_failed?"point_all_error":"point_all_complete",
                      interrupted?"Limpeza interrompida":
-                     "Varredura nativa encerrada; veja zeroed/already/errors no log");
-        printf("[dlc-clean] %s roots=%d/%d ac_pkg_found=%d ZEROED_NOW=%d ALREADY_0B=%d FAILURES=%d USB_UNTOUCHED\n",
+                     "Limpeza concluida; confira recriados/falhas no log; sem desmontar");
+        printf("[dlc-clean] %s roots=%d/%d ac_pkg_found=%d RECREATED_0B=%d FAILURES=%d NO_MOUNT_NO_UNMOUNT\n",
                interrupted?"INTERRUPTED":"DONE",g_point_all_index,g_point_all_count,
-               g_point_all_seen,g_point_all_zeroed,g_point_all_already,g_point_all_failed);
+               g_point_all_seen,g_point_all_zeroed,g_point_all_failed);
         g_catalog_dirty=1;
         return;
     }
@@ -3283,9 +3270,9 @@ static void point_all_step(void) {
     else
         snprintf(g_progress.current,sizeof(g_progress.current),"ext%u",storage-1);
     char detail[192];
-    snprintf(detail,sizeof(detail),"Unidades %d/%d; encontrados=%d; zerados agora=%d; ja 0B=%d; erros=%d; USB intocado",
+    snprintf(detail,sizeof(detail),"Unidades %d/%d; encontrados=%d; recriados 0B=%d; erros=%d; sem montar/desmontar",
              g_point_all_index,g_point_all_count,g_point_all_seen,g_point_all_zeroed,
-             g_point_all_already,g_point_all_failed);
+             g_point_all_failed);
     progress_set("point_all_running",detail);
 }
 

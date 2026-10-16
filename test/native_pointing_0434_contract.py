@@ -7,8 +7,8 @@ s = (r/'src/main.c').read_text(); u = (r/'web/index.html').read_text()
 def between(start, end):
     return s[s.index(start):s.index(end, s.index(start))]
 clean = between('int app_clean_dlcs(', 'void app_games_json(')
-clean_worker = between('/* Native-only 0-byte cleanup', '/* Reversible, SEQUENTIAL experiment')
-manual = between('static void install_dlcs_queued(void)', '/* Native-only 0-byte cleanup')
+clean_worker = between('/* Independent native ac.pkg cleaner.', '/* Reversible, SEQUENTIAL experiment')
+manual = between('static void install_dlcs_queued(void)', '/* Independent native ac.pkg cleaner.')
 point = manual[manual.index('if (manual_pointing) {\n            /* No DB read'): manual.index('} else if (state == 1')]
 mount = between('static int mount_registered_title(', 'static void activate_queued(')
 assert 'installed_internally(tid) || title_running(tid)' not in between('int app_add(', 'static volatile int g_one_uninstall_busy')
@@ -24,7 +24,7 @@ assert 'CREATED native empty ac.pkg' in s
 assert 'build_app_json(&json,&dlc->pkg,dlc->path)' in s
 assert 'g_dlc_manual_pointing=1;' in s and 'queued manual pointing for' in s
 assert 'db_is_registered' not in clean and 'db_dlc_registration' not in clean
-assert 'ftruncate(fd,0)' in clean_worker and 'O_NOFOLLOW' in clean_worker
+assert 'unlink(path)' in clean_worker and 'O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW' in clean_worker
 assert 'g_native_dlc_roots[storage]' in clean_worker
 assert 'unlink(rec.usb)' not in s and 'rename(rec.usb' not in s and 'ftruncate(rec.usb' not in s
 assert "'internal'].indexOf(g.state) >= 0" in u
