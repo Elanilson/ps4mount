@@ -21,7 +21,7 @@ checks={
  'manual search can return live progress during traversal': ('walk_pkg_dirs_progress(' in main or 'walk_pkg_dirs_progress_cancel(' in main) and 'pump_events(1)' in main,
  'indeterminate panel progress while search total unknown': "removeAttribute('value')" in page and 'p.scan_folders' in page,
  'mount/unmount button wording': '>Montar</button>' in page and '>Desmontar</button>' in page,
- 'mounted state wins over inactive marker': main.index('else if (mounted && db_is_registered(tid)) state') < main.index('else if (removed(tid)) state') < main.index('else if (!active_status(tid)) state'),
+ 'mounted state wins over inactive marker': main.index('else if (mounted) state = "ready"') < main.index('else if (removed(tid) || !active_status(tid)) state'),
  'failed writes leave an attempt guard': 'STATE_DIR "/%s.attempt"' in main and 'exists(attempt)' in main,
  'app.db freshness checked before staging': 'db_snapshot_healthy()' in main and 'g_last_good' in db,
  'no forced mount teardown': 'MNT_FORCE' not in main and 'unmount_all_layers(' not in main,

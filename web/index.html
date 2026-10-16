@@ -131,7 +131,7 @@ function render() {
     if (q && (g.name + ' ' + g.title_id).toLowerCase().indexOf(q) < 0) return;
     shown++;
     var act = '';
-    if (['removed', 'inactive', 'pending'].indexOf(g.state) >= 0) act = '<button class="primary" data-a="mount" data-t="' + g.title_id + '">Montar</button>';
+    if (['removed', 'inactive', 'pending', 'internal'].indexOf(g.state) >= 0) act = '<button class="primary" data-a="mount" data-t="' + g.title_id + '">Montar</button>';
     else if (g.state === 'ready') act = '<button class="danger" data-a="unmount" data-t="' + g.title_id + '">Desmontar</button>';
     else if (g.state === 'running') act = '<button disabled>Feche o jogo para desmontar</button>';
     var job = busy[g.title_id];
@@ -139,9 +139,9 @@ function render() {
       (job.action === 'unmount' ? 'Desmontando…' :
        job.action === 'reinstall-dlcs' ? 'Instalando DLCs…' :
        job.action === 'point-dlcs' ? 'Apontando DLCs…' : 'Montando e processando DLCs…') + '</button>';
-    else if (g.dlc > 0 && ['ready','inactive'].indexOf(g.state) >= 0)
+    else if (g.dlc > 0 && ['ready','inactive','internal','pending'].indexOf(g.state) >= 0)
       act += '<button data-a="reinstall-dlcs" data-t="' + g.title_id + '" title="Reinstala nativamente a partir dos PKGs do USB; NAO libera o SSD">Reinstalar DLCs</button>' +
-             '<button data-a="point-dlcs" data-t="' + g.title_id + '" title="Somente apos concluir a instalacao no PS5: aponta o DLC para USB e libera a copia nativa">Apontamento</button>';
+             '<button data-a="point-dlcs" data-t="' + g.title_id + '" title="Aponta todos os ac.pkg do jogo existentes no USB sem consultar registro; cria stub nativo se necessario">Apontamento</button>';
     html += '<div class="card"><div class="art" style="background-image:url(/icon/' + g.title_id + ')">' +
       '<span class="badge b-' + g.state + '">' + esc(labels[g.state] || g.state) + '</span></div>' +
       '<div class="info"><div class="name">' + esc(g.name) + '</div>' +

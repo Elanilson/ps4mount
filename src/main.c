@@ -11,7 +11,8 @@
  *      to the pkg, that folder is mounted over /user/app/<TITLE_ID> (nullfs) and
  *      the title is added to app.db/appinfo.db.
  *   3. Mounts whose storage disappeared are released.
- * Titles installed the normal way are never touched. */
+ * In explicit native-pointing mode, already-installed PS4 app/patch packages
+ * can be emptied on PS5 after verified PS4Mount nullfs mounting. */
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -41,7 +42,7 @@
 #include "web.h"
 #include "icon_data.h"
 
-#define VERSION "PS4Mount 0.4.33-native-only-clean-TEST"
+#define VERSION "PS4Mount 0.4.34-unrestricted-native-point-TEST"
 #define LOCK_PORT 9032
 #define SCAN_SECONDS 10 /* legacy value; polling for PKGs is disabled */
 #define STATE_DIR "/data/ps4mount"
@@ -974,14 +975,19 @@ static int removed(const char *tid) {
     return exists(p);
 }
 
-/* Real installs keep app.pkg on the internal drive; never touch those. */
+/* Native package present and nonempty. Zero-byte stubs produced by native
+ * pointing must NOT prevent remount/restore after reboot. */
 static int installed_internally(const char *tid) {
-    char p[64];
-    snprintf(p, sizeof(p), "/user/app/%s", tid);
-    if (mounted_from(p, NULL, 0))
-        return 0;
-    snprintf(p, sizeof(p), "/user/app/%s/app.pkg", tid);
-    return exists(p);
+    char p[PATH_MAX]; struct stat st;
+    for (int i=-1;i<8;i++) {
+        if (i<0) snprintf(p,sizeof(p),"/user/app/%s",tid);
+        else snprintf(p,sizeof(p),"/mnt/ext%d/user/app/%s",i,tid);
+        if (layers_on(p) || dead_layer(p)) continue;
+        size_t n=strlen(p);
+        snprintf(p+n,sizeof(p)-n,"/app.pkg");
+        if (!lstat(p,&st) && S_ISREG(st.st_mode) && st.st_size>0) return 1;
+    }
+    return 0;
 }
 
 static int marker_matches(const char *tid, const char *expected) {
@@ -1018,7 +1024,7 @@ static int served_elsewhere(const title_src_t *t) {
 
 static int title_state(title_src_t *t) {
     const char *tid = t->app.title_id;
-    if (installed_internally(tid) || removed(tid))
+    if (removed(tid))
         return -1;
     if (served_elsewhere(t)) {
         if (first_time(t->app_path))
@@ -1756,8 +1762,9 @@ static const char *g_native_dlc_roots[] = {
     "/mnt/ext4/user/addcont", "/mnt/ext5/user/addcont",
     "/mnt/ext6/user/addcont", "/mnt/ext7/user/addcont"
 };
-static char g_point_all_titles[CATALOG_MAX][10];
-static unsigned char g_point_all_storage[CATALOG_MAX];
+#define NATIVE_CLEAN_MAX 8192
+static char g_point_all_titles[NATIVE_CLEAN_MAX][10];
+static unsigned char g_point_all_storage[NATIVE_CLEAN_MAX];
 static int g_point_all_count, g_point_all_index;
 static int g_point_all_ok, g_point_all_failed, g_point_all_skipped_games, g_point_all_skipped_dlcs;
 
@@ -1843,8 +1850,8 @@ int app_clean_dlcs(char *msg, size_t cap) {
             char dir[PATH_MAX];
             snprintf(dir,sizeof(dir),"%s/%s",root,tid);
             if (lstat(dir,&st) || !S_ISDIR(st.st_mode)) continue;
-            if (g_point_all_count>=CATALOG_MAX) {
-                printf("[dlc-clean] LIMIT %d native folders; remaining not queued\n",CATALOG_MAX);
+            if (g_point_all_count>=NATIVE_CLEAN_MAX) {
+                printf("[dlc-clean] LIMIT %d native folders; remaining not queued\n",NATIVE_CLEAN_MAX);
                 break;
             }
             snprintf(g_point_all_titles[g_point_all_count],sizeof(g_point_all_titles[0]),"%s",tid);
@@ -1897,11 +1904,10 @@ void app_games_json(buf_t *out) {
             }
         }
         managed_t *m = managed_by(tid, NULL);
-        if (installed_internally(tid)) state = "internal";
-        else if (m && m->running) state = "running";
-        else if (mounted && db_is_registered(tid)) state = "ready";
-        else if (removed(tid)) state = "removed";
-        else if (!active_status(tid)) state = "inactive";
+        if (m && m->running) state = "running";
+        else if (mounted) state = "ready";
+        else if (removed(tid) || !active_status(tid)) state = "inactive";
+        else if (installed_internally(tid)) state = "internal";
         else state = "pending";
         buf_printf(out, "%s{\"title_id\":\"%s\",\"name\":", i ? "," : "", tid);
         json_str(out, t->name);
@@ -1962,8 +1968,8 @@ int app_add(const char *tid, char *msg, size_t cap) {
         snprintf(msg, cap, "%s not found in the organized USB library; search first", tid);
         return -1;
     }
-    if (installed_internally(tid) || title_running(tid)) {
-        snprintf(msg, cap, "%s is installed internally or currently running", tid);
+    if (title_running(tid)) {
+        snprintf(msg, cap, "%s is currently running; close it before mounting", tid);
         return -1;
     }
     snprintf(g_activate_request, sizeof(g_activate_request), "%s", tid);
@@ -2419,17 +2425,65 @@ static int usb_dlc_revalidate(title_src_t *t, const char *why) {
     return (missing || unknown) ? -1 : 0;
 }
 
+/* Capture native app/patch file descriptors BEFORE nullfs overlays cover them.
+ * An fd opened on a native filesystem cannot suddenly target USB after mount.
+ * Never follow symlinks or operate on a USB/nullfs filesystem. */
+typedef struct { int fd; char path[PATH_MAX]; unsigned long long bytes; } native_game_pkg_t;
+static void native_game_close(native_game_pkg_t *p) { if (p->fd >= 0) close(p->fd); p->fd=-1; }
+static int native_game_open(const char *tid,const char *kind,native_game_pkg_t *p) {
+    p->fd=-1; p->bytes=0; p->path[0]=0;
+    const char *filename=!strcmp(kind,"app")?"app.pkg":"patch.pkg";
+    for (int i=-1;i<8;i++) {
+        char dir[PATH_MAX],file[PATH_MAX];struct stat st;struct statfs sf;
+        if(i<0) snprintf(dir,sizeof(dir),"/user/%s/%s",kind,tid);
+        else snprintf(dir,sizeof(dir),"/mnt/ext%d/user/%s/%s",i,kind,tid);
+        if (layers_on(dir) || dead_layer(dir))continue;
+        snprintf(file,sizeof(file),"%s/%s",dir,filename);
+        if (lstat(file,&st) || !S_ISREG(st.st_mode))continue;
+        int fd=open(file,O_WRONLY|O_NOFOLLOW);
+        if (fd<0) {printf("[native-game] OPEN FAILED %s errno=%d\n",file,errno);return -1;}
+        if (fstat(fd,&st) || !S_ISREG(st.st_mode) || fstatfs(fd,&sf) ||
+            !strcmp(sf.f_fstypename,"nullfs") || !strncmp(sf.f_mntonname,"/mnt/usb",8)) {
+            printf("[native-game] REFUSED nonnative filesystem %s\n",file);close(fd);return -1;
+        }
+        p->fd=fd; p->bytes=(unsigned long long)st.st_size;
+        snprintf(p->path,sizeof(p->path),"%s",file);
+        return 0;
+    }
+    return 0;
+}
+static int native_game_zero(native_game_pkg_t *p,const char *tid,const char *kind) {
+    if (p->fd<0) return 0; /* no native pkg to truncate */
+    char dir[PATH_MAX],hold[PATH_MAX];
+    snprintf(dir,sizeof(dir),"/user/%s/%s",kind,tid);
+    hold_path(hold,sizeof(hold),kind,tid);
+    if (top_layer(dir,hold)!=1 || owned_layer_count(dir,hold)<1) {
+        printf("[native-game] %s not redirected; native file preserved\n",p->path);return -1;
+    }
+    /* Path is now covered by nullfs; fd remains bound to native inode. */
+    if (ftruncate(p->fd,0) || fsync(p->fd)) {
+        printf("[native-game] ZERO FAILED %s errno=%d\n",p->path,errno);return -1;
+    }
+    printf("[native-game] NATIVE_0B %s freed_logical=%llu USB intact\n",p->path,p->bytes);
+    return 0;
+}
+
 static int mount_registered_title(title_src_t *t) {
     const char *tid = t->app.title_id;
+    native_game_pkg_t nat_app={.fd=-1},nat_patch={.fd=-1};
+    if (native_game_open(tid,"app",&nat_app) ||
+        (t->has_patch && native_game_open(tid,"patch",&nat_patch))) {
+        goto fail;
+    }
     char root[32];
     if (find_root(tid, root, sizeof(root)) || strncmp(t->dir, root, strlen(root)) ||
         t->dir[strlen(root)] != '/') {
         printf("[manual][mount] %s: disconnected or changed USB source\n", tid);
-        return -1;
+        goto fail;
     }
     if (target_mounts_safe(t)) {
         printf("[manual][mount] %s: occupied/unreadable mount target; cannot replace another layer\n", tid);
-        return -1;
+        goto fail;
     }
     char pdb[PATH_MAX];
     snprintf(pdb, sizeof(pdb), "/user/playgo/app/%s/00/d0.pdb", t->app.content_id);
@@ -2442,7 +2496,7 @@ static int mount_registered_title(title_src_t *t) {
         progress_set("activating", "Refreshing metadata and USB links of registered game");
         if (place_files(t)) {
             printf("[manual][mount] %s: preparing metadata FAILED\n", tid);
-            return -1;
+            goto fail;
         }
     } else {
         printf("[manual][mount] %s: existing DB registration, prepared files reusable\n", tid);
@@ -2450,19 +2504,31 @@ static int mount_registered_title(title_src_t *t) {
     progress_set("activating", "Montando jogo base, atualizacao e DLCs");
     if (mount_title(t) || !title_layers_mounted(t)) {
         printf("[manual][mount] %s: incomplete/failed filesystem mount\n", tid);
-        return -1;
+        goto fail;
     }
     if (refresh && register_finish(t)) {
         printf("[manual][mount] %s: saving refreshed title marker FAILED\n", tid);
-        return -1;
+        goto fail;
     }
     if (save_active(tid)) {
         printf("[manual][mount] %s: saving active state FAILED\n", tid);
-        return -1;
+        goto fail;
     }
     manage(t);
-    printf("[manual][mount] %s: mounted using existing PS5 registration, no ownership marker required\n", tid);
+    /* App/patch fully mounted first; only then discard console-side pkg data. */
+    if (native_game_zero(&nat_app,tid,"app") ||
+        (t->has_patch && native_game_zero(&nat_patch,tid,"patch"))) {
+        printf("[native-game] %s mounted but could not zero all native PKGs\n",tid);
+        goto fail;
+    }
+    printf("[manual][mount] %s: USB mounted, native base/patch files 0B when present\n",tid);
+    goto success;
+success:
+    native_game_close(&nat_app);native_game_close(&nat_patch);
     return 0;
+fail:
+    native_game_close(&nat_app);native_game_close(&nat_patch);
+    return -1;
 }
 
 static void activate_queued(void) {
@@ -2531,7 +2597,7 @@ static void activate_queued(void) {
     if (!rc) {
         printf("[manual][activate] %s activated: game+update+DLC mounts checked; %d DLC source(s) staged\n",
                tid, t.ndlc);
-        report_dlc_registration(&t);
+        printf("[manual][activate] %s USB source DLCs=%d; no DLC DB confirmation needed\n",tid,t.ndlc);
     }
     int found_dlcs = t.ndlc;
     src_close(&t);
@@ -2543,9 +2609,10 @@ static void activate_queued(void) {
      * A second main-loop iteration handles this without blocking the panel. */
     if (found_dlcs) {
         snprintf(g_dlc_install_request, sizeof(g_dlc_install_request), "%s", tid);
-        g_progress = (progress_t){"dlc_queued", found_dlcs, 0, 0, 0, "", "Montagem concluida; instalando e mapeando DLCs"};
+        g_dlc_manual_pointing=1;
+        g_progress = (progress_t){"dlc_queued", found_dlcs, 0, 0, 0, "", "Montagem concluida; apontando DLCs sem registro"};
         snprintf(g_progress.current, sizeof(g_progress.current), "%s", tid);
-        printf("[oneclick] %s stage 1/2 base mounted; stage 2/2 queued DLC native register + USB offload (%d)\n",tid,found_dlcs);
+        printf("[oneclick] %s game redirected; queued manual pointing for %d USB DLCs, no DB checks\n",tid,found_dlcs);
     } else {
         progress_set("complete", "Jogo e atualizacao montados (sem DLCs)");
         notify("PS4Mount: %s montado sem DLCs", tid);
@@ -2686,8 +2753,8 @@ static int queue_dlc_job(const char *tid, char *msg, size_t cap, int needs_insta
         snprintf(msg, cap, "%s: USB storage not connected", tid);
         return -1;
     }
-    if (title_running(tid) || installed_internally(tid)) {
-        snprintf(msg, cap, "Close the game and use an external USB game");
+    if (title_running(tid) || (needs_installer && installed_internally(tid))) {
+        snprintf(msg, cap, "Close the game before DLC operation");
         return -1;
     }
     if (needs_installer && (!db_snapshot_healthy() || !db_is_registered(tid))) {
@@ -2720,8 +2787,8 @@ int app_force_reinstall_dlcs(const char *tid, char *msg, size_t cap) {
     return 0;
 }
 
-/* Explicit opt-in. Runs NO installer and never implicitly follows a Mount.
- * User confirms that all native DLC installations have completed on PS5. */
+/* Explicit per-game pointing; NO installer or DLC DB requirement.
+ * Mount may also queue this operation for USB DLC files. */
 int app_manual_point_dlcs(const char *tid, char *msg, size_t cap) {
     if (queue_dlc_job(tid, msg, cap, 0)) return -1;
     g_dlc_manual_pointing = 1;
@@ -2860,7 +2927,8 @@ static void install_dlcs_queued(void) {
     snprintf(only_cid, sizeof(only_cid), "%s", g_dlc_install_only_cid);
     g_dlc_install_only_cid[0] = 0;
     snprintf(g_progress.current, sizeof(g_progress.current), "%s", tid);
-    progress_set("installing_dlcs", "Verificando registros dos DLCs");
+    progress_set("installing_dlcs", manual_pointing ?
+                 "Apontamento de DLCs por pasta, sem DB" : "Verificando registros dos DLCs");
     title_src_t t = {0};
     int opened = 0;
     int fatal = 0;
@@ -2880,7 +2948,8 @@ static void install_dlcs_queued(void) {
     const char *ids[MAX_DLC];
     int states[MAX_DLC];
     for (int i = 0; i < t.ndlc; ++i) ids[i] = t.dlc[i].pkg.content_id;
-    db_dlc_registration(ids, t.ndlc, states);
+    if (!manual_pointing) db_dlc_registration(ids, t.ndlc, states);
+    else for (int i=0;i<t.ndlc;i++) states[i]=-1;
     /* One click processes each DLC. Already-registered DLCs are not reinstalled:
      * they may already have a zero-byte native stub from previous offloading. */
     int todo = only_cid[0] ? 1 : t.ndlc;
@@ -2904,6 +2973,25 @@ static void install_dlcs_queued(void) {
     if (!todo) goto done;
     /* Apontamento never prepares the native INSTALLER, and never releases
      * external title-folder layers. Only native installer jobs do so. */
+    if (manual_pointing) {
+        /* The original PS4Mount USB title-level addcont overlay hides the
+         * actual console DLC directory. Release only OUR overlay, not the
+         * USB files; native per-DLC nullfs mounts are then created there. */
+        for (int i=0;i<t.ndlc_tids;i++) {
+            const char *dtid=t.dlc_tids[i];
+            char dir[PATH_MAX],hold[PATH_MAX];
+            snprintf(dir,sizeof(dir),"/user/addcont/%s",dtid);
+            hold_path(hold,sizeof(hold),"addcont",dtid);
+            int count=owned_layer_count(dir,hold);
+            if (count>0 && top_layer(dir,hold)==1) {
+                if (release_owned_layer(dtid,"addcont")) {
+                    printf("[dlc-point] %s could not release original title-level nullfs overlay\n",dtid);
+                    fatal=1; goto done;
+                }
+                printf("[dlc-point] %s original addcont overlay released; USB files not modified\n",dtid);
+            }
+        }
+    }
     for (int i = 0; !manual_pointing && i < t.ndlc_tids; ++i) {
         int needs_native = 0;
         for (int j = 0; j < t.ndlc; ++j) {
@@ -2927,7 +3015,7 @@ static void install_dlcs_queued(void) {
         g_dlc_percent = -1;
         const char *id = t.dlc[i].pkg.content_id;
         int state = -1;
-        db_dlc_registration(&id, 1, &state);
+        if (!manual_pointing) db_dlc_registration(&id, 1, &state);
         snprintf(g_progress.detail, sizeof(g_progress.detail), "%s DLC %d/%d: %.36s",
                  manual_pointing ? (g_point_all_active ? "Limpando copia nativa" : "Apontando manualmente") :
                  force_reinstall ? "Reinstalando manualmente" :
@@ -2936,18 +3024,12 @@ static void install_dlcs_queued(void) {
         int rc = 0;
         int installer_status_unavailable = 0;
         if (manual_pointing) {
-            if (g_point_all_active && strncmp(id + 7, tid, 9)) {
-                printf("[dlc-clean] SKIP %s: Content ID differs from folder %s; unable to locate safe native target\n",id,tid);
-                g_point_all_skipped_dlcs++;
-                rc = -1;
-            } else {
-                /* User explicitly requested pointing based on the files, NOT
-                 * the addcont.db registration. This does not REGISTER a DLC. */
-                printf("[dlc-point] %s manual override: db=%d ignored; USB PKG stays intact\n",id,state);
-                progress_set("installing_dlcs", "Apontamento: redirecionar ac.pkg nativo para USB");
-                rc = offload_one(&t.dlc[i],tid,1);
-                printf("[dlc-point] %s %s\n",id,rc?"FAILED (native preserved/rollback attempted)":"DONE");
-            }
+            /* No DB read, no entitlement check, no size/content comparison.
+             * The path must still be anchored on native PS5 storage, not USB. */
+            printf("[dlc-point] %s by USB folder alone; native target prepared without DB lookup\n",id);
+            progress_set("installing_dlcs", "Apontamento: redirecionar ac.pkg nativo para USB");
+            rc = offload_one(&t.dlc[i],tid,1);
+            printf("[dlc-point] %s %s\n",id,rc?"FAILED (native preserved/rollback attempted)":"DONE");
         } else if (state == 1 && !force_reinstall) {
             /* Mount never offloads a newly installed native package. A valid
              * existing offload journal can still be reconnected as before. */
@@ -3002,14 +3084,14 @@ static void install_dlcs_queued(void) {
 done:
     /* Native add-ons take precedence. Rebuild our external mounts only for
      * folders still without internal installed contents. */
-    if (opened && !native_task_unknown && (!manual_pointing || db_is_registered(tid)) && mount_title(&t)) {
+    if (opened && !native_task_unknown && mount_title(&t)) {
         printf("[dlc-install] %s could not restore external bundle after installer\n", tid);
         fatal = 1;
     }
     if (native_task_unknown)
         printf("[dlc-install] %s native task status UNKNOWN: external add-on overlay not restored to avoid hiding an ongoing install\n", tid);
     if (opened) {
-        report_dlc_registration(&t);
+        if (!manual_pointing) report_dlc_registration(&t);
         src_close(&t);
     }
     g_dlc_percent = -1;
@@ -3052,13 +3134,30 @@ static int clean_native_title(unsigned storage,const char *tid,int *skipped) {
     const char *root=g_native_dlc_roots[storage];
     char dir[PATH_MAX];
     snprintf(dir,sizeof(dir),"%s/%s",root,tid);
-    if (layers_on(root) || dead_layer(root) || layers_on(dir) || dead_layer(dir) || title_running(tid)) {
-        printf("[dlc-clean] SKIP %s: native folder has overlay or title running\n",dir);
+    if (layers_on(root) || dead_layer(root)) {
+        printf("[dlc-clean] SKIP %s: storage root overlaid\n",dir);
         (*skipped)++;
         return 0;
     }
+    /* A title-level addcont overlay may obscure the native directory. Only
+     * release a layer belonging to PS4Mount, then remount it after cleanup. */
+    char top_hold[PATH_MAX];int parent_removed=0;
+    hold_path(top_hold,sizeof(top_hold),"addcont",tid);
+    int layer_count=owned_layer_count(dir,top_hold);
+    if (layers_on(dir) || dead_layer(dir)) {
+        if (storage!=0 || top_layer(dir,top_hold)!=1 || layer_count!=1 ||
+            unmount(dir,0)) {
+            printf("[dlc-clean] SKIP unknown parent overlay %s\n",dir);
+            (*skipped)++;return 0;
+        }
+        parent_removed=1;
+        printf("[dlc-clean] temporarily released PS4Mount addcont overlay %s\n",dir);
+    }
     DIR *d=opendir(dir);
-    if (!d) { (*skipped)++; return 0; }
+    if (!d) {
+        if (parent_removed && nullfs_mount(top_hold,dir))(*skipped)++;
+        (*skipped)++; return 0;
+    }
     int cleaned=0;
     struct dirent *e;
     while ((e=readdir(d))) {
@@ -3074,20 +3173,29 @@ static int clean_native_title(unsigned storage,const char *tid,int *skipped) {
         struct stat st;
         snprintf(addon,sizeof(addon),"%s/%s",dir,label);
         if (lstat(addon,&st) || !S_ISDIR(st.st_mode)) continue;
+        char own_stage[PATH_MAX];int addon_removed=0;
+        snprintf(own_stage,sizeof(own_stage),HOLD_DIR "/offload/%s/%s",tid,label);
         if (layers_on(addon) || dead_layer(addon)) {
-            printf("[dlc-clean] SKIP overlaid DLC folder %s\n",addon);
-            (*skipped)++;
-            continue;
+            if (top_layer(addon,own_stage)!=1 || owned_layer_count(addon,own_stage)!=1 ||
+                unmount(addon,0)) {
+                printf("[dlc-clean] SKIP nonowned or busy overlay %s\n",addon);
+                (*skipped)++;continue;
+            }
+            addon_removed=1;
         }
         snprintf(pkg,sizeof(pkg),"%s/ac.pkg",addon);
-        if (layers_on(pkg) || dead_layer(pkg) || lstat(pkg,&st) || !S_ISREG(st.st_mode)) continue;
+        if (layers_on(pkg) || dead_layer(pkg) || lstat(pkg,&st) || !S_ISREG(st.st_mode)) {
+            if (addon_removed && nullfs_mount(own_stage,addon))(*skipped)++;
+            (*skipped)++;continue;
+        }
         if (st.st_size==0) {
             printf("[dlc-clean] ALREADY_0B %s\n",pkg);
             cleaned++;
+            if (addon_removed && nullfs_mount(own_stage,addon))(*skipped)++;
             continue;
         }
         int fd=open(pkg,O_WRONLY|O_NOFOLLOW);
-        if (fd<0) { printf("[dlc-clean] OPEN_FAILED %s errno=%d\n",pkg,errno);(*skipped)++;continue; }
+        if (fd<0) { printf("[dlc-clean] OPEN_FAILED %s errno=%d\n",pkg,errno);(*skipped)++;if(addon_removed && nullfs_mount(own_stage,addon))(*skipped)++;continue; }
         struct statfs sf;
         int unsafe = fstat(fd,&st) || !S_ISREG(st.st_mode) || fstatfs(fd,&sf) ||
                      !strcmp(sf.f_fstypename,"nullfs") ||
@@ -3095,7 +3203,7 @@ static int clean_native_title(unsigned storage,const char *tid,int *skipped) {
                      layers_on(addon) || dead_layer(addon);
         if (unsafe) {
             printf("[dlc-clean] SKIP unsafe mount/target %s\n",pkg);
-            close(fd); (*skipped)++; continue;
+            close(fd); (*skipped)++;if(addon_removed && nullfs_mount(own_stage,addon))(*skipped)++; continue;
         }
         unsigned long long oldsize=(unsigned long long)st.st_size;
         int rc=ftruncate(fd,0);
@@ -3108,8 +3216,16 @@ static int clean_native_title(unsigned storage,const char *tid,int *skipped) {
             printf("[dlc-clean] ZEROED_NATIVE %s old_bytes=%llu new_bytes=0 (USB untouched)\n",pkg,oldsize);
             cleaned++;
         }
+        if (addon_removed && nullfs_mount(own_stage,addon)) {
+            printf("[dlc-clean] REMOUNT_FAILED %s; USB still untouched\n",addon);
+            (*skipped)++;
+        }
     }
     closedir(d);
+    if (parent_removed && nullfs_mount(top_hold,dir)) {
+        printf("[dlc-clean] parent overlay restore failed %s\n",dir);
+        (*skipped)++;
+    }
     return cleaned;
 }
 
@@ -3842,8 +3958,8 @@ static int offload_one(const dlc_src_t *dlc,const char *tid,int fast_after_insta
     snprintf(rec.usb,sizeof(rec.usb),"%s",dlc->path);
     snprintf(rec.stage,sizeof(rec.stage),HOLD_DIR "/offload/%s/%s",native_tid,cid+20);
     if (fast_after_install) {
-        /* Manual pointing accepts BOTH full native ac.pkg and a 0B native stub
-         * left by Limpar DLCs. Folder must already exist on native storage. */
+        /* Manual pointing accepts a full ac.pkg, a 0B native stub or a new
+         * native slot created from an existing USB DLC folder. */
         char p[PATH_MAX]; struct stat st_native;
         int found=0;
         for (int n=0;n<9 && !found;n++) {
@@ -3874,7 +3990,47 @@ static int offload_one(const dlc_src_t *dlc,const char *tid,int fast_after_insta
             }
         }
         if (!found) {
-            printf("[dlc-point] %s no native DLC folder/ac.pkg (no USB modification)\n",cid);
+            /* Source DLC exists but console never created the native slot.
+             * Create a 0-byte slot ONLY on the console. Never use a path
+             * overlaid with nullfs, which could resolve into the USB tree. */
+            const char *roots[]={"/user/addcont", "/mnt/ext0/user/addcont",
+                "/mnt/ext1/user/addcont", "/mnt/ext2/user/addcont",
+                "/mnt/ext3/user/addcont", "/mnt/ext4/user/addcont",
+                "/mnt/ext5/user/addcont", "/mnt/ext6/user/addcont",
+                "/mnt/ext7/user/addcont"};
+            for (size_t j=0; j<sizeof(roots)/sizeof(roots[0]) && !found; j++) {
+                char parent[PATH_MAX], target[PATH_MAX];
+                struct stat sfolder;
+                snprintf(parent,sizeof(parent),"%s/%s",roots[j],native_tid);
+                snprintf(target,sizeof(target),"%s/%s",parent,cid+20);
+                if (layers_on(roots[j]) || dead_layer(roots[j]) ||
+                    layers_on(parent) || dead_layer(parent) ||
+                    layers_on(target) || dead_layer(target)) continue;
+                if (lstat(roots[j],&sfolder) || !S_ISDIR(sfolder.st_mode))continue;
+                struct stat parent_st;
+                if (!lstat(parent,&parent_st) && !S_ISDIR(parent_st.st_mode))continue;
+                if (mkdirs(target,0770), lstat(target,&sfolder) || !S_ISDIR(sfolder.st_mode))continue;
+                char stub[PATH_MAX];snprintf(stub,sizeof(stub),"%s/ac.pkg",target);
+                struct stat ststub;
+                if (!lstat(stub,&ststub)) {
+                    if (!S_ISREG(ststub.st_mode)) continue;
+                } else {
+                    int fd=open(stub,O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW,0600);
+                    if (fd<0) continue;
+                    struct statfs fs;
+                    int bad=fstatfs(fd,&fs) || !strcmp(fs.f_fstypename,"nullfs") ||
+                            !strncmp(fs.f_mntonname,"/mnt/usb",8);
+                    if (!bad) bad=fsync(fd);
+                    close(fd);
+                    if (bad) {unlink(stub);continue;}
+                }
+                snprintf(rec.native,sizeof(rec.native),"%s",target);
+                found=1;
+                printf("[dlc-point] %s CREATED native empty ac.pkg at %s; USB untouched\n",cid,stub);
+            }
+        }
+        if (!found) {
+            printf("[dlc-point] %s cannot create native slot without touching overlay or USB\n",cid);
             return -1;
         }
     } else if (offload_locate_native(tid,cid+20,rec.native,sizeof(rec.native))) {
@@ -3911,7 +4067,29 @@ static int offload_one(const dlc_src_t *dlc,const char *tid,int fast_after_insta
     }
     mkdirs(rec.stage,0770);
     const char *meta[]={"ac.json","ac.pbm","ac.pbm.backup"};
-    for (int i=0;i<3;i++) if (redirect_copy_meta(rec.native,rec.stage,meta[i]))return -1;
+    if (fast_after_install) {
+        /* Prefer native metadata. If not natively installed, synthesize the
+         * stage metadata from the USB PKG WITHOUT registering the DLC. */
+        const sfo_item_t *v=sfo_get(&dlc->sfo,"VERSION");
+        const char *version=v && !v->is_int ? v->sval : "01.00";
+        buf_t json={0},pbm={0};
+        build_app_json(&json,&dlc->pkg,dlc->path);
+        build_app_pbm(&pbm,&dlc->pkg,version,dlc->data?PBM_ADDCONT:PBM_LICENSE);
+        for (int i=0;i<3;i++) {
+            if (!redirect_copy_meta(rec.native,rec.stage,meta[i])) continue;
+            char fallback[PATH_MAX];
+            snprintf(fallback,sizeof(fallback),"%s/%s",rec.stage,meta[i]);
+            struct stat target_st;
+            if ((!lstat(fallback,&target_st) && !S_ISREG(target_st.st_mode)) ||
+                write_buf(fallback,i==0?&json:&pbm)) {
+                buf_free(&json);buf_free(&pbm);return -1;
+            }
+            printf("[dlc-point] %s stage meta %s built from USB PKG header only\n",cid,meta[i]);
+        }
+        buf_free(&json);buf_free(&pbm);
+    } else {
+        for (int i=0;i<3;i++) if (redirect_copy_meta(rec.native,rec.stage,meta[i]))return -1;
+    }
     char link[PATH_MAX];snprintf(link,sizeof(link),"%s/ac.pkg",rec.stage);
     if (!lstat(link,&st) && !S_ISLNK(st.st_mode))return -1;
     if ((!lstat(link,&st) && unlink(link)) || symlink(rec.usb,link))return -1;
